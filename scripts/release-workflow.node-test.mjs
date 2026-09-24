@@ -7,7 +7,11 @@ const releaseRequest = await readFile(new URL("../.github/workflows/release-requ
 const ci = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 
 const expectedPins = new Map([
-  ["pnpm/action-setup", "b906affcce14559ad1aafd4ab0e942779e9f58b1"],
+  ["actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"],
+  ["actions/setup-node", "a0853c24544627f65ddf259abe73b1d18a591444"],
+  ["pnpm/action-setup", "fc06bc1257f339d1d5d8b3a19a8cae5388b55320"],
+  ["actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"],
+  ["actions/download-artifact", "37930b1c2abaa49bbe596cd826c3c89aef350131"],
   ["Swatinem/rust-cache", "6323deb102c322ba6fcbdcafc7e3dddab59af2b6"],
   ["tauri-apps/tauri-action", "1deb371b0cd8bd54025b384f1cd735e725c4060f"],
 ]);
@@ -88,7 +92,7 @@ test("pins reviewed actions to the expected commit objects", () => {
   for (const match of `${ci}\n${release}\n${releaseRequest}`.matchAll(/uses: [^@\s]+@([^\s]+)/g)) {
     assert.match(match[1], /^[0-9a-f]{40}$/, `action is not pinned to a full SHA: ${match[0]}`);
   }
-  assert.doesNotMatch(`${ci}\n${release}`, /f40ffcd9367d9f12939873eb1018b921a783ffaa|49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c|944946e3e4cac6603d1fe8f514171e9ecd3c78aa/);
+  assert.doesNotMatch(`${ci}\n${release}`, /f40ffcd9367d9f12939873eb1018b921a783ffaa|49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c|944946e3e4cac6603d1fe8f514171e9ecd3c78aa|11d5960a326750d5838078e36cf38b85af677262|49933ea5288caeca8642d1e84afbd3f7d6820020|b906affcce14559ad1aafd4ab0e942779e9f58b1|ea165f8d65b6e75b540449e92b4886f43607fa02|d3f86a106a0bac45b974a628896c90dbdf5c8093/);
 });
 
 test("reconciles residual draft assets before clobbering the exact local set", () => {
