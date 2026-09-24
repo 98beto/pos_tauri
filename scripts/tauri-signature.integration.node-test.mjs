@@ -39,14 +39,14 @@ test("Tauri CLI signatures verify with minisign", {
   await mkdir(assets);
   await run("pnpm", ["exec", "tauri", "signer", "generate", "--ci", "--password", "", "--write-keys", key]);
 
-  const appImage = path.join(assets, "Linea POS_1.2.3_amd64.AppImage");
-  const nsis = path.join(assets, "Linea POS_1.2.3_x64-setup.exe");
+  const appImage = path.join(assets, "Linea.POS_1.2.3_amd64.AppImage");
+  const nsis = path.join(assets, "Linea.POS_1.2.3_x64-setup.exe");
   await Promise.all([
     writeFile(appImage, "appimage integration artifact"),
     writeFile(nsis, "nsis integration artifact"),
-    writeFile(path.join(assets, "Linea POS_1.2.3_amd64.deb"), "deb"),
-    writeFile(path.join(assets, "Linea POS-1.2.3-1.x86_64.rpm"), "rpm"),
-    writeFile(path.join(assets, "Linea POS_1.2.3_x64_en-US.msi"), "msi"),
+    writeFile(path.join(assets, "Linea.POS_1.2.3_amd64.deb"), "deb"),
+    writeFile(path.join(assets, "Linea.POS-1.2.3-1.x86_64.rpm"), "rpm"),
+    writeFile(path.join(assets, "Linea.POS_1.2.3_x64_en-US.msi"), "msi"),
   ]);
   await run("pnpm", ["exec", "tauri", "signer", "sign", "--private-key-path", key, "--password", "", appImage]);
   await run("pnpm", ["exec", "tauri", "signer", "sign", "--private-key-path", key, "--password", "", nsis]);

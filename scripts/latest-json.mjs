@@ -6,6 +6,7 @@ import { decodeTauriSignature } from "./tauri-signature-format.mjs";
 
 const REPOSITORY = "98beto/pos_tauri";
 const TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const ASSET_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const PLATFORM_KEYS = ["linux-x86_64", "windows-x86_64"];
 const EXPECTED_ASSET_COUNT = 7;
 
@@ -43,6 +44,12 @@ export async function inspectReleaseAssets(assetsDirectory) {
   const files = paths.filter((file) => path.basename(file) !== "latest.json");
   const names = files.map((file) => path.basename(file));
 
+  const unsafeName = names.find((name) => !ASSET_NAME_PATTERN.test(name));
+  if (unsafeName) {
+    throw new Error(
+      `Unsafe release asset filename ${JSON.stringify(unsafeName)}; names must start and end with A-Z, a-z, or 0-9, with only dot, underscore, and hyphen also allowed inside`,
+    );
+  }
   if (new Set(names).size !== names.length) {
     throw new Error("Release asset filenames must be unique");
   }

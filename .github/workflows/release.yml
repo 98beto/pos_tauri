@@ -375,6 +375,35 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
+      - name: Canonicalize release asset filenames
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -a sources=() targets=()
+
+          while IFS= read -r -d '' asset; do
+            directory="${asset%/*}"
+            basename="${asset##*/}"
+            canonical="${basename// /.}"
+            target="$directory/$canonical"
+
+            if [[ -e "$target" || -L "$target" ]]; then
+              printf 'Canonical release asset target collision: %q\n' "$target" >&2
+              exit 1
+            fi
+            for claimed_target in "${targets[@]}"; do
+              if [[ "$claimed_target" == "$target" ]]; then
+                printf 'Canonical release asset target collision: %q\n' "$target" >&2
+                exit 1
+              fi
+            done
+            sources+=("$asset")
+            targets+=("$target")
+          done < <(find release-assets -type f -name '* *' -print0)
+
+          for index in "${!sources[@]}"; do
+            mv -- "${sources[$index]}" "${targets[$index]}"
+          done
       - name: Install minisign
         run: |
           sudo apt-get update

@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 const release = await readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
 const releaseRequest = await readFile(new URL("../.github/workflows/release-request.yml", import.meta.url), "utf8");
 const ci = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const execFileAsync = promisify(execFile);
 
 const expectedPins = new Map([
   ["actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"],
@@ -26,6 +31,35 @@ function jobSection(contents, name) {
   const remaining = contents.slice(start + 1);
   const next = remaining.slice(1).search(/^  [a-z][a-z-]*:$/m);
   return next === -1 ? remaining : remaining.slice(0, next + 1);
+}
+
+function stepRunBlock(contents, name) {
+  const marker = `      - name: ${name}\n`;
+  const start = contents.indexOf(marker);
+  assert.notEqual(start, -1, `${name} step must exist`);
+  const end = contents.indexOf("\n      - ", start + marker.length);
+  const step = contents.slice(start, end === -1 ? undefined : end);
+  const runMarker = "        run: |\n";
+  const runStart = step.indexOf(runMarker);
+  assert.notEqual(runStart, -1, `${name} step must have a literal run block`);
+  return step
+    .slice(runStart + runMarker.length)
+    .split("\n")
+    .map((line) => line.startsWith("          ") ? line.slice(10) : line)
+    .join("\n");
+}
+
+const canonicalizeScript = stepRunBlock(release, "Canonicalize release asset filenames");
+
+async function canonicalizationFixture(t) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pos-release-workflow-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "release-assets"));
+  return root;
+}
+
+async function runCanonicalization(root) {
+  return execFileAsync("bash", ["-c", canonicalizeScript], { cwd: root });
 }
 
 test("uses least privilege and disables checkout credential persistence", () => {
@@ -81,6 +115,86 @@ test("verifies local and downloaded signatures before atomic publication", () =>
   assert.match(release, /REQUIRE_MINISIGN_INTEGRATION: "1"[\s\S]*?pnpm test:signature-integration/);
   assert.match(release, /gh release upload "\$TAG" "\$\{assets\[@\]\}" --clobber/);
   assert.match(release, /gh release edit "\$TAG" --draft=false --latest/);
+});
+
+test("canonicalizes downloaded asset names before verification and publication", () => {
+  const publish = jobSection(release, "publish");
+  const download = publish.indexOf("uses: actions/download-artifact@");
+  const canonicalize = publish.indexOf("- name: Canonicalize release asset filenames");
+  const verify = publish.indexOf("- name: Verify signatures before changing the draft");
+  const manifest = publish.indexOf("- name: Generate and validate latest.json");
+  const upload = publish.indexOf("- name: Upload draft assets and verify the remote release");
+
+  assert.ok(download < canonicalize);
+  assert.ok(canonicalize < verify);
+  assert.ok(canonicalize < manifest);
+  assert.ok(canonicalize < upload);
+  assert.match(
+    publish.slice(download, canonicalize).trimEnd(),
+    /merge-multiple: true$/,
+  );
+
+  const step = publish.slice(canonicalize, publish.indexOf("      - name:", canonicalize + 1));
+  assert.match(step, /find release-assets -type f -name '\* \*' -print0/);
+  assert.match(step, /canonical="\$\{basename\/\/ \/\.\}"/);
+  assert.match(step, /\[\[ -e "\$target" \|\| -L "\$target" \]\]/);
+  assert.match(step, /for claimed_target in "\$\{targets\[@\]\}"/);
+  assert.match(step, /\[\[ "\$claimed_target" == "\$target" \]\]/);
+  assert.ok(step.indexOf("done < <(find") < step.indexOf("mv --"));
+  assert.ok(step.lastIndexOf("Canonical release asset target collision") < step.indexOf("mv --"));
+});
+
+test("canonicalization renames nested asset basenames containing spaces", async (t) => {
+  const root = await canonicalizationFixture(t);
+  const nested = path.join(root, "release-assets", "nested artifacts");
+  await mkdir(nested);
+  await writeFile(path.join(nested, "Linea POS setup.exe"), "asset");
+
+  await runCanonicalization(root);
+
+  assert.equal(await readFile(path.join(nested, "Linea.POS.setup.exe"), "utf8"), "asset");
+  await assert.rejects(readFile(path.join(nested, "Linea POS setup.exe")), { code: "ENOENT" });
+});
+
+test("canonicalization rerun is a no-op", async (t) => {
+  const root = await canonicalizationFixture(t);
+  const source = path.join(root, "release-assets", "Linea POS.AppImage");
+  const target = path.join(root, "release-assets", "Linea.POS.AppImage");
+  await writeFile(source, "asset");
+
+  await runCanonicalization(root);
+  await runCanonicalization(root);
+
+  assert.equal(await readFile(target, "utf8"), "asset");
+});
+
+test("canonicalization rejects a pre-existing target without partial moves", async (t) => {
+  const root = await canonicalizationFixture(t);
+  const assets = path.join(root, "release-assets");
+  await writeFile(path.join(assets, "First Asset.deb"), "first");
+  await writeFile(path.join(assets, "Blocked Asset.rpm"), "source");
+  await writeFile(path.join(assets, "Blocked.Asset.rpm"), "target");
+
+  await assert.rejects(runCanonicalization(root), /Canonical release asset target collision/);
+  assert.equal(await readFile(path.join(assets, "First Asset.deb"), "utf8"), "first");
+  assert.equal(await readFile(path.join(assets, "Blocked Asset.rpm"), "utf8"), "source");
+  assert.equal(await readFile(path.join(assets, "Blocked.Asset.rpm"), "utf8"), "target");
+  await assert.rejects(readFile(path.join(assets, "First.Asset.deb")), { code: "ENOENT" });
+});
+
+test("canonicalization rejects two sources claiming one target without partial moves", async (t) => {
+  const root = await canonicalizationFixture(t);
+  const assets = path.join(root, "release-assets");
+  await writeFile(path.join(assets, "First Asset.deb"), "first");
+  await writeFile(path.join(assets, "Same Name.sig"), "one");
+  await writeFile(path.join(assets, "Same.Name sig"), "two");
+
+  await assert.rejects(runCanonicalization(root), /Canonical release asset target collision/);
+  assert.equal(await readFile(path.join(assets, "First Asset.deb"), "utf8"), "first");
+  assert.equal(await readFile(path.join(assets, "Same Name.sig"), "utf8"), "one");
+  assert.equal(await readFile(path.join(assets, "Same.Name sig"), "utf8"), "two");
+  await assert.rejects(readFile(path.join(assets, "First.Asset.deb")), { code: "ENOENT" });
+  await assert.rejects(readFile(path.join(assets, "Same.Name.sig")), { code: "ENOENT" });
 });
 
 test("pins reviewed actions to the expected commit objects", () => {

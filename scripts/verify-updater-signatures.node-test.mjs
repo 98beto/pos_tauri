@@ -27,13 +27,13 @@ async function fixture(t) {
   const assets = path.join(root, "assets");
   await mkdir(assets);
   const files = {
-    "Linea POS_1.2.3_amd64.AppImage": "appimage",
-    "Linea POS_1.2.3_amd64.AppImage.sig": signature(1),
-    "Linea POS_1.2.3_amd64.deb": "deb",
-    "Linea POS-1.2.3-1.x86_64.rpm": "rpm",
-    "Linea POS_1.2.3_x64-setup.exe": "nsis",
-    "Linea POS_1.2.3_x64-setup.exe.sig": signature(2),
-    "Linea POS_1.2.3_x64_en-US.msi": "msi",
+    "Linea.POS_1.2.3_amd64.AppImage": "appimage",
+    "Linea.POS_1.2.3_amd64.AppImage.sig": signature(1),
+    "Linea.POS_1.2.3_amd64.deb": "deb",
+    "Linea.POS-1.2.3-1.x86_64.rpm": "rpm",
+    "Linea.POS_1.2.3_x64-setup.exe": "nsis",
+    "Linea.POS_1.2.3_x64-setup.exe.sig": signature(2),
+    "Linea.POS_1.2.3_x64_en-US.msi": "msi",
   };
   await Promise.all(Object.entries(files).map(([name, contents]) => (
     writeFile(path.join(assets, name), contents)
@@ -80,8 +80,8 @@ test("verifies both native updater artifacts", async (t) => {
 test("fails when minisign reports a signature mismatch", async (t) => {
   const { assets, verifier } = await fixture(t);
   const badSignature = signature(4);
-  await writeFile(path.join(assets, "Linea POS_1.2.3_x64-setup.exe.sig"), badSignature);
-  await writeFile(path.join(assets, "Linea POS_1.2.3_x64-setup.exe"), "");
+  await writeFile(path.join(assets, "Linea.POS_1.2.3_x64-setup.exe.sig"), badSignature);
+  await writeFile(path.join(assets, "Linea.POS_1.2.3_x64-setup.exe"), "");
   await assert.rejects(
     verifyUpdaterSignatures({ assetsDirectory: assets, publicKey, minisign: verifier }),
     /minisign rejected .*setup\.exe/,

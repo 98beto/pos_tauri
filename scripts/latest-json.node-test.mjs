@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -24,13 +24,13 @@ async function fixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "pos-latest-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const files = {
-    "Linea POS_1.2.3_amd64.AppImage": "appimage",
-    "Linea POS_1.2.3_amd64.AppImage.sig": linuxSignature,
-    "Linea POS_1.2.3_amd64.deb": "deb",
-    "Linea POS-1.2.3-1.x86_64.rpm": "rpm",
-    "Linea POS_1.2.3_x64-setup.exe": "nsis",
-    "Linea POS_1.2.3_x64-setup.exe.sig": windowsSignature,
-    "Linea POS_1.2.3_x64_en-US.msi": "msi",
+    "Linea.POS_1.2.3_amd64.AppImage": "appimage",
+    "Linea.POS_1.2.3_amd64.AppImage.sig": linuxSignature,
+    "Linea.POS_1.2.3_amd64.deb": "deb",
+    "Linea.POS-1.2.3-1.x86_64.rpm": "rpm",
+    "Linea.POS_1.2.3_x64-setup.exe": "nsis",
+    "Linea.POS_1.2.3_x64-setup.exe.sig": windowsSignature,
+    "Linea.POS_1.2.3_x64_en-US.msi": "msi",
   };
   await Promise.all(Object.entries(files).map(([name, contents]) => (
     writeFile(path.join(root, name), contents)
@@ -51,11 +51,11 @@ test("generates one native updater entry per supported platform", async (t) => {
   assert.deepEqual(Object.keys(manifest.platforms), ["linux-x86_64", "windows-x86_64"]);
   assert.equal(
     manifest.platforms["linux-x86_64"].url,
-    "https://github.com/98beto/pos_tauri/releases/download/v1.2.3/Linea%20POS_1.2.3_amd64.AppImage",
+    "https://github.com/98beto/pos_tauri/releases/download/v1.2.3/Linea.POS_1.2.3_amd64.AppImage",
   );
   assert.equal(
     manifest.platforms["windows-x86_64"].url,
-    "https://github.com/98beto/pos_tauri/releases/download/v1.2.3/Linea%20POS_1.2.3_x64-setup.exe",
+    "https://github.com/98beto/pos_tauri/releases/download/v1.2.3/Linea.POS_1.2.3_x64-setup.exe",
   );
   assert.equal(manifest.platforms["linux-x86_64"].signature, linuxSignature);
   assert.equal(manifest.platforms["windows-x86_64"].signature, windowsSignature);
@@ -91,14 +91,14 @@ test("rejects an MSI URL as the Windows updater", async (t) => {
 
 test("rejects missing and empty signatures", async (t) => {
   const root = await fixture(t);
-  await writeFile(path.join(root, "Linea POS_1.2.3_amd64.AppImage.sig"), "");
+  await writeFile(path.join(root, "Linea.POS_1.2.3_amd64.AppImage.sig"), "");
 
   await assert.rejects(inspectReleaseAssets(root), /canonical Base64/);
 });
 
 test("rejects a missing required asset", async (t) => {
   const root = await fixture(t);
-  await rm(path.join(root, "Linea POS_1.2.3_x64_en-US.msi"));
+  await rm(path.join(root, "Linea.POS_1.2.3_x64_en-US.msi"));
 
   await assert.rejects(inspectReleaseAssets(root), /exactly 7 release assets, found 6/);
 });
@@ -110,29 +110,44 @@ test("rejects an unexpected extra asset", async (t) => {
   await assert.rejects(inspectReleaseAssets(root), /exactly 7 release assets, found 8/);
 });
 
-test("escapes RFC 3986 reserved characters in asset names", async (t) => {
+test("rejects asset filenames outside the stable GitHub-safe set", async (t) => {
   const root = await fixture(t);
   await Promise.all([
     cp(
-      path.join(root, "Linea POS_1.2.3_amd64.AppImage"),
-      path.join(root, "Linea POS's_1.2.3_amd64.AppImage"),
+      path.join(root, "Linea.POS_1.2.3_amd64.AppImage"),
+      path.join(root, "Linea.POS's_1.2.3_amd64.AppImage"),
     ),
     cp(
-      path.join(root, "Linea POS_1.2.3_amd64.AppImage.sig"),
-      path.join(root, "Linea POS's_1.2.3_amd64.AppImage.sig"),
+      path.join(root, "Linea.POS_1.2.3_amd64.AppImage.sig"),
+      path.join(root, "Linea.POS's_1.2.3_amd64.AppImage.sig"),
     ),
   ]);
   await Promise.all([
-    rm(path.join(root, "Linea POS_1.2.3_amd64.AppImage")),
-    rm(path.join(root, "Linea POS_1.2.3_amd64.AppImage.sig")),
+    rm(path.join(root, "Linea.POS_1.2.3_amd64.AppImage")),
+    rm(path.join(root, "Linea.POS_1.2.3_amd64.AppImage.sig")),
   ]);
-  const manifest = await generateLatestJson({
-    tag: "v1.2.3",
-    assetsDirectory: root,
-    pubDate: "2026-09-23T10:00:00Z",
-  });
 
-  assert.match(manifest.platforms["linux-x86_64"].url, /Linea%20POS%27s_/);
+  await assert.rejects(inspectReleaseAssets(root), /Unsafe release asset filename.*must start and end/);
+});
+
+test("rejects asset filenames with a leading period", async (t) => {
+  const root = await fixture(t);
+  await rename(
+    path.join(root, "Linea.POS_1.2.3_amd64.deb"),
+    path.join(root, ".Linea.POS_1.2.3_amd64.deb"),
+  );
+
+  await assert.rejects(inspectReleaseAssets(root), /Unsafe release asset filename/);
+});
+
+test("rejects asset filenames with a trailing period", async (t) => {
+  const root = await fixture(t);
+  await rename(
+    path.join(root, "Linea.POS_1.2.3_amd64.deb"),
+    path.join(root, "Linea.POS_1.2.3_amd64.deb."),
+  );
+
+  await assert.rejects(inspectReleaseAssets(root), /Unsafe release asset filename/);
 });
 
 test("rejects legacy updater archives", async (t) => {
@@ -146,8 +161,8 @@ test("rejects duplicate filenames downloaded from separate artifacts", async (t)
   const root = await fixture(t);
   await mkdir(path.join(root, "duplicate"));
   await cp(
-    path.join(root, "Linea POS_1.2.3_amd64.deb"),
-    path.join(root, "duplicate", "Linea POS_1.2.3_amd64.deb"),
+    path.join(root, "Linea.POS_1.2.3_amd64.deb"),
+    path.join(root, "duplicate", "Linea.POS_1.2.3_amd64.deb"),
   );
 
   await assert.rejects(inspectReleaseAssets(root), /filenames must be unique/);
