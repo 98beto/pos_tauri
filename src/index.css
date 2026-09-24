@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #f4f6fa;
+  --color-surface: #ffffff;
+  --color-surface-soft: #f8f9fc;
+  --color-ink: #182033;
+  --color-muted: #6f788a;
+  --color-line: #e2e6ee;
+  --color-line-strong: #ccd3df;
+  --color-brand: #3559c7;
+  --color-brand-dark: #27449f;
+  --color-brand-soft: #e9eefc;
+  --color-warning: #9a681b;
+  --color-warning-soft: #fff3db;
+  --color-danger: #b0444c;
+  --color-danger-soft: #fcebed;
+  --color-info: #397393;
+  --color-info-soft: #e8f3f8;
+  --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-heading: "Fraunces Variable", Fraunces, Georgia, serif;
+  --shadow-panel: 0 18px 50px rgb(24 32 51 / 0.11);
+  --radius-control: 0.625rem;
+  --radius-card: 1rem;
+  --radius-modal: 1.125rem;
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: var(--color-canvas);
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    min-width: 0;
+  }
+
+  body.modal-scroll-lock {
+    overflow: hidden;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    color: white;
+    background: var(--color-brand);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

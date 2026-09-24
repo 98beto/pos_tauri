@@ -1,0 +1,21 @@
+name: Release request
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  validate-request:
+    name: Validate unprivileged tag request
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate tag syntax
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Invalid release tag; expected vX.Y.Z" >&2
+            exit 1
+          fi

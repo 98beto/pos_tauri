@@ -1,0 +1,484 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Release request"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 24.15.0
+  PNPM_VERSION: 12.4.1
+
+jobs:
+  validate:
+    name: Validate release
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release-source.outputs.tag }}
+      sha: ${{ steps.release-source.outputs.sha }}
+    steps:
+      # actions/checkout v4; update this SHA when renewing the action.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve trusted release tag and immutable commit
+        id: release-source
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUEST_EVENT: ${{ github.event.workflow_run.event }}
+          REQUEST_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          REQUEST_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$DISPATCH_REF" != "refs/heads/main" ]]; then
+              echo "Manual releases must be dispatched from main" >&2
+              exit 1
+            fi
+            tag="$DISPATCH_TAG"
+            if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Invalid release tag; expected vX.Y.Z" >&2
+              exit 1
+            fi
+            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+            sha="$(git rev-parse "${tag}^{commit}")"
+          else
+            if [[ "$REQUEST_EVENT" != "push" || "$REQUEST_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+              echo "Release request must be a push run from this repository" >&2
+              exit 1
+            fi
+            if [[ ! "$REQUEST_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Release request has an invalid head SHA" >&2
+              exit 1
+            fi
+            sha="$REQUEST_SHA"
+            git fetch --force origin "+refs/tags/v*:refs/tags/v*"
+            mapfile -t tags < <(
+              while read -r ref; do
+                candidate="${ref#refs/tags/}"
+                if [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+                  && [[ "$(git rev-parse "${ref}^{commit}")" == "$sha" ]]; then
+                  printf '%s\n' "$candidate"
+                fi
+              done < <(git for-each-ref --format='%(refname)' 'refs/tags/v*')
+            )
+            if [[ "${#tags[@]}" -ne 1 ]]; then
+              echo "Expected exactly one vX.Y.Z tag at $sha; found ${#tags[@]}" >&2
+              exit 1
+            fi
+            tag="${tags[0]}"
+          fi
+
+          git merge-base --is-ancestor "$sha" origin/main
+          git checkout --detach "$sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      # pnpm/action-setup v4; update this SHA when renewing the action.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 12.4.1
+          run_install: false
+      # actions/setup-node v4; update this SHA when renewing the action.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      # dtolnay/rust-toolchain 2026-09-03; update this SHA when renewing the action.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      # Swatinem/rust-cache v2; update this SHA when renewing the action.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri -> target
+      - name: Validate tag source and release state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release-source.outputs.tag }}
+        run: |
+          git merge-base --is-ancestor "${{ steps.release-source.outputs.sha }}" origin/main
+          response="$RUNNER_TEMP/release.json"
+          status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          if [[ "$status" == "200" ]] && [[ "$(jq -r .draft "$response")" != "true" ]]; then
+            echo "Release $TAG is already published" >&2
+            exit 1
+          fi
+          if [[ "$status" != "200" && "$status" != "404" ]]; then
+            echo "GitHub release lookup failed with HTTP $status" >&2
+            exit 1
+          fi
+      - name: Require updater public key and create test overlay
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/release-config.mjs --output "$RUNNER_TEMP/tauri.release.conf.json"
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: pnpm install --frozen-lockfile
+      - run: git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
+      - run: node scripts/validate-version.mjs "${{ steps.release-source.outputs.tag }}"
+      - run: pnpm test
+      - run: pnpm build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml
+      - run: git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
+
+  linux:
+    name: Build Linux bundles
+    needs: validate
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      # actions/checkout v4; update this SHA when renewing the action.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      # pnpm/action-setup v4; update this SHA when renewing the action.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 12.4.1
+          run_install: false
+      # actions/setup-node v4; update this SHA when renewing the action.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      # dtolnay/rust-toolchain 2026-09-03; update this SHA when renewing the action.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      # Swatinem/rust-cache v2; update this SHA when renewing the action.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Linux bundle dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build frontend without signing secrets
+        run: |
+          pnpm build
+          test -d dist
+      - name: Create ephemeral Tauri release config
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/release-config.mjs --output "$RUNNER_TEMP/tauri.release.conf.json"
+      - name: Require updater signing secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          : "${TAURI_SIGNING_PRIVATE_KEY:?TAURI_SIGNING_PRIVATE_KEY secret is required}"
+          : "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required}"
+      # tauri-apps/tauri-action v1; update this SHA when renewing the action.
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          args: --bundles appimage,deb,rpm --config "${{ runner.temp }}/tauri.release.conf.json" -- --locked
+      - run: git diff --exit-code -- src-tauri/Cargo.lock
+      # actions/upload-artifact v4; update this SHA when renewing the action.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-linux
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+
+  windows-nsis:
+    name: Build Windows NSIS updater
+    needs: validate
+    runs-on: windows-latest
+    environment: release
+    steps:
+      # actions/checkout v4; update this SHA when renewing the action.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      # pnpm/action-setup v4; update this SHA when renewing the action.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 12.4.1
+          run_install: false
+      # actions/setup-node v4; update this SHA when renewing the action.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      # dtolnay/rust-toolchain 2026-09-03; update this SHA when renewing the action.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      # Swatinem/rust-cache v2; update this SHA when renewing the action.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri -> target
+      - run: pnpm install --frozen-lockfile
+      - name: Build frontend without signing secrets
+        run: |
+          pnpm build
+          if (-not (Test-Path -Path dist -PathType Container)) {
+            throw "dist was not created"
+          }
+      - name: Create ephemeral Tauri release config
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/release-config.mjs --output "$env:RUNNER_TEMP/tauri.release.conf.json"
+      - name: Require updater signing secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY secret is required"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required"
+          }
+      # tauri-apps/tauri-action v1; update this SHA when renewing the action.
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          args: --bundles nsis --config "${{ runner.temp }}/tauri.release.conf.json" -- --locked
+      - run: git diff --exit-code -- src-tauri/Cargo.lock
+      # actions/upload-artifact v4; update this SHA when renewing the action.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-windows-nsis
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+
+  windows-msi:
+    name: Build Windows MSI (manual)
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      # actions/checkout v4; update this SHA when renewing the action.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      # pnpm/action-setup v4; update this SHA when renewing the action.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 12.4.1
+          run_install: false
+      # actions/setup-node v4; update this SHA when renewing the action.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      # dtolnay/rust-toolchain 2026-09-03; update this SHA when renewing the action.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      # Swatinem/rust-cache v2; update this SHA when renewing the action.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri -> target
+      - run: pnpm install --frozen-lockfile
+      - name: Build frontend
+        run: |
+          pnpm build
+          if (-not (Test-Path -Path dist -PathType Container)) {
+            throw "dist was not created"
+          }
+      - name: Create ephemeral Tauri config without updater artifacts
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/release-config.mjs --output "$env:RUNNER_TEMP/tauri.release.conf.json" --disable-updater-artifacts
+      # tauri-apps/tauri-action v1; update this SHA when renewing the action.
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        with:
+          projectPath: .
+          args: --bundles msi --config "${{ runner.temp }}/tauri.release.conf.json" -- --locked
+      - run: git diff --exit-code -- src-tauri/Cargo.lock
+      # actions/upload-artifact v4; update this SHA when renewing the action.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-windows-msi
+          if-no-files-found: error
+          retention-days: 7
+          path: src-tauri/target/release/bundle/msi/*.msi
+
+  publish:
+    name: Assemble and atomically publish
+    needs: [validate, linux, windows-nsis, windows-msi]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # actions/checkout v4; update this SHA when renewing the action.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # pnpm/action-setup v4; update this SHA when renewing the action.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 12.4.1
+          run_install: false
+      # actions/setup-node v4; update this SHA when renewing the action.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.15.0
+      # actions/download-artifact v4; update this SHA when renewing the action.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+      - run: pnpm install --frozen-lockfile
+      - name: Exercise the real Tauri signature format with minisign
+        env:
+          REQUIRE_MINISIGN_INTEGRATION: "1"
+        run: pnpm test:signature-integration
+      - name: Verify signatures before changing the draft
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/verify-updater-signatures.mjs --assets release-assets
+      - name: Create or reuse the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          git fetch --force origin "refs/tags/$TAG"
+          remote_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] \
+            || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
+            echo "Remote tag no longer resolves to the validated main commit" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2>/dev/null; then
+            if [[ "$(< "$RUNNER_TEMP/is-draft")" != "true" ]]; then
+              echo "Release $TAG is already published" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "Linea POS $TAG"
+          fi
+          gh release view "$TAG" --json body --jq .body > "$RUNNER_TEMP/release-notes.md"
+      - name: Generate and validate latest.json
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          node scripts/latest-json.mjs generate \
+            --tag "$TAG" \
+            --assets release-assets \
+            --output release-assets/latest.json \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --pub-date "$(date --utc +'%Y-%m-%dT%H:%M:%SZ')"
+          node scripts/latest-json.mjs validate \
+            --tag "$TAG" \
+            --assets release-assets \
+            --manifest release-assets/latest.json
+      - name: Upload draft assets and verify the remote release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          git fetch --force origin "refs/tags/$TAG"
+          remote_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] \
+            || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
+            echo "Remote tag no longer resolves to the validated main commit" >&2
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "Release $TAG is not a draft" >&2
+            exit 1
+          fi
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          declare -A expected_assets=()
+          for asset in "${assets[@]}"; do
+            expected_assets["$(basename "$asset")"]=1
+          done
+          while IFS= read -r remote_asset; do
+            if [[ -n "$remote_asset" && ! -v 'expected_assets[$remote_asset]' ]]; then
+              gh release delete-asset "$TAG" "$remote_asset" --yes
+            fi
+          done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          mkdir "$RUNNER_TEMP/remote-assets"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/remote-assets"
+          node scripts/verify-updater-signatures.mjs \
+            --assets "$RUNNER_TEMP/remote-assets"
+          node scripts/latest-json.mjs validate \
+            --tag "$TAG" \
+            --assets "$RUNNER_TEMP/remote-assets" \
+            --manifest "$RUNNER_TEMP/remote-assets/latest.json"
+          local_assets="$(find release-assets -type f -printf '%f\n' | sort)"
+          remote_assets="$(find "$RUNNER_TEMP/remote-assets" -maxdepth 1 -type f -printf '%f\n' | sort)"
+          [[ "$local_assets" == "$remote_assets" ]]
+      - name: Publish only after all remote checks pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          git fetch --force origin "refs/tags/$TAG"
+          remote_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] \
+            || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
+            echo "Remote tag no longer resolves to the validated main commit" >&2
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "Release $TAG is not a draft" >&2
+            exit 1
+          fi
+          gh release edit "$TAG" --draft=false --latest
