@@ -1,6 +1,6 @@
 # Linea POS
 
-Aplicacion de punto de venta de escritorio construida con Tauri 2, React y SQLite. El repositorio publica instaladores para Linux y Windows y ofrece actualizaciones firmadas para AppImage y NSIS.
+Aplicacion de punto de venta de escritorio construida con Tauri 2, React y SQLite. El repositorio publica instaladores para Linux y Windows y ofrece actualizaciones firmadas para AppImage, DEB, RPM y NSIS.
 
 ## Requisitos
 
@@ -15,6 +15,8 @@ Aplicacion de punto de venta de escritorio construida con Tauri 2, React y SQLit
 pnpm install --frozen-lockfile
 pnpm tauri dev
 ```
+
+El modo desarrollo no requiere claves ni configuracion de release, no registra el updater y no consulta el endpoint de produccion.
 
 Comprobaciones principales:
 

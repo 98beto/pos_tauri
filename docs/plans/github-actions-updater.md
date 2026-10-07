@@ -11,8 +11,7 @@ La aplicacion consultara actualizaciones al iniciar. Cuando exista una version n
 - El repositorio `98beto/pos_tauri` y las GitHub Releases seran publicos; la rama principal es `main`.
 - La primera version automatizada soportara Linux y Windows x86_64.
 - Linux seguira generando AppImage, `.deb` y `.rpm`.
-- El AppImage sera el canal autoactualizable en Linux.
-- `.deb` y `.rpm` se conservaran como instaladores manuales.
+- AppImage, `.deb` y `.rpm` seran canales autoactualizables independientes en Linux.
 - Windows generara NSIS `.exe` y MSI `.msi`.
 - NSIS sera el canal autoactualizable en Windows.
 - MSI se conservara como instalador manual.
@@ -33,10 +32,11 @@ Instalacion manual:
 
 Updater:
 
-- `*.AppImage`
-- `*.AppImage.sig`
+- `*.AppImage` y `*.AppImage.sig`
+- `*.deb` y `*.deb.sig`
+- `*.rpm` y `*.rpm.sig`
 
-El updater oficial de Tauri actualizara instalaciones AppImage. Los paquetes `.deb` y `.rpm` no se reemplazaran mediante el updater; se actualizaran manualmente o mediante un futuro repositorio de paquetes.
+El updater oficial de Tauri reemplaza AppImage, instala DEB mediante `dpkg -i` y RPM mediante `rpm -U`. DEB y RPM pueden requerir elevacion administrativa.
 
 ### Windows
 
@@ -50,12 +50,13 @@ Updater:
 - `*-setup.exe`
 - `*-setup.exe.sig`
 
-El manifiesto `latest.json` debe apuntar al artefacto NSIS para `windows-x86_64`, no al MSI.
+El manifiesto `latest.json` debe apuntar al artefacto NSIS para `windows-x86_64-nsis`, no al MSI.
 
 ### Metadatos
 
-- `latest.json` con version, notas, fecha, URL y firma por plataforma.
-- El conjunto publicado contiene exactamente los siete artefactos nativos y `latest.json`; agregar otros assets requiere actualizar y volver a validar ese contrato.
+- `latest.json` con version, notas, fecha, URL y firma por formato.
+- Claves exactas `linux-x86_64-appimage`, `linux-x86_64-deb`, `linux-x86_64-rpm` y `windows-x86_64-nsis`.
+- El conjunto publicado contiene exactamente nueve artefactos nativos y `latest.json`; agregar otros assets requiere actualizar y volver a validar ese contrato.
 
 ## Etapa 1: Preparar el repositorio
 
@@ -123,10 +124,12 @@ tauri-plugin-updater
 tauri-plugin-process
 ```
 
-Registrar ambos plugins en el builder de Tauri:
+Registrar Process en el builder y registrar Updater solamente cuando `plugins.updater` sea un objeto de configuracion valido:
 
 - Updater para comprobar, descargar, verificar e instalar.
 - Process para relanzar la aplicacion despues de instalar.
+
+La configuracion base no contiene updater. En `tauri dev` el backend no registra el plugin y el frontend no consulta actualizaciones ni muestra la accion manual. Los builds de release reciben la configuracion mediante el overlay efimero.
 
 No usar `plugin-upload`; ese plugin solo transfiere archivos por HTTP y no implementa actualizaciones de aplicaciones.
 
@@ -185,7 +188,7 @@ Crear durante la release un overlay efimero equivalente a esta configuracion; el
 {
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {
@@ -205,7 +208,7 @@ Configurar bundles explicitos por job:
 
 ### Resultado esperado
 
-Cada build genera instaladores normales y artefactos firmados para el updater.
+Linux sanea primero el AppImage y firma despues los bytes finales de AppImage, DEB y RPM. NSIS genera su firma en el build dedicado; MSI permanece manual.
 
 ## Etapa 8: Implementar la experiencia de actualizacion
 
@@ -255,7 +258,7 @@ error
 
 Reutilizar `Modal`, `Button`, `Spinner` y `Toast` existentes.
 
-Agregar una accion manual `Buscar actualizaciones` dentro del shell para recuperar el flujo si el usuario eligio `Despues`.
+Agregar una accion manual `Buscar actualizaciones` dentro del shell para recuperar el flujo si el usuario eligio `Despues`. No mostrarla en desarrollo, donde el updater esta deshabilitado.
 
 ### Resultado esperado
 
@@ -282,6 +285,8 @@ Cubrir:
 - En Linux, relanzamiento solo tras confirmacion si la instalacion devuelve el control; en Windows, NSIS puede cerrar la aplicacion.
 - Advertencia de sesion y carrito.
 - Consulta manual despues de elegir `Despues`.
+- En desarrollo no se llama al plugin ni se muestra la consulta manual.
+- En produccion se conservan la comprobacion inicial y manual.
 
 ### Resultado esperado
 
@@ -322,8 +327,8 @@ Crear `.github/workflows/release.yml`.
 Disparadores:
 
 ```text
-tags v*
-workflow_dispatch controlado
+workflow_run desde la solicitud no privilegiada de tags
+workflow_dispatch controlado con modos validate y publish
 ```
 
 Permisos:
@@ -348,30 +353,34 @@ Agregar concurrencia global de publicacion para impedir que releases de tags dis
 - Runner `ubuntu-24.04`.
 - Instalar dependencias oficiales de Tauri 2.
 - Generar AppImage, `.deb` y `.rpm`.
-- Generar el AppImage nativo y su firma `.AppImage.sig` para el updater.
-- Subir los bundles como artefactos temporales de Actions para el job final.
+- Eliminar del AppImage final las familias `libwayland-client`, `cursor`, `egl` y `server` incluidas por el bundler.
+- Firmar explicitamente los bytes finales de AppImage, DEB y RPM.
+- Verificar las tres firmas con `minisign` antes de subir exactamente seis archivos.
 
-Construir el AppImage en Ubuntu evita la incompatibilidad entre el `strip` antiguo de `linuxdeploy` y las bibliotecas `.relr.dyn` de CachyOS.
+El saneamiento evita mezclar las bibliotecas Wayland incluidas por Ubuntu con Mesa reciente del host. La firma anterior al saneamiento se descarta siempre.
 
 ### Job Windows NSIS
 
 - Runner `windows-latest`.
-- Generar instalador NSIS.
-- Generar la firma `-setup.exe.sig` del instalador nativo.
+- Generar el instalador NSIS sin exponer la clave privada al build.
+- Firmar despues el `-setup.exe` final en un paso minimo y generar `-setup.exe.sig`.
 - Subir el resultado como artefacto temporal de Actions para el job final.
 
 ### Job Windows MSI
 
 - Generar MSI como instalador manual.
+- Compilarlo sin `VITE_UPDATER_ENABLED` y sin `plugins.updater`.
 - Subirlo como artefacto temporal de Actions para el job final.
 - Evitar que sustituya la entrada NSIS en `latest.json`.
 
-### Publicacion
+### Ensamblado y publicacion
 
 - Usar una version estable de `tauri-apps/tauri-action`, preferentemente fijada por SHA.
-- Generar y validar `latest.json` en el job final a partir de los artefactos nativos.
+- Ejecutar siempre un job `assemble` con `contents: read`, verificar las cuatro firmas y generar `latest.json` a partir de los artefactos nativos.
+- En `mode=validate`, subir el candidato verificado como artifact de Actions y omitir por completo el job de publicacion.
 - Crear o reutilizar la release en borrador despues de que termine la matriz y se verifiquen las firmas locales.
-- Publicar automaticamente y de forma atomica solamente cuando Linux, NSIS, MSI, firmas y `latest.json` esten completos y los assets remotos hayan sido revalidados.
+- Conceder `contents: write` solo al job `publish`, condicionado a un tag valido.
+- Publicar automaticamente y de forma atomica solamente cuando los nueve assets, `latest.json`, firmas y SHA-256 remotos hayan sido revalidados.
 - Si falla una plataforma, no crear un borrador nuevo; si existia uno de un intento anterior, conservarlo, y mantener la release estable anterior como `latest`.
 
 ### Resultado esperado
@@ -383,9 +392,8 @@ Un tag valido produce una release completa para Linux y Windows sin publicar man
 Antes de publicar comprobar:
 
 - Version igual al tag.
-- Entrada `linux-x86_64` apuntando al updater AppImage.
-- Entrada `windows-x86_64` apuntando al updater NSIS.
-- Firmas no vacias.
+- Entradas `linux-x86_64-appimage`, `linux-x86_64-deb`, `linux-x86_64-rpm` y `windows-x86_64-nsis` apuntando a su propio formato.
+- Cuatro firmas no vacias y criptograficamente correspondientes.
 - URLs pertenecientes a la misma release.
 - Archivos referenciados realmente existentes.
 - Ausencia de referencias a MSI como canal updater.
@@ -396,7 +404,7 @@ Los clientes siempre descargan el formato correcto y una firma correspondiente.
 
 ## Etapa 13: Prueba real N-1 a N
 
-1. Instalar una release N-1 real en Linux AppImage.
+1. Instalar una release N-1 real en Linux mediante AppImage, DEB y RPM.
 2. Instalar una release N-1 real en Windows mediante NSIS.
 3. Crear propietario, productos, inventario y ventas.
 4. Publicar N mediante el workflow estable, o usar una build QA separada con un endpoint publico/controlado; los drafts no son visibles mediante `/releases/latest`.
@@ -404,7 +412,7 @@ Los clientes siempre descargan el formato correcto y una firma correspondiente.
 6. Elegir `Despues` y comprobar que la aplicacion sigue funcionando.
 7. Reiniciar y confirmar que vuelve a preguntar.
 8. Elegir `Actualizar ahora`.
-9. Verificar descarga, firma e instalacion; en Windows aceptar el cierre por NSIS y en Linux confirmar el relanzamiento si la llamada regresa.
+9. Verificar descarga, firma e instalacion; confirmar reemplazo AppImage, elevacion DEB/RPM y cierre esperado de NSIS.
 10. Confirmar que SQLite y los datos sobreviven.
 11. Probar firma invalida, JSON corrupto y descarga interrumpida.
 12. Probar rutas con espacios y usuario sin privilegios administrativos.
@@ -426,7 +434,7 @@ Documentar:
 - Como publicar o cancelar una release.
 - Como recuperar una release fallida.
 - Como respaldar y rotar claves sin bloquear clientes antiguos.
-- Diferencia entre instaladores manuales y canales autoactualizables.
+- Comportamiento de AppImage, DEB, RPM y NSIS como canales independientes, y MSI como instalador manual.
 
 ### Resultado esperado
 
@@ -460,7 +468,9 @@ En CI tambien se verificara la generacion de:
 - Los tags `vX.Y.Z` crean o reutilizan un borrador durante el ensamblado final y lo publican automaticamente despues de todos los gates.
 - Linux genera AppImage, `.deb` y `.rpm`.
 - Windows genera NSIS y MSI.
-- AppImage y NSIS cuentan con artefactos updater firmados.
+- AppImage, DEB, RPM y NSIS cuentan con firmas updater verificadas.
+- `latest.json` contiene solamente cuatro claves especificas por formato.
+- `mode=validate` construye y verifica sin permisos de publicacion.
 - `latest.json` solo se publica cuando todas las plataformas terminan.
 - La aplicacion consulta actualizaciones al iniciar.
 - La modal solo aparece cuando hay una version nueva.

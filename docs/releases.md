@@ -6,7 +6,7 @@ Esta guia corresponde al repositorio publico `98beto/pos_tauri`, la rama `main` 
 https://github.com/98beto/pos_tauri/releases/latest/download/latest.json
 ```
 
-El workflow compila el commit inmutable de un tag `vX.Y.Z`, valida todos los artefactos, crea o reutiliza una release en borrador y la publica automaticamente solo despues de superar todos los gates. No hay un paso manual de publicacion entre la validacion y `gh release edit --draft=false --latest`.
+El workflow admite `validate` y `publish`. `validate` compila el `HEAD` de `main`, firma y verifica todos los bundles y conserva un artifact candidato durante siete dias sin crear ni modificar releases. `publish` compila el commit inmutable de un tag `vX.Y.Z`, crea o reutiliza una release en borrador y la publica automaticamente solo despues de superar todos los gates.
 
 ## Prerrequisitos locales
 
@@ -49,7 +49,7 @@ En `Settings > Environments`:
 
 Introducir los valores solamente en los campos protegidos de la interfaz. Evitar comandos CLI que incluyan el valor en argumentos, porque pueden quedar en el historial o la lista de procesos. La variable publica se inyecta en un overlay efimero durante la release; `src-tauri/tauri.conf.json` no contiene una clave de produccion ni un valor sustituible que pueda publicarse por accidente.
 
-Ejecutar manualmente `Release` no es una prueba inocua: si todos los gates pasan, publicara la release.
+Para probar bundles antes del tag, ejecutar manualmente `Release` desde `main` con `mode=validate`. El modo `publish` requiere un tag existente y puede publicar la release; comprobar siempre el modo seleccionado.
 
 ## Preparar una version
 
@@ -90,51 +90,62 @@ No mover ni reutilizar un tag enviado. El workflow exige que su commit pertenezc
 
 ## Ejecucion del workflow
 
-Un push de `v*` ejecuta primero `Release request`, que no tiene secrets ni permisos de escritura. Al terminar correctamente, `Release` se carga desde la rama default mediante `workflow_run`, obtiene exactamente un tag SemVer que apunte a `workflow_run.head_sha`, exige que el SHA pertenezca a `origin/main` y compila ese SHA. `workflow_dispatch` solo puede lanzarse seleccionando `main`; recibe un tag `vX.Y.Z` ya existente y aplica las mismas validaciones. Se usa para recuperar o reintentar, no para publicar codigo sin tag.
+Un push de `v*` ejecuta primero `Release request`, que no tiene secrets ni permisos de escritura. Al terminar correctamente, `Release` se carga desde la rama default mediante `workflow_run`, obtiene exactamente un tag SemVer que apunte a `workflow_run.head_sha`, exige que el SHA pertenezca a `origin/main` y compila ese SHA.
 
-Cada job firmado genera `dist` con `pnpm build` antes de exponer los secrets. El overlay efimero anula `build.beforeBuildCommand`, por lo que `tauri-action` reutiliza ese `frontendDist` y Vite o sus plugins no heredan las credenciales de firma. La compilacion Rust firmada si recibe necesariamente esos secrets.
+`workflow_dispatch` solo puede lanzarse seleccionando `main`:
 
-Windows MSI, que no recibe secretos, puede compilar mientras espera la aprobacion. Tras la aprobacion de los required reviewers, se ejecutan los jobs firmados de Linux y Windows NSIS. Sus resultados temporales duran siete dias. El job `publish` tambien usa el environment protegido y:
+- `mode=validate` usa el `HEAD` de `origin/main`, deriva el tag desde `package.json`, construye el candidato completo y deja omitido el job con `contents: write`.
+- `mode=publish` requiere un tag `vX.Y.Z` existente y sirve para recuperar o reintentar la publicacion normal.
 
-1. Verifica criptograficamente las firmas locales.
-2. Confirma que el tag remoto sigue apuntando al commit validado.
-3. Crea o reutiliza el borrador.
-4. Genera `latest.json` y valida version, URLs, firmas y el conjunto exacto de assets.
-5. Sube los assets, vuelve a descargarlos y repite la verificacion remota.
-6. Publica atomica y automaticamente la release como `latest`.
+Cada job genera `dist` con `pnpm build` antes de cualquier acceso a secrets. Linux compila sin la clave privada, sanea el AppImage y expone la clave solamente al paso que firma los tres instaladores finales. NSIS tambien compila sin la clave y la expone solo al firmador posterior. MSI no recibe secretos ni configuracion del updater. El overlay efimero anula `build.beforeBuildCommand`, por lo que Vite o sus plugins no heredan credenciales de firma.
+
+Windows MSI, que no recibe secretos, puede compilar mientras espera la aprobacion. Tras la aprobacion de los required reviewers, se ejecutan Linux y Windows NSIS. El job `assemble`, con `contents: read`, se ejecuta en ambos modos y:
+
+1. Canonicaliza los nombres de assets.
+2. Verifica criptograficamente las cuatro firmas locales.
+3. Genera `latest.json` y valida version, nombres, URLs, firmas y conjunto exacto.
+4. Sube un artifact `release-candidate` con nueve assets nativos y `latest.json`.
+
+Solo en `publish`, un job separado con `contents: write` confirma de nuevo tag y commit, crea o reutiliza el borrador, sube el candidato, vuelve a descargarlo, compara los SHA-256 de los diez archivos y publica la release como `latest`.
 
 ## Artefactos esperados
 
-La config base mantiene `createUpdaterArtifacts=false`, por lo que builds normales no requieren firma. Para `1.2.3`, el overlay efimero de release establece `createUpdaterArtifacts=true` en Linux/NSIS y `false` en MSI; produce estos siete assets nativos y el workflow agrega `latest.json`:
+La config base mantiene `createUpdaterArtifacts=false`, por lo que builds normales no requieren firma. Para `1.2.3`, el workflow firma los cuatro canales updater y exige estos nueve assets nativos antes de agregar `latest.json`:
 
 ```text
-Linea POS_1.2.3_amd64.AppImage
-Linea POS_1.2.3_amd64.AppImage.sig
-Linea POS_1.2.3_amd64.deb
-Linea POS-1.2.3-1.x86_64.rpm
-Linea POS_1.2.3_x64-setup.exe
-Linea POS_1.2.3_x64-setup.exe.sig
-Linea POS_1.2.3_x64_en-US.msi
+Linea.POS_1.2.3_amd64.AppImage
+Linea.POS_1.2.3_amd64.AppImage.sig
+Linea.POS_1.2.3_amd64.deb
+Linea.POS_1.2.3_amd64.deb.sig
+Linea.POS-1.2.3-1.x86_64.rpm
+Linea.POS-1.2.3-1.x86_64.rpm.sig
+Linea.POS_1.2.3_x64-setup.exe
+Linea.POS_1.2.3_x64-setup.exe.sig
+Linea.POS_1.2.3_x64_en-US.msi
 latest.json
 ```
 
-Una version futura cambia solo el segmento de version. Cada sufijo debe existir exactamente una vez. No son validos los formatos heredados `*.AppImage.tar.gz`, `*.AppImage.tar.gz.sig`, `*.nsis.zip` o `*.nsis.zip.sig`.
+Una version futura cambia solo el segmento de version. Los basenames, producto, arquitectura y locale deben coincidir exactamente. No son validos los formatos heredados `*.AppImage.tar.gz`, `*.AppImage.tar.gz.sig`, `*.nsis.zip` o `*.nsis.zip.sig`.
 
 | Plataforma | Instalacion manual | Updater |
 | --- | --- | --- |
-| Linux | AppImage, `.deb`, `.rpm` | AppImage y su `.sig` |
+| Linux | AppImage, `.deb`, `.rpm` | AppImage, DEB y RPM, cada uno con su `.sig` |
 | Windows | NSIS `setup.exe`, MSI | NSIS `setup.exe` y su `.sig` |
 
-`latest.json` contiene solamente `linux-x86_64` apuntando al AppImage y `windows-x86_64` apuntando al `setup.exe`. `.deb`, `.rpm` y MSI son manuales y nunca deben aparecer como URL del updater.
+`latest.json` contiene solamente `linux-x86_64-appimage`, `linux-x86_64-deb`, `linux-x86_64-rpm` y `windows-x86_64-nsis`. Cada entrada apunta a su formato nativo y usa la firma del mismo archivo. MSI permanece manual y nunca aparece como URL del updater.
+
+AppImage se actualiza reemplazando el ejecutable. DEB usa `dpkg -i` y RPM usa `rpm -U`; ambos pueden requerir elevacion administrativa. El usuario confirma antes de descargar e instalar. Actualizar o desinstalar el paquete no elimina `pos.db`, almacenada en el directorio de datos de `com.beto98.pos-tauri`.
+
+El frontend del updater se compila con `VITE_UPDATER_ENABLED=true` solamente para AppImage, DEB, RPM y NSIS. MSI y builds de produccion sin overlay no registran ni ofrecen el updater.
 
 ## Revision, publicacion y cancelacion
 
-El borrador solo existe durante la fase final y puede durar pocos segundos. Si se necesita observarlo, abrir `Releases` mientras corre `Assemble and atomically publish` y comprobar:
+El borrador solo existe durante la fase final y puede durar pocos segundos. Si se necesita observarlo, abrir `Releases` mientras corre `Atomically publish verified candidate` y comprobar:
 
 - Tag, titulo y notas correctos.
-- Los siete assets nativos y `latest.json`, sin residuos de otro intento.
-- Version igual al tag, fecha valida, notas no vacias, dos plataformas y URLs de esa release.
-- Firmas no vacias y `.sig` emparejados exactamente con AppImage y NSIS.
+- Los nueve assets nativos y `latest.json`, sin residuos de otro intento.
+- Version igual al tag, fecha valida, notas no vacias, cuatro plataformas y URLs de esa release.
+- Firmas no vacias y `.sig` emparejados exactamente con AppImage, DEB, RPM y NSIS.
 
 La inspeccion visual no reemplaza los gates: el workflow verifica firmas con `minisign`, compara el conjunto remoto con el local y valida el manifiesto descargado. No pulsar `Publish release` manualmente; puede saltarse comprobaciones pendientes. El workflow publica por si mismo.
 
@@ -159,18 +170,18 @@ Una release incompleta que sigue en draft no es visible mediante `/releases/late
 
 ## Primera release con updater
 
-Una aplicacion anterior al plugin updater no puede descubrir la primera release habilitada. Esa version se instala manualmente mediante AppImage o NSIS y sirve como N-1. La prueba real requiere publicar despues una segunda version habilitada N:
+Una aplicacion anterior al plugin updater no puede descubrir la primera release habilitada. Esa version se instala manualmente y sirve como N-1. La prueba real requiere publicar despues una segunda version habilitada N:
 
 1. Publicar la primera release habilitada y comprobar que `latest.json` es publico.
-2. Instalar su AppImage en Linux y su NSIS en Windows.
+2. Instalar AppImage, DEB, RPM y NSIS en sus sistemas de prueba.
 3. Crear datos representativos y cerrar/reabrir la aplicacion.
 4. Preparar y publicar la siguiente version con el workflow.
-5. Ejecutar la lista N-1 a N en ambas plataformas.
+5. Ejecutar la lista N-1 a N en los cuatro canales.
 
 ## Prueba real N-1 a N
 
-1. Instalar N-1 desde sus assets publicados: AppImage en Linux y NSIS por usuario en Windows.
-2. Probar rutas con espacios para el AppImage o descarga cuando la plataforma lo permita.
+1. Instalar N-1 desde sus assets publicados en cuatro entornos: AppImage, DEB, RPM y NSIS.
+2. Probar rutas con espacios para AppImage o descarga cuando la plataforma lo permita.
 3. Crear propietario, productos, inventario y una venta; anotar totales y conteos.
 4. Dejar un carrito no cobrado y comprobar su advertencia.
 5. Confirmar que N-1 detecta N al iniciar, muestra versiones/notas y no descarga antes de `Actualizar ahora`.
@@ -178,9 +189,9 @@ Una aplicacion anterior al plugin updater no puede descubrir la primera release 
 7. Reiniciar N-1 y confirmar que vuelve a ofrecer N.
 8. Actualizar sin checkout ni mutacion del carrito en curso.
 9. En Windows aceptar que NSIS puede cerrar la aplicacion; `downloadAndInstall` no necesariamente regresa a la UI.
-10. En Linux, si la llamada regresa, comprobar que se pide confirmacion antes de relanzar.
+10. En Linux confirmar reemplazo de AppImage o elevacion para `dpkg -i`/`rpm -U`, y comprobar el relanzamiento cuando la llamada regrese.
 11. Abrir N, verificar su version y confirmar que SQLite, propietario, productos, inventario y ventas sobrevivieron.
-12. Repetir con usuario estandar sin privilegios administrativos y registrar cualquier elevacion inesperada.
+12. Repetir con usuario estandar, confirmar la elevacion esperada para DEB/RPM y registrar cancelaciones o fallos.
 
 Probar por separado en un entorno controlado: `latest.json` malformado, firma alterada o de otro archivo, interrupcion de red y cierre durante la descarga. La instalacion vigente debe permanecer utilizable y un reintento posterior debe ser posible.
 
@@ -224,8 +235,10 @@ La `.sig` de Tauri autentica el artefacto para clientes que confian en la clave 
 | Tag fuera de `main` | Integrar normalmente y crear un tag nuevo sobre `main`. |
 | Falta la publica | Revisar `TAURI_UPDATER_PUBLIC_KEY`; no agregarla literal a la config base. |
 | Falla la firma | Revisar ambos secrets, contrasena y pareja publica; no imprimir valores. |
-| Se esperan archivos comprimidos | Son heredados; se exigen AppImage/NSIS nativos y sus `.sig`. |
-| `latest.json` apunta a MSI | Cancelar; debe apuntar a `*-setup.exe`. MSI es manual. |
+| Se esperan archivos comprimidos | Son heredados; se exigen AppImage, DEB, RPM y NSIS nativos con sus `.sig`. |
+| Falta una firma DEB/RPM | Cancelar; los cuatro canales updater deben estar firmados y verificados. |
+| `latest.json` usa una clave generica | Cancelar; debe usar las cuatro claves especificas por formato. |
+| `latest.json` apunta a MSI | Cancelar; MSI es exclusivamente manual. |
 | El draft no aparece en `/latest` | Es normal; usar el procedimiento QA para staging. |
 | No ofrece la primera version habilitada | Instalar manualmente la primera base con updater. |
 | Windows cierra la app | Es esperado durante NSIS; despues verificar N y SQLite. |
