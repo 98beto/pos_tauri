@@ -12,6 +12,7 @@ export type CartReportVersion = {
 };
 
 export type UpdaterControls = {
+  enabled: boolean;
   manualCheck: () => void;
   checking: boolean;
   busy: boolean;
@@ -23,6 +24,7 @@ export type UpdaterControls = {
 };
 
 const defaultControls: UpdaterControls = {
+  enabled: false,
   manualCheck: () => undefined,
   checking: false,
   busy: false,

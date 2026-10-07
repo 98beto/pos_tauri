@@ -68,6 +68,7 @@ const product = {
 
 function updaterControls(overrides: Partial<UpdaterControls> = {}): UpdaterControls {
   return {
+    enabled: true,
     manualCheck: vi.fn(),
     checking: false,
     busy: false,

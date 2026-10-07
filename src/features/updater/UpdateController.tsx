@@ -3,6 +3,7 @@ import {
   checkForUpdate,
   checkForUpdateAtStartup,
   classifyUpdaterError,
+  isUpdaterEnabled,
   relaunchApplication,
   type AvailableUpdate,
   type UpdaterErrorKind,
@@ -29,6 +30,7 @@ function formatBytes(bytes: number) {
 }
 
 export function UpdateController({ sessionId, children }: { sessionId?: number; children: ReactNode }) {
+  const enabled = isUpdaterEnabled();
   const [stage, setStage] = useState<Stage>("idle");
   const [update, setUpdate] = useState<AvailableUpdate>();
   const [checking, setChecking] = useState(false);
@@ -87,19 +89,21 @@ export function UpdateController({ sessionId, children }: { sessionId?: number; 
   useEffect(() => {
     active.current = true;
     let cancelled = false;
-    void checkForUpdateAtStartup()
-      .then((available) => {
-        if (!available) return;
-        if (!cancelled) presentUpdate(available);
-        else if (!active.current) closeUpdate(available);
-      })
-      .catch((error: unknown) => {
-        if (cancelled || !active.current) return;
-        const kind = classifyUpdaterError(error, "check");
-        if (kind === "network" || kind === "unknown") return;
-        setErrorKind(kind);
-        setStage("error");
-      });
+    if (enabled) {
+      void checkForUpdateAtStartup()
+        .then((available) => {
+          if (!available) return;
+          if (!cancelled) presentUpdate(available);
+          else if (!active.current) closeUpdate(available);
+        })
+        .catch((error: unknown) => {
+          if (cancelled || !active.current) return;
+          const kind = classifyUpdaterError(error, "check");
+          if (kind === "network" || kind === "unknown") return;
+          setErrorKind(kind);
+          setStage("error");
+        });
+    }
     return () => {
       cancelled = true;
       active.current = false;
@@ -107,7 +111,7 @@ export function UpdateController({ sessionId, children }: { sessionId?: number; 
       updateResource.current = undefined;
       closeUpdate(retained);
     };
-  }, [closeUpdate, presentUpdate]);
+  }, [closeUpdate, enabled, presentUpdate]);
 
   useEffect(() => {
     if (cartOwner.current && cartOwner.current.sessionId !== sessionId) cartOwner.current = undefined;
@@ -134,7 +138,7 @@ export function UpdateController({ sessionId, children }: { sessionId?: number; 
   }, [stage]);
 
   const manualCheck = useCallback(() => {
-    if (checking || actionInFlight.current) return;
+    if (!enabled || checking || actionInFlight.current) return;
     setChecking(true);
     setNotice(undefined);
     void checkForUpdate()
@@ -159,7 +163,7 @@ export function UpdateController({ sessionId, children }: { sessionId?: number; 
       .finally(() => {
         if (active.current) setChecking(false);
       });
-  }, [checking, closeUpdate, presentUpdate]);
+  }, [checking, closeUpdate, enabled, presentUpdate]);
 
   const beginCartReporting = useCallback((ownerSessionId: number) => {
     const generation = ++cartGeneration.current;
@@ -308,7 +312,7 @@ export function UpdateController({ sessionId, children }: { sessionId?: number; 
           : "No se pudo actualizar";
 
   return (
-    <UpdaterProvider value={{ manualCheck, checking, busy, beginCartReporting, beginCartOperation, reportCart, runCartMutation, runCheckout }}>
+    <UpdaterProvider value={{ enabled, manualCheck, checking, busy, beginCartReporting, beginCartOperation, reportCart, runCartMutation, runCheckout }}>
       {children}
       <Modal
         open={stage !== "idle"}

@@ -14,6 +14,10 @@ export type UpdaterErrorKind = "network" | "integrity" | "configuration" | "down
 let startupCheck: Promise<AvailableUpdate | null> | undefined;
 let checkInFlight: Promise<AvailableUpdate | null> | undefined;
 
+export function isUpdaterEnabled() {
+  return !import.meta.env.DEV && import.meta.env.VITE_UPDATER_ENABLED === "true";
+}
+
 async function performCheck() {
   const update = await check();
   if (!update) return null;
@@ -41,11 +45,13 @@ function singleFlightCheck() {
 }
 
 export function checkForUpdateAtStartup() {
+  if (!isUpdaterEnabled()) return Promise.resolve(null);
   startupCheck ??= singleFlightCheck();
   return startupCheck;
 }
 
 export function checkForUpdate() {
+  if (!isUpdaterEnabled()) return Promise.resolve(null);
   return singleFlightCheck();
 }
 

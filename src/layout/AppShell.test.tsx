@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { user } from "../test/fixtures";
+import { UpdaterProvider, type UpdaterControls } from "../features/updater/UpdaterContext";
 import { AppShell } from "./AppShell";
 
 vi.mock("../features/pos/PosView", () => ({
@@ -11,11 +12,23 @@ vi.mock("../features/inventory/InventoryView", () => ({ InventoryView: ({ onNoti
 vi.mock("../features/sales/SalesView", () => ({ SalesView: () => <div>Vista ventas</div> }));
 
 describe("AppShell", () => {
+  const updaterControls: UpdaterControls = {
+    enabled: true,
+    manualCheck: vi.fn(),
+    checking: false,
+    busy: false,
+    beginCartReporting: () => 0,
+    beginCartOperation: () => true,
+    reportCart: () => true,
+    runCartMutation: (_sessionId, _version, operation) => operation(),
+    runCheckout: (_sessionId, operation) => operation(),
+  };
+
   it("navigates between views and delegates logout and session expiry", () => {
     const onLogout = vi.fn();
     const onSessionRequired = vi.fn();
     const onNotice = vi.fn();
-    render(<AppShell user={user} sessionId={1} loggingOut={false} onLogout={onLogout} onNotice={onNotice} onSessionRequired={onSessionRequired} />);
+    render(<UpdaterProvider value={updaterControls}><AppShell user={user} sessionId={1} loggingOut={false} onLogout={onLogout} onNotice={onNotice} onSessionRequired={onSessionRequired} /></UpdaterProvider>);
     expect(screen.getByRole("button", { name: "Buscar actualizaciones" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Productos" }));
@@ -31,5 +44,10 @@ describe("AppShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cerrar sesion" }));
     expect(onSessionRequired).toHaveBeenCalledOnce();
     expect(onLogout).toHaveBeenCalledOnce();
+  });
+
+  it("hides the updater action safely without a provider", () => {
+    render(<AppShell user={user} sessionId={1} loggingOut={false} onLogout={vi.fn()} onNotice={vi.fn()} onSessionRequired={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Buscar actualizaciones" })).toBeNull();
   });
 });

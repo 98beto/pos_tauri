@@ -1,10 +1,10 @@
 import { StrictMode, useState } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { resetUpdaterSessionForTests } from "../../api/updater";
+import { checkForUpdate, checkForUpdateAtStartup, resetUpdaterSessionForTests } from "../../api/updater";
 import { getCart, incrementCartItem } from "../../api/cart";
 import { listCategories } from "../../api/categories";
 import { cart, deferred, emptyCart, user } from "../../test/fixtures";
@@ -45,10 +45,11 @@ function createUpdate(overrides: Record<string, unknown> = {}) {
 }
 
 function Harness() {
-  const { manualCheck, beginCartReporting, beginCartOperation, reportCart, runCheckout } = useUpdater();
+  const { enabled, manualCheck, beginCartReporting, beginCartOperation, reportCart, runCheckout } = useUpdater();
   const [posVisible, setPosVisible] = useState(true);
   const [cartGeneration] = useState(() => beginCartReporting(7));
   return <div>
+    <span>updater-enabled:{String(enabled)}</span>
     <button onClick={manualCheck}>manual-test</button>
     <button onClick={() => setPosVisible((visible) => !visible)}>navigate-test</button>
     {posVisible && <>
@@ -86,6 +87,8 @@ function renderController(strict = false) {
 }
 
 beforeEach(() => {
+  vi.stubEnv("DEV", false);
+  vi.stubEnv("VITE_UPDATER_ENABLED", "true");
   resetUpdaterSessionForTests();
   checkoutRequest = deferred<void>();
   mockedCheck.mockReset();
@@ -95,11 +98,38 @@ beforeEach(() => {
   vi.mocked(listCategories).mockReset().mockResolvedValue([]);
 });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe("UpdateController", () => {
-  it("performs exactly one silent startup check under StrictMode", async () => {
+  it("disables startup and manual checks in development at the controller and API boundaries", async () => {
+    vi.stubEnv("DEV", true);
+    renderController();
+    expect(screen.getByText("updater-enabled:false")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "manual-test" }));
+    expect(await checkForUpdateAtStartup()).toBeNull();
+    expect(await checkForUpdate()).toBeNull();
+    expect(mockedCheck).not.toHaveBeenCalled();
+  });
+
+  it("disables checks in production builds without an updater channel", async () => {
+    vi.stubEnv("VITE_UPDATER_ENABLED", "false");
+    renderController();
+    expect(screen.getByText("updater-enabled:false")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "manual-test" }));
+    expect(await checkForUpdateAtStartup()).toBeNull();
+    expect(await checkForUpdate()).toBeNull();
+    expect(mockedCheck).not.toHaveBeenCalled();
+  });
+
+  it("performs exactly one silent startup check in production under StrictMode", async () => {
     mockedCheck.mockResolvedValue(null);
     renderController(true);
     await act(async () => undefined);
+    expect(screen.getByText("updater-enabled:true")).toBeTruthy();
     expect(mockedCheck).toHaveBeenCalledOnce();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -172,7 +202,7 @@ describe("UpdateController", () => {
     expect(update.close).toHaveBeenCalledOnce();
   });
 
-  it("postpones for the session and a manual check recovers the flow", async () => {
+  it("preserves the manual check flow in production after postponing", async () => {
     const first = createUpdate();
     const second = createUpdate({ version: "0.2.1" });
     mockedCheck.mockResolvedValueOnce(first as never).mockResolvedValueOnce(second as never);

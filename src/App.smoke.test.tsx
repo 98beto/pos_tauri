@@ -22,6 +22,7 @@ describe("App smoke", () => {
     render(<App />);
     expect(await screen.findByRole("heading", { name: "Carrito actual" })).toBeTruthy();
     expect(screen.getByText(`${user.first_name} ${user.last_name}`)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Buscar actualizaciones" })).toBeNull();
     expect(invokeMock).toHaveBeenCalledWith("owner_exists");
     expect(invokeMock).toHaveBeenCalledWith("current_user");
     expect(invokeMock).toHaveBeenCalledWith("get_cart");

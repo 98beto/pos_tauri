@@ -7,6 +7,11 @@ mod services;
 use std::sync::Mutex;
 use tauri::Manager;
 
+#[cfg(desktop)]
+fn updater_is_configured(plugins: &tauri::utils::config::PluginConfig) -> bool {
+    matches!(plugins.0.get("updater"), Some(serde_json::Value::Object(_)))
+}
+
 #[cfg(not(debug_assertions))]
 const GENERIC_ERROR_MESSAGE: &str = "The application encountered an unexpected error.";
 
@@ -37,8 +42,10 @@ pub fn run() {
     let result = builder
         .setup(|app| {
             #[cfg(desktop)]
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            if updater_is_configured(&app.config().plugins) {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+            }
 
             let connection = db::open_database(app)?;
             #[cfg(debug_assertions)]
@@ -94,6 +101,59 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(desktop)]
+    fn plugin_config(value: serde_json::Value) -> tauri::utils::config::PluginConfig {
+        serde_json::from_value(value).expect("plugin config should deserialize")
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn updater_is_not_configured_when_absent() {
+        assert!(!updater_is_configured(&plugin_config(
+            serde_json::json!({})
+        )));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn updater_is_not_configured_when_null() {
+        assert!(!updater_is_configured(&plugin_config(
+            serde_json::json!({ "updater": null })
+        )));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn updater_is_not_configured_when_string() {
+        assert!(!updater_is_configured(&plugin_config(
+            serde_json::json!({ "updater": "configured" })
+        )));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn updater_is_not_configured_when_array() {
+        assert!(!updater_is_configured(&plugin_config(
+            serde_json::json!({ "updater": [] })
+        )));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn updater_is_not_configured_when_boolean() {
+        assert!(!updater_is_configured(&plugin_config(
+            serde_json::json!({ "updater": true })
+        )));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn updater_is_configured_when_object() {
+        assert!(updater_is_configured(&plugin_config(serde_json::json!({
+            "updater": {}
+        }))));
+    }
 
     #[cfg(debug_assertions)]
     #[test]

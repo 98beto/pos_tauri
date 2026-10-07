@@ -24,7 +24,7 @@ function localDateValue(date: Date) {
 
 export function Topbar({ view, menuOpen, onOpenMenu }: TopbarProps) {
   const [date, setDate] = useState(() => new Date());
-  const { manualCheck, checking, busy } = useUpdater();
+  const { enabled: updaterEnabled, manualCheck, checking, busy } = useUpdater();
 
   useEffect(() => {
     let timeout: number;
@@ -60,10 +60,10 @@ export function Topbar({ view, menuOpen, onOpenMenu }: TopbarProps) {
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2 text-[0.6875rem] font-semibold text-muted">
-        <button type="button" onClick={manualCheck} disabled={checking || busy} className="inline-flex min-h-9 items-center gap-2 rounded-control border border-line bg-surface/70 px-3 font-bold text-muted transition hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:cursor-not-allowed disabled:opacity-45" aria-label={checking ? "Buscando actualizaciones" : "Buscar actualizaciones"}>
+        {updaterEnabled && <button type="button" onClick={manualCheck} disabled={checking || busy} className="inline-flex min-h-9 items-center gap-2 rounded-control border border-line bg-surface/70 px-3 font-bold text-muted transition hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:cursor-not-allowed disabled:opacity-45" aria-label={checking ? "Buscando actualizaciones" : "Buscar actualizaciones"}>
           <svg viewBox="0 0 24 24" className={`size-4 ${checking ? "animate-spin" : ""}`} fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7" /></svg>
           <span className="hidden lg:inline">{checking ? "Buscando…" : "Buscar actualizaciones"}</span>
-        </button>
+        </button>}
         <span className="hidden items-center rounded-control border border-line bg-surface/70 px-3 py-2 sm:inline-flex">
           <span className="mr-2 size-2 rounded-full bg-[#3b9b6d]" aria-hidden="true" />
           Sistema listo
