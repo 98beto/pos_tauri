@@ -45,6 +45,13 @@ test("can disable updater artifacts for the manual MSI build", () => {
   assert.equal(config.plugins.updater.pubkey, publicKey);
 });
 
+test("can omit updater configuration for a manual-only build", () => {
+  const config = createReleaseConfig(undefined, false, false);
+
+  assert.equal(config.bundle.createUpdaterArtifacts, false);
+  assert.equal("plugins" in config, false);
+});
+
 test("disables the Tauri frontend build hook after the explicit unprivileged build", () => {
   assert.equal(createReleaseConfig(publicKey).build.beforeBuildCommand, "");
 });

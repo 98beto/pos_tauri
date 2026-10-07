@@ -24,7 +24,10 @@ async function fixture(t, versions = {}) {
   );
   await writeFile(
     path.join(root, "src-tauri", "tauri.conf.json"),
-    JSON.stringify({ version: versions.tauri ?? "1.2.3" }),
+    JSON.stringify({
+      version: versions.tauri ?? "1.2.3",
+      identifier: versions.identifier ?? "com.beto98.pos-tauri",
+    }),
   );
   return root;
 }
@@ -77,3 +80,12 @@ for (const source of ["package", "cargo", "tauri"]) {
     await assert.rejects(validateVersion("v1.2.3", root), /requires version 1\.2\.3/);
   });
 }
+
+test("rejects a changed Tauri application identifier", async (t) => {
+  const root = await fixture(t, { identifier: "com.example.other-app" });
+
+  await assert.rejects(
+    validateVersion("v1.2.3", root),
+    /identifier must remain com\.beto98\.pos-tauri/,
+  );
+});

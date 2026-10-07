@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const APPLICATION_IDENTIFIER = "com.beto98.pos-tauri";
 
 async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
@@ -51,6 +52,11 @@ export async function validateVersion(tag, rootDirectory = process.cwd()) {
       .map(([file, version]) => `${file} has ${JSON.stringify(version)}`)
       .join(", ");
     throw new Error(`Tag ${tag} requires version ${expectedVersion}; ${details}`);
+  }
+  if (tauriConfig.identifier !== APPLICATION_IDENTIFIER) {
+    throw new Error(
+      `src-tauri/tauri.conf.json identifier must remain ${APPLICATION_IDENTIFIER}`,
+    );
   }
 
   return expectedVersion;

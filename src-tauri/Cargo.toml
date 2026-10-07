@@ -1,6 +1,6 @@
 [package]
 name = "pos_tauri"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop point-of-sale application built with Tauri"
 authors = ["98beto"]
 repository = "https://github.com/98beto/pos_tauri"

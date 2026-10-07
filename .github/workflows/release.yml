@@ -6,16 +6,24 @@ on:
     types: [completed]
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing vX.Y.Z tag to release
+      mode:
+        description: Validate bundles or publish an existing immutable tag
         required: true
+        default: validate
+        type: choice
+        options:
+          - validate
+          - publish
+      tag:
+        description: Existing vX.Y.Z tag (required only for publish)
+        required: false
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-publish
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'publish' }}
   cancel-in-progress: false
 
 env:
@@ -24,10 +32,11 @@ env:
 
 jobs:
   validate:
-    name: Validate release
+    name: Validate release source
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     outputs:
+      mode: ${{ steps.release-source.outputs.mode }}
       tag: ${{ steps.release-source.outputs.tag }}
       sha: ${{ steps.release-source.outputs.sha }}
     steps:
@@ -37,9 +46,10 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve trusted release tag and immutable commit
+      - name: Resolve trusted release mode, tag, and immutable commit
         id: release-source
         env:
+          DISPATCH_MODE: ${{ inputs.mode }}
           DISPATCH_TAG: ${{ inputs.tag }}
           DISPATCH_REF: ${{ github.ref }}
           EVENT_NAME: ${{ github.event_name }}
@@ -55,14 +65,31 @@ jobs:
               echo "Manual releases must be dispatched from main" >&2
               exit 1
             fi
-            tag="$DISPATCH_TAG"
-            if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo "Invalid release tag; expected vX.Y.Z" >&2
+            mode="$DISPATCH_MODE"
+            if [[ "$mode" != "validate" && "$mode" != "publish" ]]; then
+              echo "Invalid release mode" >&2
               exit 1
             fi
-            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
-            sha="$(git rev-parse "${tag}^{commit}")"
+
+            if [[ "$mode" == "validate" ]]; then
+              sha="$(git rev-parse origin/main^{commit})"
+              version="$(git show "$sha:package.json" | jq -er .version)"
+              tag="v$version"
+              if [[ -n "$DISPATCH_TAG" && "$DISPATCH_TAG" != "$tag" ]]; then
+                echo "Validate tag input must match package.json ($tag)" >&2
+                exit 1
+              fi
+            else
+              tag="$DISPATCH_TAG"
+              if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                echo "Publish mode requires an existing vX.Y.Z tag" >&2
+                exit 1
+              fi
+              git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+              sha="$(git rev-parse "${tag}^{commit}")"
+            fi
           else
+            mode=publish
             if [[ "$REQUEST_EVENT" != "push" || "$REQUEST_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
               echo "Release request must be a push run from this repository" >&2
               exit 1
@@ -73,15 +100,17 @@ jobs:
             fi
             sha="$REQUEST_SHA"
             git fetch --force origin "+refs/tags/v*:refs/tags/v*"
-            mapfile -t tags < <(
-              while read -r ref; do
-                candidate="${ref#refs/tags/}"
-                if [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-                  && [[ "$(git rev-parse "${ref}^{commit}")" == "$sha" ]]; then
-                  printf '%s\n' "$candidate"
-                fi
-              done < <(git for-each-ref --format='%(refname)' 'refs/tags/v*')
-            )
+            tag_refs_file="$(mktemp "$RUNNER_TEMP/release-tag-refs.XXXXXX")"
+            git for-each-ref --format='%(refname)' 'refs/tags/v*' > "$tag_refs_file"
+            tags=()
+            while read -r ref; do
+              candidate="${ref#refs/tags/}"
+              if [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+                && [[ "$(git rev-parse "${ref}^{commit}")" == "$sha" ]]; then
+                tags+=("$candidate")
+              fi
+            done < "$tag_refs_file"
+            rm -f -- "$tag_refs_file"
             if [[ "${#tags[@]}" -ne 1 ]]; then
               echo "Expected exactly one vX.Y.Z tag at $sha; found ${#tags[@]}" >&2
               exit 1
@@ -90,7 +119,13 @@ jobs:
           fi
 
           git merge-base --is-ancestor "$sha" origin/main
+          version="$(git show "$sha:package.json" | jq -er .version)"
+          [[ "$tag" == "v$version" ]] || {
+            echo "Tag $tag does not match package.json version $version" >&2
+            exit 1
+          }
           git checkout --detach "$sha"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       # pnpm/action-setup v5.0.0; update this SHA when renewing the action.
@@ -112,25 +147,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri -> target
-      - name: Validate tag source and release state
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.release-source.outputs.tag }}
-        run: |
-          git merge-base --is-ancestor "${{ steps.release-source.outputs.sha }}" origin/main
-          response="$RUNNER_TEMP/release.json"
-          status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
-          if [[ "$status" == "200" ]] && [[ "$(jq -r .draft "$response")" != "true" ]]; then
-            echo "Release $TAG is already published" >&2
-            exit 1
-          fi
-          if [[ "$status" != "200" && "$status" != "404" ]]; then
-            echo "GitHub release lookup failed with HTTP $status" >&2
-            exit 1
-          fi
       - name: Require updater public key and create test overlay
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
@@ -180,46 +196,119 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri -> target
-      - name: Install Linux bundle dependencies
+      - name: Install Linux bundle and signature dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm minisign
       - run: pnpm install --frozen-lockfile
       - name: Build frontend without signing secrets
+        env:
+          VITE_UPDATER_ENABLED: "true"
         run: |
           pnpm build
           test -d dist
-      - name: Create ephemeral Tauri release config
+      - name: Create ephemeral Tauri release config without updater artifacts
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
-        run: node scripts/release-config.mjs --output "$RUNNER_TEMP/tauri.release.conf.json"
-      - name: Require updater signing secrets
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          : "${TAURI_SIGNING_PRIVATE_KEY:?TAURI_SIGNING_PRIVATE_KEY secret is required}"
-          : "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required}"
+        run: node scripts/release-config.mjs --output "$RUNNER_TEMP/tauri.release.conf.json" --disable-updater-artifacts
       # tauri-apps/tauri-action v1; update this SHA when renewing the action.
-      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Build Linux installers
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           projectPath: .
           args: --bundles appimage,deb,rpm --config "${{ runner.temp }}/tauri.release.conf.json" -- --locked
+      - name: Locate Linux installers and remove previous signatures
+        id: linux-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          locate_one() {
+            local directory=$1 pattern=$2 label=$3 output=$4
+            local matches_file
+            local -a matches=()
+            matches_file="$(mktemp "$RUNNER_TEMP/linux-asset-matches.XXXXXX")"
+            find "$directory" -maxdepth 1 -name "$pattern" -print0 > "$matches_file"
+            while IFS= read -r -d '' candidate; do
+              matches+=("$candidate")
+            done < "$matches_file"
+            rm -f -- "$matches_file"
+            (( ${#matches[@]} == 1 )) || {
+              echo "Expected exactly one $label, found ${#matches[@]}" >&2
+              exit 1
+            }
+            local asset=${matches[0]} basename=${matches[0]##*/}
+            [[ "$basename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]] || {
+              echo "Unsafe $label filename" >&2
+              exit 1
+            }
+            [[ -f "$asset" && ! -L "$asset" && -s "$asset" ]] || {
+              echo "$label must be a non-empty regular file, not a symlink" >&2
+              exit 1
+            }
+            rm -f -- "$asset.sig"
+            printf '%s=%s\n' "$output" "$asset" >> "$GITHUB_OUTPUT"
+          }
+          locate_one src-tauri/target/release/bundle/appimage '*.AppImage' AppImage appimage
+          locate_one src-tauri/target/release/bundle/deb '*.deb' DEB deb
+          locate_one src-tauri/target/release/bundle/rpm '*.rpm' RPM rpm
+      - name: Sanitize final AppImage bytes
+        env:
+          APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
+        run: |
+          scripts/sanitize-appimage.sh "$APPIMAGE"
+      - name: Sign final Linux installer bytes
+        env:
+          APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
+          DEB: ${{ steps.linux-assets.outputs.deb }}
+          RPM: ${{ steps.linux-assets.outputs.rpm }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          pnpm tauri signer sign "$APPIMAGE"
+          pnpm tauri signer sign "$DEB"
+          pnpm tauri signer sign "$RPM"
+      - name: Verify final Linux installer signatures
+        env:
+          APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
+          DEB: ${{ steps.linux-assets.outputs.deb }}
+          RPM: ${{ steps.linux-assets.outputs.rpm }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          for asset in "$APPIMAGE" "$DEB" "$RPM"; do
+            [[ -f "$asset" && ! -L "$asset" && -s "$asset" ]]
+            [[ -f "$asset.sig" && ! -L "$asset.sig" && -s "$asset.sig" ]]
+            node scripts/verify-updater-signatures.mjs --artifact "$asset" --signature "$asset.sig"
+          done
+      - name: Stage exactly six Linux release assets
+        env:
+          APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
+          DEB: ${{ steps.linux-assets.outputs.deb }}
+          RPM: ${{ steps.linux-assets.outputs.rpm }}
+        run: |
+          set -euo pipefail
+          mkdir release-linux
+          for asset in "$APPIMAGE" "$DEB" "$RPM"; do
+            cp -- "$asset" "$asset.sig" release-linux/
+          done
+          staged_file="$(mktemp "$RUNNER_TEMP/staged-linux-assets.XXXXXX")"
+          find release-linux -maxdepth 1 -type f -print0 > "$staged_file"
+          mapfile -d '' staged < "$staged_file"
+          rm -f -- "$staged_file"
+          [[ "${#staged[@]}" -eq 6 ]]
+          for asset in "${staged[@]}"; do
+            [[ ! -L "$asset" && -s "$asset" ]]
+          done
       - run: git diff --exit-code -- src-tauri/Cargo.lock
       # actions/upload-artifact v7.0.1; update this SHA when renewing the action.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - name: Upload exactly six Linux release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-linux
           if-no-files-found: error
           retention-days: 7
-          path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/appimage/*.AppImage.sig
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+          path: release-linux/*
 
   windows-nsis:
     name: Build Windows NSIS updater
@@ -253,34 +342,50 @@ jobs:
           workspaces: src-tauri -> target
       - run: pnpm install --frozen-lockfile
       - name: Build frontend without signing secrets
+        env:
+          VITE_UPDATER_ENABLED: "true"
         run: |
           pnpm build
-          if (-not (Test-Path -Path dist -PathType Container)) {
-            throw "dist was not created"
-          }
-      - name: Create ephemeral Tauri release config
+          if (-not (Test-Path -Path dist -PathType Container)) { throw "dist was not created" }
+      - name: Create ephemeral Tauri release config without updater artifacts
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
-        run: node scripts/release-config.mjs --output "$env:RUNNER_TEMP/tauri.release.conf.json"
-      - name: Require updater signing secrets
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
-            throw "TAURI_SIGNING_PRIVATE_KEY secret is required"
-          }
-          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
-            throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required"
-          }
+        run: node scripts/release-config.mjs --output "$env:RUNNER_TEMP/tauri.release.conf.json" --disable-updater-artifacts
       # tauri-apps/tauri-action v1; update this SHA when renewing the action.
-      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Build NSIS installer without signing secrets
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           projectPath: .
           args: --bundles nsis --config "${{ runner.temp }}/tauri.release.conf.json" -- --locked
+      - name: Locate final NSIS installer
+        id: nsis-asset
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "src-tauri/target/release/bundle/nsis" -File -Filter "*-setup.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer; found $($installers.Count)"
+          }
+          $installer = $installers[0]
+          if ($installer.Length -eq 0 -or $installer.Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._ -]*[A-Za-z0-9]$') {
+            throw "NSIS installer must be non-empty and have a safe filename"
+          }
+          Remove-Item -Force -ErrorAction SilentlyContinue "$($installer.FullName).sig"
+          "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+      - name: Sign final NSIS installer bytes
+        env:
+          NSIS_INSTALLER: ${{ steps.nsis-asset.outputs.installer }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri signer sign "$env:NSIS_INSTALLER"
+      - name: Require final NSIS signature
+        env:
+          NSIS_INSTALLER: ${{ steps.nsis-asset.outputs.installer }}
+        shell: pwsh
+        run: |
+          $signature = Get-Item "$env:NSIS_INSTALLER.sig" -ErrorAction Stop
+          if ($signature.PSIsContainer -or $signature.Length -eq 0) {
+            throw "NSIS signature must be a non-empty regular file"
+          }
       - run: git diff --exit-code -- src-tauri/Cargo.lock
       # actions/upload-artifact v7.0.1; update this SHA when renewing the action.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -325,13 +430,9 @@ jobs:
       - name: Build frontend
         run: |
           pnpm build
-          if (-not (Test-Path -Path dist -PathType Container)) {
-            throw "dist was not created"
-          }
+          if (-not (Test-Path -Path dist -PathType Container)) { throw "dist was not created" }
       - name: Create ephemeral Tauri config without updater artifacts
-        env:
-          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
-        run: node scripts/release-config.mjs --output "$env:RUNNER_TEMP/tauri.release.conf.json" --disable-updater-artifacts
+        run: node scripts/release-config.mjs --output "$env:RUNNER_TEMP/tauri.release.conf.json" --disable-updater
       # tauri-apps/tauri-action v1; update this SHA when renewing the action.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
@@ -346,13 +447,12 @@ jobs:
           retention-days: 7
           path: src-tauri/target/release/bundle/msi/*.msi
 
-  publish:
-    name: Assemble and atomically publish
+  assemble:
+    name: Assemble and verify release candidate
     needs: [validate, linux, windows-nsis, windows-msi]
     runs-on: ubuntu-24.04
-    environment: release
     permissions:
-      contents: write
+      contents: read
     steps:
       # actions/checkout v5.1.0; update this SHA when renewing the action.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -380,13 +480,13 @@ jobs:
         run: |
           set -euo pipefail
           declare -a sources=() targets=()
-
+          spaced_assets_file="$(mktemp "$RUNNER_TEMP/spaced-release-assets.XXXXXX")"
+          find release-assets -type f -name '* *' -print0 > "$spaced_assets_file"
           while IFS= read -r -d '' asset; do
             directory="${asset%/*}"
             basename="${asset##*/}"
             canonical="${basename// /.}"
             target="$directory/$canonical"
-
             if [[ -e "$target" || -L "$target" ]]; then
               printf 'Canonical release asset target collision: %q\n' "$target" >&2
               exit 1
@@ -399,8 +499,8 @@ jobs:
             done
             sources+=("$asset")
             targets+=("$target")
-          done < <(find release-assets -type f -name '* *' -print0)
-
+          done < "$spaced_assets_file"
+          rm -f -- "$spaced_assets_file"
           for index in "${!sources[@]}"; do
             mv -- "${sources[$index]}" "${targets[$index]}"
           done
@@ -413,32 +513,37 @@ jobs:
         env:
           REQUIRE_MINISIGN_INTEGRATION: "1"
         run: pnpm test:signature-integration
-      - name: Verify signatures before changing the draft
+      - name: Verify all four candidate updater signatures
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
-        run: node scripts/verify-updater-signatures.mjs --assets release-assets
-      - name: Create or reuse the draft release
+        run: node scripts/verify-updater-signatures.mjs --assets release-assets --tag "${{ needs.validate.outputs.tag }}"
+      - name: Generate updater release notes from verified history
         env:
-          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.validate.outputs.sha }}
           TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
         run: |
-          git fetch --force origin "refs/tags/$TAG"
-          remote_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
-          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] \
-            || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
-            echo "Remote tag no longer resolves to the validated main commit" >&2
-            exit 1
-          fi
-          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2>/dev/null; then
-            if [[ "$(< "$RUNNER_TEMP/is-draft")" != "true" ]]; then
-              echo "Release $TAG is already published" >&2
-              exit 1
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/v*:refs/tags/v*"
+          tags_file="$(mktemp "$RUNNER_TEMP/release-notes-tags.XXXXXX")"
+          git for-each-ref --sort=-version:refname --format='%(refname:short)' 'refs/tags/v*' > "$tags_file"
+          previous_tag=
+          while IFS= read -r candidate; do
+            if [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+              && [[ "$candidate" != "$TAG" ]] \
+              && git merge-base --is-ancestor "$candidate" "$SHA"; then
+              previous_tag="$candidate"
+              break
             fi
+          done < "$tags_file"
+          rm -f -- "$tags_file"
+          notes="$RUNNER_TEMP/updater-release-notes.md"
+          if [[ -n "$previous_tag" ]]; then
+            printf 'Changes since %s:\n\n' "$previous_tag" > "$notes"
+            git log --format='- %s (`%h`)' "$previous_tag..$SHA" >> "$notes"
           else
-            gh release create "$TAG" --draft --verify-tag --generate-notes --title "Linea POS $TAG"
+            printf 'Release %s\n' "$TAG" > "$notes"
           fi
-          gh release view "$TAG" --json body --jq .body > "$RUNNER_TEMP/release-notes.md"
+          [[ -s "$notes" ]]
       - name: Generate and validate latest.json
         env:
           TAG: ${{ needs.validate.outputs.tag }}
@@ -447,67 +552,175 @@ jobs:
             --tag "$TAG" \
             --assets release-assets \
             --output release-assets/latest.json \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --notes-file "$RUNNER_TEMP/updater-release-notes.md" \
             --pub-date "$(date --utc +'%Y-%m-%dT%H:%M:%SZ')"
           node scripts/latest-json.mjs validate \
             --tag "$TAG" \
             --assets release-assets \
             --manifest release-assets/latest.json
-      - name: Upload draft assets and verify the remote release
+      - name: Require exactly nine native assets and latest.json
+        run: |
+          set -euo pipefail
+          assets_file="$(mktemp "$RUNNER_TEMP/assembled-release-assets.XXXXXX")"
+          find release-assets -mindepth 1 -maxdepth 1 -print0 > "$assets_file"
+          mapfile -d '' assets < "$assets_file"
+          rm -f -- "$assets_file"
+          [[ "${#assets[@]}" -eq 10 ]]
+          [[ -f release-assets/latest.json && ! -L release-assets/latest.json && -s release-assets/latest.json ]]
+          for asset in "${assets[@]}"; do
+            [[ -f "$asset" && ! -L "$asset" && -s "$asset" ]]
+          done
+      # actions/upload-artifact v7.0.1; update this SHA when renewing the action.
+      - name: Upload verified release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-candidate
+          if-no-files-found: error
+          retention-days: 7
+          path: release-assets/*
+
+  publish:
+    name: Atomically publish verified candidate
+    needs: [validate, assemble]
+    if: needs.validate.outputs.mode == 'publish'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # actions/checkout v5.1.0; update this SHA when renewing the action.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # pnpm/action-setup v5.0.0; update this SHA when renewing the action.
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 12.4.1
+          run_install: false
+      # actions/setup-node v5.0.0; update this SHA when renewing the action.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 24.15.0
+      # actions/download-artifact v7.0.0; update this SHA when renewing the action.
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-candidate
+          path: release-candidate
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+      - run: pnpm install --frozen-lockfile
+      - name: Verify candidate before changing the draft
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          node scripts/verify-updater-signatures.mjs --assets release-candidate --tag "$TAG"
+          node scripts/latest-json.mjs validate --tag "$TAG" --assets release-candidate --manifest release-candidate/latest.json
+      - name: Create or reuse the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          verify_release_source() {
+            git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "+refs/tags/$TAG:refs/tags/$TAG"
+            remote_sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            if [[ "$remote_sha" != "$EXPECTED_SHA" ]] || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
+              echo "Remote tag no longer resolves to the validated main commit" >&2
+              exit 1
+            fi
+          }
+          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2>/dev/null; then
+            [[ "$(< "$RUNNER_TEMP/is-draft")" == "true" ]] || {
+              echo "Release $TAG is already published" >&2
+              exit 1
+            }
+          else
+            verify_release_source
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "Linea POS $TAG"
+          fi
+      - name: Reconcile draft assets and verify the remote candidate
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
           EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
         run: |
-          git fetch --force origin "refs/tags/$TAG"
-          remote_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
-          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] \
-            || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
-            echo "Remote tag no longer resolves to the validated main commit" >&2
-            exit 1
-          fi
-          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
-            echo "Release $TAG is not a draft" >&2
-            exit 1
-          fi
-          mapfile -d '' assets < <(find release-assets -type f -print0)
+          set -euo pipefail
+          verify_release_source() {
+            git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "+refs/tags/$TAG:refs/tags/$TAG"
+            remote_sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            if [[ "$remote_sha" != "$EXPECTED_SHA" ]] || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
+              echo "Remote tag no longer resolves to the validated main commit" >&2
+              exit 1
+            fi
+          }
+          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
+          assets_file="$(mktemp "$RUNNER_TEMP/release-candidate-assets.XXXXXX")"
+          find release-candidate -maxdepth 1 -type f -print0 > "$assets_file"
+          mapfile -d '' assets < "$assets_file"
+          rm -f -- "$assets_file"
+          [[ "${#assets[@]}" -eq 10 ]]
           declare -A expected_assets=()
           for asset in "${assets[@]}"; do
             expected_assets["$(basename "$asset")"]=1
           done
+          remote_assets_file="$(mktemp "$RUNNER_TEMP/remote-release-assets.XXXXXX")"
+          gh release view "$TAG" --json assets --jq '.assets[].name' > "$remote_assets_file"
           while IFS= read -r remote_asset; do
             if [[ -n "$remote_asset" && ! -v 'expected_assets[$remote_asset]' ]]; then
+              verify_release_source
+              [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
               gh release delete-asset "$TAG" "$remote_asset" --yes
             fi
-          done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          done < "$remote_assets_file"
+          rm -f -- "$remote_assets_file"
+          verify_release_source
+          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
           gh release upload "$TAG" "${assets[@]}" --clobber
           mkdir "$RUNNER_TEMP/remote-assets"
           gh release download "$TAG" --dir "$RUNNER_TEMP/remote-assets"
-          node scripts/verify-updater-signatures.mjs \
-            --assets "$RUNNER_TEMP/remote-assets"
+          node scripts/verify-updater-signatures.mjs --assets "$RUNNER_TEMP/remote-assets" --tag "$TAG"
           node scripts/latest-json.mjs validate \
             --tag "$TAG" \
             --assets "$RUNNER_TEMP/remote-assets" \
             --manifest "$RUNNER_TEMP/remote-assets/latest.json"
-          local_assets="$(find release-assets -type f -printf '%f\n' | sort)"
+          local_assets="$(find release-candidate -maxdepth 1 -type f -printf '%f\n' | sort)"
           remote_assets="$(find "$RUNNER_TEMP/remote-assets" -maxdepth 1 -type f -printf '%f\n' | sort)"
           [[ "$local_assets" == "$remote_assets" ]]
+          (cd release-candidate && sha256sum -- * | sort) > "$RUNNER_TEMP/local-sha256"
+          (cd "$RUNNER_TEMP/remote-assets" && sha256sum -- * | sort) > "$RUNNER_TEMP/remote-sha256"
+          [[ "$(wc -l < "$RUNNER_TEMP/local-sha256")" -eq 10 ]]
+          diff -u "$RUNNER_TEMP/local-sha256" "$RUNNER_TEMP/remote-sha256"
       - name: Publish only after all remote checks pass
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate.outputs.tag }}
           EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
         run: |
-          git fetch --force origin "refs/tags/$TAG"
-          remote_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
-          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] \
-            || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "+refs/tags/$TAG:refs/tags/$TAG"
+          remote_sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          if [[ "$remote_sha" != "$EXPECTED_SHA" ]] || ! git merge-base --is-ancestor "$remote_sha" origin/main; then
             echo "Remote tag no longer resolves to the validated main commit" >&2
             exit 1
           fi
-          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
-            echo "Release $TAG is not a draft" >&2
-            exit 1
-          fi
+          [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
+          mkdir "$RUNNER_TEMP/final-remote-assets"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/final-remote-assets"
+          node scripts/verify-updater-signatures.mjs --assets "$RUNNER_TEMP/final-remote-assets" --tag "$TAG"
+          node scripts/latest-json.mjs validate \
+            --tag "$TAG" \
+            --assets "$RUNNER_TEMP/final-remote-assets" \
+            --manifest "$RUNNER_TEMP/final-remote-assets/latest.json"
+          (cd release-candidate && sha256sum -- * | sort) > "$RUNNER_TEMP/final-local-sha256"
+          (cd "$RUNNER_TEMP/final-remote-assets" && sha256sum -- * | sort) > "$RUNNER_TEMP/final-remote-sha256"
+          [[ "$(wc -l < "$RUNNER_TEMP/final-local-sha256")" -eq 10 ]]
+          diff -u "$RUNNER_TEMP/final-local-sha256" "$RUNNER_TEMP/final-remote-sha256"
           gh release edit "$TAG" --draft=false --latest

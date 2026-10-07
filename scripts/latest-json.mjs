@@ -7,8 +7,22 @@ import { decodeTauriSignature } from "./tauri-signature-format.mjs";
 const REPOSITORY = "98beto/pos_tauri";
 const TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const ASSET_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
-const PLATFORM_KEYS = ["linux-x86_64", "windows-x86_64"];
-const EXPECTED_ASSET_COUNT = 7;
+export const UPDATER_PLATFORMS = {
+  "linux-x86_64-appimage": {
+    name: (version) => `Linea.POS_${version}_amd64.AppImage`,
+  },
+  "linux-x86_64-deb": {
+    name: (version) => `Linea.POS_${version}_amd64.deb`,
+  },
+  "linux-x86_64-rpm": {
+    name: (version) => `Linea.POS-${version}-1.x86_64.rpm`,
+  },
+  "windows-x86_64-nsis": {
+    name: (version) => `Linea.POS_${version}_x64-setup.exe`,
+  },
+};
+const PLATFORM_KEYS = Object.keys(UPDATER_PLATFORMS);
+const EXPECTED_ASSET_COUNT = 9;
 
 async function filesIn(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -17,14 +31,6 @@ async function filesIn(directory) {
     return entry.isDirectory() ? filesIn(entryPath) : [entryPath];
   }));
   return nested.flat();
-}
-
-function exactlyOne(files, description, predicate) {
-  const matches = files.filter(predicate);
-  if (matches.length !== 1) {
-    throw new Error(`Expected exactly one ${description}, found ${matches.length}`);
-  }
-  return matches[0];
 }
 
 function releaseUrl(tag, filePath) {
@@ -39,7 +45,9 @@ function assertTag(tag) {
   }
 }
 
-export async function inspectReleaseAssets(assetsDirectory) {
+export async function inspectReleaseAssets(assetsDirectory, tag) {
+  assertTag(tag);
+  const version = tag.slice(1);
   const paths = await filesIn(assetsDirectory);
   const files = paths.filter((file) => path.basename(file) !== "latest.json");
   const names = files.map((file) => path.basename(file));
@@ -60,38 +68,33 @@ export async function inspectReleaseAssets(assetsDirectory) {
     throw new Error(`Expected exactly ${EXPECTED_ASSET_COUNT} release assets, found ${files.length}`);
   }
 
-  const appImage = exactlyOne(files, "AppImage", (file) => file.endsWith(".AppImage"));
-  const appImageSignature = exactlyOne(
-    files,
-    "AppImage signature",
-    (file) => file === `${appImage}.sig`,
-  );
-  const nsis = exactlyOne(files, "NSIS setup executable", (file) => /-setup\.exe$/i.test(file));
-  const nsisSignature = exactlyOne(
-    files,
-    "NSIS signature",
-    (file) => file === `${nsis}.sig`,
-  );
+  const expectedNames = [
+    ...Object.values(UPDATER_PLATFORMS).flatMap(({ name }) => {
+      const artifact = name(version);
+      return [artifact, `${artifact}.sig`];
+    }),
+    `Linea.POS_${version}_x64_en-US.msi`,
+  ];
+  const unexpected = names.filter((name) => !expectedNames.includes(name));
+  const missing = expectedNames.filter((name) => !names.includes(name));
+  if (unexpected.length || missing.length) {
+    throw new Error(
+      `Release asset basenames must exactly match tag ${tag}; missing: ${missing.join(", ") || "none"}; unexpected: ${unexpected.join(", ") || "none"}`,
+    );
+  }
 
-  exactlyOne(files, "Debian package", (file) => file.endsWith(".deb"));
-  exactlyOne(files, "RPM package", (file) => file.endsWith(".rpm"));
-  exactlyOne(files, "MSI package", (file) => file.endsWith(".msi"));
+  const byName = new Map(files.map((file) => [path.basename(file), file]));
+  const updaters = {};
+  for (const [platform, contract] of Object.entries(UPDATER_PLATFORMS)) {
+    const artifactName = contract.name(version);
+    const artifact = byName.get(artifactName);
+    const signatureFile = byName.get(`${artifactName}.sig`);
+    const signature = await readFile(signatureFile, "utf8");
+    decodeTauriSignature(signature);
+    updaters[platform] = { artifact, signatureFile, signature };
+  }
 
-  const [linuxSignature, windowsSignature] = await Promise.all([
-    readFile(appImageSignature, "utf8"),
-    readFile(nsisSignature, "utf8"),
-  ]);
-  decodeTauriSignature(linuxSignature);
-  decodeTauriSignature(windowsSignature);
-
-  return {
-    appImage,
-    appImageSignature,
-    linuxSignature,
-    nsis,
-    nsisSignature,
-    windowsSignature,
-  };
+  return { updaters };
 }
 
 export async function generateLatestJson({
@@ -101,7 +104,7 @@ export async function generateLatestJson({
   pubDate = new Date().toISOString(),
 }) {
   assertTag(tag);
-  const assets = await inspectReleaseAssets(assetsDirectory);
+  const assets = await inspectReleaseAssets(assetsDirectory, tag);
   const date = new Date(pubDate);
   if (Number.isNaN(date.valueOf())) {
     throw new Error("pub_date must be a valid date");
@@ -111,16 +114,10 @@ export async function generateLatestJson({
     version: tag.slice(1),
     notes: typeof notes === "string" && notes.trim() ? notes.trim() : `Release ${tag}`,
     pub_date: date.toISOString(),
-    platforms: {
-      "linux-x86_64": {
-        signature: assets.linuxSignature,
-        url: releaseUrl(tag, assets.appImage),
-      },
-      "windows-x86_64": {
-        signature: assets.windowsSignature,
-        url: releaseUrl(tag, assets.nsis),
-      },
-    },
+    platforms: Object.fromEntries(PLATFORM_KEYS.map((platform) => [platform, {
+      signature: assets.updaters[platform].signature,
+      url: releaseUrl(tag, assets.updaters[platform].artifact),
+    }])),
   };
   await validateLatestJson({ tag, assetsDirectory, manifest });
   return manifest;
@@ -128,7 +125,7 @@ export async function generateLatestJson({
 
 export async function validateLatestJson({ tag, assetsDirectory, manifest }) {
   assertTag(tag);
-  const assets = await inspectReleaseAssets(assetsDirectory);
+  const assets = await inspectReleaseAssets(assetsDirectory, tag);
   if (manifest.version !== tag.slice(1)) {
     throw new Error(`latest.json version must equal ${tag.slice(1)}`);
   }
@@ -145,26 +142,16 @@ export async function validateLatestJson({ tag, assetsDirectory, manifest }) {
     throw new Error(`latest.json must contain only ${PLATFORM_KEYS.join(" and ")}`);
   }
 
-  const expected = {
-    "linux-x86_64": {
-      signature: assets.linuxSignature,
-      url: releaseUrl(tag, assets.appImage),
-    },
-    "windows-x86_64": {
-      signature: assets.windowsSignature,
-      url: releaseUrl(tag, assets.nsis),
-    },
-  };
   for (const platform of PLATFORM_KEYS) {
     const entry = manifest.platforms[platform];
-    if (!entry?.signature || entry.signature !== expected[platform].signature) {
+    if (typeof entry?.url === "string" && /\.msi(?:$|[?#])/i.test(entry.url)) {
+      throw new Error("MSI must not be used as an updater asset");
+    }
+    if (!entry?.signature || entry.signature !== assets.updaters[platform].signature) {
       throw new Error(`${platform} signature does not match its native updater asset`);
     }
-    if (entry.url !== expected[platform].url) {
+    if (entry.url !== releaseUrl(tag, assets.updaters[platform].artifact)) {
       throw new Error(`${platform} URL does not reference the expected release asset`);
-    }
-    if (/\.msi(?:$|[?#])/i.test(entry.url)) {
-      throw new Error("MSI must not be used as an updater asset");
     }
   }
 

@@ -5,10 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { decodeTauriPublicKey, decodeTauriSignature, verifyUpdaterSignatures } from "./verify-updater-signatures.mjs";
+import {
+  decodeTauriPublicKey,
+  decodeTauriSignature,
+  verifyUpdaterSignatures,
+} from "./verify-updater-signatures.mjs";
 
 function available(command, args) {
   return spawnSync(command, args, { stdio: "ignore" }).status === 0;
+}
+
+function commandAvailable(command) {
+  return !spawnSync(command, ["-h"], { stdio: "ignore" }).error;
 }
 
 function run(command, args) {
@@ -22,7 +30,7 @@ function run(command, args) {
   });
 }
 
-const minisignAvailable = available(process.env.MINISIGN_BIN || "minisign", ["-v"]);
+const minisignAvailable = commandAvailable(process.env.MINISIGN_BIN || "minisign");
 const tauriAvailable = available("pnpm", ["exec", "tauri", "--version"]);
 const required = process.env.REQUIRE_MINISIGN_INTEGRATION === "1";
 
@@ -40,24 +48,48 @@ test("Tauri CLI signatures verify with minisign", {
   await run("pnpm", ["exec", "tauri", "signer", "generate", "--ci", "--password", "", "--write-keys", key]);
 
   const appImage = path.join(assets, "Linea.POS_1.2.3_amd64.AppImage");
+  const deb = path.join(assets, "Linea.POS_1.2.3_amd64.deb");
+  const rpm = path.join(assets, "Linea.POS-1.2.3-1.x86_64.rpm");
   const nsis = path.join(assets, "Linea.POS_1.2.3_x64-setup.exe");
   await Promise.all([
     writeFile(appImage, "appimage integration artifact"),
+    writeFile(deb, "deb integration artifact"),
+    writeFile(rpm, "rpm integration artifact"),
     writeFile(nsis, "nsis integration artifact"),
-    writeFile(path.join(assets, "Linea.POS_1.2.3_amd64.deb"), "deb"),
-    writeFile(path.join(assets, "Linea.POS-1.2.3-1.x86_64.rpm"), "rpm"),
     writeFile(path.join(assets, "Linea.POS_1.2.3_x64_en-US.msi"), "msi"),
   ]);
-  await run("pnpm", ["exec", "tauri", "signer", "sign", "--private-key-path", key, "--password", "", appImage]);
-  await run("pnpm", ["exec", "tauri", "signer", "sign", "--private-key-path", key, "--password", "", nsis]);
+  for (const artifact of [appImage, deb, rpm, nsis]) {
+    await run("pnpm", [
+      "exec", "tauri", "signer", "sign",
+      "--private-key-path", key,
+      "--password", "",
+      artifact,
+    ]);
+  }
 
   const publicKey = await readFile(`${key}.pub`, "utf8");
-  const [appImageSignature, nsisSignature] = await Promise.all([
-    readFile(`${appImage}.sig`, "utf8"),
-    readFile(`${nsis}.sig`, "utf8"),
-  ]);
+  const artifacts = [appImage, deb, rpm, nsis];
+  const signatures = await Promise.all(artifacts.map((artifact) => readFile(`${artifact}.sig`, "utf8")));
   decodeTauriPublicKey(publicKey);
-  decodeTauriSignature(appImageSignature);
-  decodeTauriSignature(nsisSignature);
+  signatures.forEach(decodeTauriSignature);
   await verifyUpdaterSignatures({ assetsDirectory: assets, publicKey });
+
+  await Promise.all([
+    writeFile(`${appImage}.sig`, signatures[1]),
+    writeFile(`${deb}.sig`, signatures[0]),
+  ]);
+  await assert.rejects(
+    verifyUpdaterSignatures({ assetsDirectory: assets, publicKey }),
+    /minisign rejected/,
+  );
+
+  await Promise.all([
+    writeFile(`${appImage}.sig`, signatures[0]),
+    writeFile(`${deb}.sig`, signatures[1]),
+    writeFile(rpm, "rpm integration artifact altered"),
+  ]);
+  await assert.rejects(
+    verifyUpdaterSignatures({ assetsDirectory: assets, publicKey }),
+    /minisign rejected .*\.rpm/,
+  );
 });
