@@ -50,7 +50,7 @@ export function AppShell({ user, sessionId, loggingOut, onLogout, onNotice, onSe
       <div className="min-w-0">
         <Topbar view={view} menuOpen={mobileMenuOpen} onOpenMenu={() => setMobileMenuOpen(true)} />
         {activeView === "pos" && <PosView user={user} sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
-        {activeView === "products" && <ProductsView onNotice={onNotice} onSessionRequired={onSessionRequired} />}
+        {activeView === "products" && <ProductsView sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "inventory" && <InventoryView key={`inventory-${historyActivation}`} user={user} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "sales" && <SalesView key={`sales-${historyActivation}`} onSessionRequired={onSessionRequired} />}
       </div>

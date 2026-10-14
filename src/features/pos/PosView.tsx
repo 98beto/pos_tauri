@@ -1,23 +1,36 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  addCartItem,
   checkoutCart,
   clearCart,
   decrementCartItem,
   getCart,
   incrementCartItem,
+  quoteCartDiscount,
   quoteCashChange,
+  removeCartDiscount,
   removeCartItem,
+  resetCartItemUnitPrice,
+  setCartDiscount,
+  setCartItemQuantity,
+  setCartItemUnitPrice,
 } from "../../api/cart";
 import { listCategories } from "../../api/categories";
-import { listProductSelector } from "../../api/products";
+import { findProductByCode, listProductSelector } from "../../api/products";
 import { Button, EmptyState, Field, Modal, Spinner } from "../../components/ui";
 import { errorMessage, isAppError, isSessionRequired } from "../../lib/app-error";
-import { formatDateTime, formatMoney } from "../../lib/format";
+import {
+  centsToDecimal,
+  formatBaseQuantity,
+  formatDateTime,
+  formatEnteredQuantity,
+  formatMoney,
+  presentationPriceLabel,
+} from "../../lib/format";
 import { useUpdater, type CartReportVersion } from "../updater/UpdaterContext";
 import type { Category } from "../../types/category";
-import type { Cart, CashChangeQuote } from "../../types/cart";
-import type { ProductSelectorRow } from "../../types/product";
+import type { Cart, CartDiscountQuote, CartDiscountType, CartLine, CashChangeQuote } from "../../types/cart";
+import type { ProductCodeMatch, ProductSelectorRow } from "../../types/product";
+import type { ProductPresentation } from "../../types/product_presentation";
 import type { PaymentMethod, SaleReceipt } from "../../types/sale";
 import type { User } from "../../types/user";
 import {
@@ -29,6 +42,14 @@ import {
 } from "./checkout-intent";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
+type QuantityEditor = {
+  presentation: ProductPresentation;
+  productName: string;
+  baseUnit: ProductSelectorRow["base_unit"];
+  currentQuantity?: number;
+  availableBase: number;
+};
+type PriceEditor = Pick<CartLine, "presentation_id" | "product_name" | "presentation_name" | "mode" | "base_unit" | "base_quantity" | "catalog_unit_price" | "applied_unit_price" | "price_overridden">;
 type PosViewProps = {
   user: User;
   sessionId: number;
@@ -44,8 +65,11 @@ const paymentMethods: { value: PaymentMethod; label: string }[] = [
 
 const clearedCart: Cart = {
   lines: [],
-  item_count: 0,
+  line_count: 0,
   subtotal: 0,
+  discount_type: "none",
+  discount_value: 0,
+  discount_amount: 0,
   total: 0,
   cart_fingerprint: "",
 };
@@ -58,6 +82,30 @@ function checkoutIntentConflict(error: unknown) {
   return isAppError(error) && ["CART_CHANGED", "CART_FINGERPRINT_MISMATCH", "CHECKOUT_TOKEN_REUSED"].includes(error.code);
 }
 
+function fixedQuantityName(presentation: ProductPresentation, baseUnit: ProductSelectorRow["base_unit"]) {
+  if (baseUnit === "piece" && presentation.base_quantity === 1) return "piezas";
+  const [name, ...detail] = presentation.name.toLocaleLowerCase().split(/\s+/);
+  return [`${name}${name.endsWith("s") ? "" : "s"}`, ...detail].join(" ");
+}
+
+function availableQuantity(editor: QuantityEditor) {
+  if (editor.presentation.mode !== "fixed" || editor.presentation.base_quantity === 1) {
+    return formatBaseQuantity(editor.availableBase, editor.baseUnit);
+  }
+  return `${Math.floor(editor.availableBase / editor.presentation.base_quantity)} ${fixedQuantityName(editor.presentation, editor.baseUnit)} / ${formatBaseQuantity(editor.availableBase, editor.baseUnit)}`;
+}
+
+function discountValueInput(type: CartDiscountType, value: number) {
+  if (type === "percentage") return `${Math.trunc(value / 100)}.${String(value % 100).padStart(2, "0")}`;
+  if (type === "fixed") return centsToDecimal(value);
+  return "";
+}
+
+function discountLabel(type: CartDiscountType, value: number) {
+  if (type === "percentage") return `Descuento ${discountValueInput(type, value).replace(/\.00$/, "")}%`;
+  return "Descuento";
+}
+
 export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosViewProps) {
   const { beginCartReporting, beginCartOperation, reportCart, runCartMutation, runCheckout } = useUpdater();
   const [cart, setCart] = useState<Cart>();
@@ -67,6 +115,10 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
   const [pickerSearch, setPickerSearch] = useState("");
   const [pickerCategory, setPickerCategory] = useState("");
   const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerError, setPickerError] = useState("");
+  const [pickerStale, setPickerStale] = useState(false);
+  const [pickerDataReady, setPickerDataReady] = useState(false);
+  const [codeMatch, setCodeMatch] = useState<ProductCodeMatch>();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -82,12 +134,25 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
   const [pending, setPending] = useState<PendingCheckout>();
   const [intentConflict, setIntentConflict] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
+  const [quantityEditor, setQuantityEditor] = useState<QuantityEditor>();
+  const [quantityInput, setQuantityInput] = useState("");
+  const [quantityError, setQuantityError] = useState("");
+  const [priceEditor, setPriceEditor] = useState<PriceEditor>();
+  const [priceInput, setPriceInput] = useState("");
+  const [priceError, setPriceError] = useState("");
+  const [discountOpen, setDiscountOpen] = useState(false);
+  const [discountType, setDiscountType] = useState<"percentage" | "fixed">("percentage");
+  const [discountInput, setDiscountInput] = useState("");
+  const [discountQuote, setDiscountQuote] = useState<CartDiscountQuote>();
+  const [discountError, setDiscountError] = useState("");
+  const [discountLoading, setDiscountLoading] = useState(false);
   const recoveryStarted = useRef("");
   const mutationInFlight = useRef<symbol | undefined>(undefined);
   const pendingRef = useRef<PendingCheckout | undefined>(undefined);
   const pickerRequest = useRef(0);
   const loadRequest = useRef(0);
   const quoteRequest = useRef(0);
+  const discountRequest = useRef(0);
   const lifetime = useRef(0);
   const cartReporting = useRef<{ sessionId: number; generation: number; operation: number } | undefined>(undefined);
   if (!cartReporting.current || cartReporting.current.sessionId !== sessionId) {
@@ -104,6 +169,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       loadRequest.current += 1;
       pickerRequest.current += 1;
       quoteRequest.current += 1;
+      discountRequest.current += 1;
     };
   }, [sessionId]);
 
@@ -137,14 +203,30 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
     const generation = lifetime.current;
     const request = ++pickerRequest.current;
     setPickerLoading(true);
+    setPickerError("");
     try {
-      const items = await listProductSelector({
-        search: pickerSearch || undefined,
-        category_id: pickerCategory ? Number(pickerCategory) : undefined,
-      });
-      if (lifetime.current === generation && pickerRequest.current === request) setPickerItems(items);
+      const search = pickerSearch.trim();
+      const [items, exactMatch] = await Promise.all([
+        listProductSelector({
+          search: search || undefined,
+          category_id: pickerCategory ? Number(pickerCategory) : undefined,
+        }),
+        search ? findProductByCode(search) : Promise.resolve(null),
+      ]);
+      if (lifetime.current === generation && pickerRequest.current === request) {
+        setPickerItems(exactMatch ? items.filter((item) => item.id === exactMatch.product.id) : items);
+        setCodeMatch(exactMatch ?? undefined);
+        setPickerDataReady(true);
+        setPickerStale(false);
+      }
     } catch (value: unknown) {
-      if (lifetime.current === generation && pickerRequest.current === request) handleError(value, "No se pudo consultar el catalogo.");
+      if (lifetime.current === generation && pickerRequest.current === request) {
+        if (isSessionRequired(value)) onSessionRequired();
+        else {
+          setPickerError(errorMessage(value, "No se pudo consultar el catalogo."));
+          setPickerStale(pickerDataReady);
+        }
+      }
     } finally {
       if (lifetime.current === generation && pickerRequest.current === request) setPickerLoading(false);
     }
@@ -305,8 +387,8 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
     return () => window.removeEventListener("keydown", openPicker);
   }, [busyOrPending]);
 
-  async function mutate(operation: () => Promise<Cart>, fallback: string) {
-    if (mutationInFlight.current || pendingRef.current) return;
+  async function mutate(operation: () => Promise<Cart>, fallback: string, setLocalError?: (message: string) => void) {
+    if (mutationInFlight.current || pendingRef.current) return undefined;
     const generation = lifetime.current;
     const mutation = Symbol();
     const cartOperation = nextCartOperation();
@@ -318,18 +400,136 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       if (lifetime.current !== generation) return;
       setCart(nextCart);
       setDataStale(false);
+      return nextCart;
     } catch (value: unknown) {
-      if (lifetime.current === generation) handleError(value, fallback);
+      if (lifetime.current === generation) {
+        if (setLocalError && !isSessionRequired(value)) setLocalError(errorMessage(value, fallback));
+        else handleError(value, fallback);
+      }
     } finally {
       if (lifetime.current === generation && mutationInFlight.current === mutation) {
         mutationInFlight.current = undefined;
         setBusy(false);
       }
     }
+    return undefined;
   }
 
-  async function addProduct(productId: number) {
-    await mutate(() => addCartItem(productId), "No se pudo agregar el producto.");
+  function openQuantityEditor(editor: QuantityEditor) {
+    if (pickerOpen) closePicker();
+    setQuantityEditor(editor);
+    setQuantityInput(editor.currentQuantity ? String(editor.currentQuantity) : "");
+    setQuantityError("");
+  }
+
+  async function saveQuantity() {
+    if (!quantityEditor) return;
+    const quantity = Number(quantityInput);
+    if (!/^[1-9]\d*$/.test(quantityInput) || !Number.isSafeInteger(quantity)) {
+      setQuantityError("Ingresa una cantidad entera mayor que cero.");
+      return;
+    }
+    const maxQuantity = quantityEditor.presentation.mode === "fixed"
+      ? Math.floor(quantityEditor.availableBase / quantityEditor.presentation.base_quantity)
+      : quantityEditor.availableBase;
+    if (quantity > maxQuantity) {
+      const available = quantityEditor.presentation.mode === "fixed" && quantityEditor.presentation.base_quantity > 1
+        ? `${maxQuantity} ${fixedQuantityName(quantityEditor.presentation, quantityEditor.baseUnit)}`
+        : formatBaseQuantity(quantityEditor.availableBase, quantityEditor.baseUnit);
+      setQuantityError(`Solo hay ${available} disponibles.`);
+      return;
+    }
+    const saved = await mutate(
+      () => setCartItemQuantity(quantityEditor.presentation.id, quantity),
+      "No se pudo guardar la cantidad.",
+      setQuantityError,
+    );
+    if (saved) setQuantityEditor(undefined);
+  }
+
+  function openPriceEditor(line: CartLine) {
+    setPriceEditor(line);
+    setPriceInput(centsToDecimal(line.applied_unit_price));
+    setPriceError("");
+  }
+
+  async function savePrice() {
+    if (!priceEditor) return;
+    setPriceError("");
+    const saved = await mutate(
+      () => setCartItemUnitPrice(priceEditor.presentation_id, priceInput),
+      "No se pudo guardar el precio.",
+      setPriceError,
+    );
+    if (saved) setPriceEditor(undefined);
+  }
+
+  async function resetPrice() {
+    if (!priceEditor) return;
+    setPriceError("");
+    const saved = await mutate(
+      () => resetCartItemUnitPrice(priceEditor.presentation_id),
+      "No se pudo restablecer el precio de catalogo.",
+      setPriceError,
+    );
+    if (saved) setPriceEditor(undefined);
+  }
+
+  function openDiscountEditor() {
+    if (!cart) return;
+    const type = cart.discount_type === "fixed" ? "fixed" : "percentage";
+    setDiscountType(type);
+    setDiscountInput(discountValueInput(cart.discount_type, cart.discount_value));
+    setDiscountQuote(undefined);
+    setDiscountError("");
+    setDiscountOpen(true);
+  }
+
+  function invalidateDiscountPreview() {
+    discountRequest.current += 1;
+    setDiscountLoading(false);
+    setDiscountQuote(undefined);
+    setDiscountError("");
+  }
+
+  async function previewDiscount() {
+    const generation = lifetime.current;
+    const request = ++discountRequest.current;
+    setDiscountLoading(true);
+    setDiscountQuote(undefined);
+    setDiscountError("");
+    try {
+      const quote = await quoteCartDiscount(discountType, discountInput);
+      if (lifetime.current === generation && discountRequest.current === request) setDiscountQuote(quote);
+    } catch (value: unknown) {
+      if (lifetime.current !== generation || discountRequest.current !== request) return;
+      if (isSessionRequired(value)) onSessionRequired();
+      else setDiscountError(errorMessage(value, "No se pudo calcular el descuento."));
+    } finally {
+      if (lifetime.current === generation && discountRequest.current === request) setDiscountLoading(false);
+    }
+  }
+
+  function cancelDiscount() {
+    invalidateDiscountPreview();
+    setDiscountOpen(false);
+  }
+
+  async function saveDiscount() {
+    if (!discountQuote) return;
+    setDiscountError("");
+    const saved = await mutate(
+      () => setCartDiscount(discountType, discountInput),
+      "No se pudo guardar el descuento.",
+      setDiscountError,
+    );
+    if (saved) setDiscountOpen(false);
+  }
+
+  async function removeDiscount() {
+    setDiscountError("");
+    const removed = await mutate(removeCartDiscount, "No se pudo quitar el descuento.", setDiscountError);
+    if (removed) setDiscountOpen(false);
   }
 
   async function submitCheckout() {
@@ -430,17 +630,23 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       <div className="grid min-h-[calc(100dvh-10rem)] gap-5 xl:grid-cols-[minmax(0,1fr)_400px]">
         <section className="min-w-0 rounded-card border border-line bg-surface p-4 sm:p-6">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div><h2 id="cart-table-title" className="font-heading text-xl font-bold">Carrito actual</h2><p className="mt-1 text-xs text-muted">{cart?.item_count ?? 0} articulos en esta venta</p></div>
+            <div><h2 id="cart-table-title" className="font-heading text-xl font-bold">Carrito actual</h2><p className="mt-1 text-xs text-muted">{cart?.line_count ?? 0} lineas en esta venta</p></div>
             <div className="flex gap-2"><Button variant="ghost" disabled={busyOrPending || !cart?.lines.length} onClick={() => void mutate(clearCart, "No se pudo vaciar el carrito.")}>Vaciar</Button><Button variant="primary" disabled={busyOrPending} onClick={() => setPickerOpen(true)}>Agregar producto <kbd className="rounded bg-white/15 px-1.5 py-0.5 text-[0.625rem]">F2</kbd></Button></div>
           </div>
           {!cart?.lines.length ? (
             <EmptyState title="El carrito esta vacio" description="Abre el selector para agregar productos disponibles." action={<Button disabled={busyOrPending} onClick={() => setPickerOpen(true)}>Buscar productos</Button>} />
           ) : (
-            <div className="mt-5 overflow-x-auto">
+            <div className="mt-5 overflow-x-auto" role="region" aria-label="Productos del carrito; desplaza horizontalmente para ver todas las columnas" tabIndex={0}>
               <table aria-labelledby="cart-table-title" className="w-full min-w-[620px] border-separate border-spacing-0 text-left text-sm">
                 <caption className="sr-only">Productos agregados al carrito actual</caption>
                 <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-3 py-3">Producto</th><th className="border-b border-line px-3 py-3">Precio</th><th className="border-b border-line px-3 py-3 text-center">Cantidad</th><th className="border-b border-line px-3 py-3 text-right">Subtotal</th><th className="border-b border-line px-3 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
-                <tbody>{cart.lines.map((line) => <tr key={line.product_id} className={!line.available ? "bg-danger-soft/50" : ""}><td className="border-b border-line px-3 py-4"><strong className="block">{line.name}</strong><span className="text-xs text-muted">{line.sku} · stock {line.stock}</span></td><td className="border-b border-line px-3 py-4">{formatMoney(line.unit_price)}</td><td className="border-b border-line px-3 py-4"><div className="mx-auto flex w-fit items-center rounded-control border border-line"><button aria-label={`Reducir ${line.name}`} disabled={busyOrPending} className="size-9 text-lg disabled:opacity-40" onClick={() => void mutate(() => decrementCartItem(line.product_id), "No se pudo reducir la cantidad.")}>−</button><span className="min-w-8 text-center font-bold">{line.quantity}</span><button aria-label={`Aumentar ${line.name}`} disabled={busyOrPending} className="size-9 text-lg disabled:opacity-40" onClick={() => void mutate(() => incrementCartItem(line.product_id), "No se pudo aumentar la cantidad.")}>+</button></div></td><td className="border-b border-line px-3 py-4 text-right font-bold">{formatMoney(line.subtotal)}</td><td className="border-b border-line px-3 py-4"><button aria-label={`Quitar ${line.name}`} disabled={busyOrPending} className="rounded p-2 text-danger hover:bg-danger-soft disabled:opacity-40" onClick={() => void mutate(() => removeCartItem(line.product_id), "No se pudo quitar el producto.")}>Quitar</button></td></tr>)}</tbody>
+                <tbody>{cart.lines.map((line) => <tr key={line.presentation_id} className={!line.available ? "bg-danger-soft/50" : ""}>
+                  <td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="block text-xs text-muted">{line.presentation_name} · {line.sku}</span><span className="text-xs text-muted">Stock {formatBaseQuantity(line.stock_base, line.base_unit)}</span></td>
+                    <td className="border-b border-line px-3 py-4"><span className="block font-semibold">{presentationPriceLabel({ mode: line.mode, name: line.presentation_name, price: line.applied_unit_price, base_quantity: line.base_quantity }, line.base_unit)}</span>{line.catalog_unit_price !== line.applied_unit_price && <span className="mt-1 block text-xs text-muted">Catalogo: {presentationPriceLabel({ mode: line.mode, name: line.presentation_name, price: line.catalog_unit_price, base_quantity: line.base_quantity }, line.base_unit)}</span>}<button aria-label={`Cambiar precio de ${line.product_name}, ${line.presentation_name}`} className="mt-1 rounded px-2 py-1 text-xs font-bold text-brand hover:bg-brand-soft disabled:opacity-40" disabled={busyOrPending} onClick={() => openPriceEditor(line)}>Cambiar precio</button></td>
+                    <td className="border-b border-line px-3 py-4"><div className="grid justify-items-center gap-1">{line.mode === "fixed" ? <div className="flex w-fit items-center rounded-control border border-line"><button aria-label={`Reducir ${line.product_name}, ${line.presentation_name}`} disabled={busyOrPending} className="size-9 text-lg disabled:opacity-40" onClick={() => void mutate(() => decrementCartItem(line.presentation_id), "No se pudo reducir la cantidad.")}>−</button><span className="min-w-24 text-center text-xs font-bold">{formatEnteredQuantity(line.entered_quantity, line.mode, line.presentation_name, line.base_unit)}</span><button aria-label={`Aumentar ${line.product_name}, ${line.presentation_name}`} disabled={busyOrPending} className="size-9 text-lg disabled:opacity-40" onClick={() => void mutate(() => incrementCartItem(line.presentation_id), "No se pudo aumentar la cantidad.")}>+</button></div> : <strong>{formatEnteredQuantity(line.entered_quantity, line.mode, line.presentation_name, line.base_unit)}</strong>}<button aria-label={`Editar cantidad de ${line.product_name}, ${line.presentation_name}`} className="rounded px-2 py-1 text-xs font-bold text-brand hover:bg-brand-soft disabled:opacity-40" disabled={busyOrPending} onClick={() => openQuantityEditor({ presentation: { id: line.presentation_id, product_id: line.product_id, name: line.presentation_name, mode: line.mode, base_quantity: line.base_quantity, price: line.applied_unit_price, barcode: line.presentation_barcode, is_default: false, is_active: true, is_conversion_locked: true, created_at: "", updated_at: "" }, productName: line.product_name, baseUnit: line.base_unit, currentQuantity: line.entered_quantity, availableBase: line.stock_base - cart.lines.filter((other) => other.product_id === line.product_id && other.presentation_id !== line.presentation_id).reduce((total, other) => total + other.base_consumed, 0) })}>Editar cantidad</button></div></td>
+                  <td className="border-b border-line px-3 py-4 text-right font-bold">{formatMoney(line.line_total)}</td>
+                  <td className="border-b border-line px-3 py-4"><button aria-label={`Quitar ${line.product_name}, ${line.presentation_name}`} disabled={busyOrPending} className="rounded p-2 text-danger hover:bg-danger-soft disabled:opacity-40" onClick={() => void mutate(() => removeCartItem(line.presentation_id), "No se pudo quitar el producto.")}>Quitar</button></td>
+                </tr>)}</tbody>
               </table>
             </div>
           )}
@@ -448,7 +654,8 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
 
         <aside className="h-fit rounded-card border border-line bg-surface p-5 shadow-sm sm:p-6">
           <h2 className="font-heading text-xl font-bold">Cobro</h2>
-          <dl className="mt-5 grid gap-3 border-b border-line pb-5 text-sm"><div className="flex justify-between"><dt className="text-muted">Articulos</dt><dd className="font-semibold">{cart?.item_count ?? 0}</dd></div><div className="flex justify-between"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(cart?.subtotal ?? 0)}</dd></div><div className="flex items-end justify-between pt-2"><dt className="font-bold">Total</dt><dd className="font-heading text-3xl font-bold text-brand">{formatMoney(cart?.total ?? 0)}</dd></div></dl>
+          <dl className="mt-5 grid gap-3 border-b border-line pb-5 text-sm"><div className="flex justify-between"><dt className="text-muted">Lineas</dt><dd className="font-semibold">{cart?.line_count ?? 0}</dd></div><div className="flex justify-between"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(cart?.subtotal ?? 0)}</dd></div>{cart && cart.discount_type !== "none" && <div className="flex justify-between text-danger"><dt>{discountLabel(cart.discount_type, cart.discount_value)}</dt><dd className="font-semibold">-{formatMoney(cart.discount_amount)}</dd></div>}<div className="flex items-end justify-between pt-2"><dt className="font-bold">Total</dt><dd className="font-heading text-3xl font-bold text-brand">{formatMoney(cart?.total ?? 0)}</dd></div></dl>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2"><Button size="sm" variant="ghost" disabled={busyOrPending || !cart?.lines.length} onClick={openDiscountEditor}>{cart?.discount_type === "none" ? "Aplicar descuento" : "Cambiar descuento"}</Button>{cart?.discount_type !== "none" && <Button size="sm" variant="ghost" disabled={busyOrPending} onClick={() => void mutate(removeCartDiscount, "No se pudo quitar el descuento.")}>Quitar descuento</Button>}</div>
            <fieldset className="mt-5" disabled={busyOrPending}><legend className="mb-2 text-[0.625rem] font-extrabold tracking-wider text-muted uppercase">Metodo de pago</legend><div className="grid grid-cols-3 gap-2">{paymentMethods.map((method) => <label key={method.value} className={`cursor-pointer rounded-control border px-2 py-3 text-center text-xs font-bold transition has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-brand ${paymentMethod === method.value ? "border-brand bg-brand-soft text-brand" : "border-line text-muted"}`}><input className="sr-only" type="radio" name="payment" value={method.value} checked={paymentMethod === method.value} onChange={() => setPaymentMethod(method.value)} />{method.label}</label>)}</div></fieldset>
            {paymentMethod === "efectivo" && <div className="mt-5"><Field label="Efectivo recibido" value={cashReceived} onChange={(event) => setCashReceived(event.target.value)} inputMode="decimal" placeholder="0.00" disabled={busyOrPending} required /></div>}
            {paymentMethod === "efectivo" && cashReceived.trim() && <div className="mt-3 min-h-16" aria-live="polite">{quoteLoading ? <p className="text-xs font-semibold text-muted">Calculando cambio...</p> : cashQuote ? <dl className="grid gap-2 rounded-control bg-surface-soft p-3 text-sm"><div className="flex justify-between"><dt className="text-muted">Total</dt><dd className="font-semibold">{formatMoney(cashQuote.total)}</dd></div><div className="flex justify-between"><dt className="text-muted">Efectivo</dt><dd className="font-semibold">{formatMoney(cashQuote.cash_received)}</dd></div><div className="flex justify-between border-t border-line pt-2"><dt className="font-bold">Cambio</dt><dd className="font-bold text-brand">{formatMoney(cashQuote.change)}</dd></div></dl> : cashQuoteError ? <p className="rounded-control bg-danger-soft px-3 py-2 text-sm text-danger" role="status">{cashQuoteError}</p> : null}</div>}
@@ -457,12 +664,39 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       </div>
 
       <Modal open={pickerOpen} onClose={closePicker} closeDisabled={busy} title="Agregar productos" description="La disponibilidad considera las unidades que ya estan en el carrito." size="lg">
-        <div className="grid gap-3 sm:grid-cols-[1fr_220px]"><Field data-autofocus label="Buscar" value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} placeholder="Nombre o SKU" disabled={busyOrPending} /><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-wider text-muted uppercase">Categoria<select value={pickerCategory} onChange={(event) => setPickerCategory(event.target.value)} disabled={busyOrPending} className="h-11 rounded-control border border-line-strong bg-surface px-3 text-sm font-normal tracking-normal text-ink normal-case outline-none focus:border-brand disabled:opacity-45"><option value="">Todas</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label></div>
-        <div className="mt-5 min-h-56">{pickerLoading ? <Spinner className="mx-auto mt-20 size-6 text-brand" /> : pickerItems.length ? <div className="grid gap-2 sm:grid-cols-2">{pickerItems.map((product) => <article key={product.id} className="flex items-center justify-between gap-3 rounded-card border border-line p-4"><div className="min-w-0"><strong className="block truncate text-sm">{product.name}</strong><span className="block truncate text-xs text-muted">{product.sku} · {product.category_name}</span><span className="mt-2 block text-sm font-bold text-brand">{formatMoney(product.price)}</span></div><Button size="sm" disabled={busyOrPending || product.available_stock === 0} onClick={() => void addProduct(product.id)}>{product.available_stock === 0 ? "Sin stock" : `Agregar · ${product.available_stock}`}</Button></article>)}</div> : <EmptyState className="min-h-56" title="No hay productos disponibles" description="Prueba con otra busqueda o categoria." />}</div>
+        <div className="grid gap-3 sm:grid-cols-[1fr_220px]"><Field data-autofocus label="Buscar" value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} placeholder="Nombre, SKU o codigo de barras" disabled={busyOrPending} /><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-wider text-muted uppercase">Categoria<select value={pickerCategory} onChange={(event) => setPickerCategory(event.target.value)} disabled={busyOrPending} className="h-11 rounded-control border border-line-strong bg-surface px-3 text-sm font-normal tracking-normal text-ink normal-case outline-none focus:border-brand disabled:opacity-45"><option value="">Todas</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label></div>
+         {pickerError && pickerStale && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-control border border-warning/30 bg-warning-soft px-4 py-3 text-sm text-warning" role="status"><span>No se pudo actualizar el selector. Se muestran resultados anteriores.</span><Button size="sm" disabled={pickerLoading} onClick={() => void refreshPicker()}>Reintentar</Button></div>}
+         <div className="mt-5 min-h-56">{pickerLoading && !pickerDataReady ? <Spinner className="mx-auto mt-20 size-6 text-brand" /> : pickerError && !pickerStale ? <section className="grid min-h-56 place-items-center text-center" role="alert"><div><strong className="block text-sm">No se pudo cargar el catalogo</strong><p className="mt-2 text-sm text-danger">{pickerError}</p><Button className="mt-4" size="sm" disabled={pickerLoading} onClick={() => void refreshPicker()}>Reintentar</Button></div></section> : pickerItems.length ? <div className="grid gap-3">{pickerItems.map((product) => <article key={product.id} className="rounded-card border border-line p-4"><div className="flex flex-wrap items-baseline justify-between gap-2"><div className="min-w-0"><strong className="block truncate text-sm">{product.name}</strong><span className="block truncate text-xs text-muted">{product.sku} · {product.category_name}</span></div><span className="text-xs font-semibold text-muted">Disponible {formatBaseQuantity(product.available_stock, product.base_unit)}</span></div><div className="mt-3 grid gap-2 sm:grid-cols-2">{product.presentations.filter((presentation) => presentation.is_active && (codeMatch?.match_kind !== "barcode" || presentation.id === codeMatch.presentation_id)).map((presentation) => {
+            const currentLine = cart?.lines.find((line) => line.presentation_id === presentation.id);
+            const availableBase = product.available_stock + (currentLine?.base_consumed ?? 0);
+            const available = availableBase > 0 && (presentation.mode === "measured" || presentation.base_quantity <= availableBase);
+            const exactBarcode = codeMatch?.match_kind === "barcode" && presentation.id === codeMatch.presentation_id;
+             const action = available ? (currentLine ? "Editar" : "Agregar") : "Sin stock";
+             return <div key={presentation.id} className={`flex items-center justify-between gap-3 rounded-control bg-surface-soft p-3 ${exactBarcode ? "ring-2 ring-brand" : ""}`}><div className="min-w-0"><strong className="block truncate text-sm">{presentation.name}</strong>{exactBarcode && <span className="block text-[0.625rem] font-bold tracking-wide text-brand uppercase">Codigo exacto</span>}<span className="block text-xs text-brand">{presentationPriceLabel(presentation, product.base_unit)}</span>{presentation.barcode && <span className="block truncate text-[0.6875rem] text-muted">Codigo {presentation.barcode}</span>}</div><Button size="sm" aria-label={`${action} ${product.name}, ${presentation.name}`} disabled={busyOrPending || !available} onClick={() => openQuantityEditor({ presentation, productName: product.name, baseUnit: product.base_unit, currentQuantity: currentLine?.entered_quantity, availableBase })}>{action}</Button></div>;
+         })}</div></article>)}</div> : <EmptyState className="min-h-56" title="No hay productos disponibles" description="Prueba con otra busqueda o categoria." />}</div>
+      </Modal>
+
+      <Modal open={Boolean(quantityEditor)} onClose={() => setQuantityEditor(undefined)} closeDisabled={busy} title={quantityEditor?.currentQuantity ? "Editar cantidad" : "Capturar cantidad"} size="sm" footer={<><Button disabled={busy} onClick={() => setQuantityEditor(undefined)}>Cancelar</Button><Button variant="primary" loading={busy} onClick={() => void saveQuantity()}>Guardar cantidad</Button></>}>
+         {quantityEditor && <div><dl className="mb-4 grid gap-2 text-sm"><div className="flex justify-between gap-4"><dt className="text-muted">Producto</dt><dd className="font-semibold text-right">{quantityEditor.productName}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted">Presentacion</dt><dd className="font-semibold text-right">{quantityEditor.presentation.name}</dd></div></dl><Field data-autofocus label={quantityEditor.presentation.mode === "measured" ? (quantityEditor.baseUnit === "gram" ? "Cantidad en gramos" : "Cantidad en mililitros") : `Cantidad de ${fixedQuantityName(quantityEditor.presentation, quantityEditor.baseUnit)}`} value={quantityInput} onChange={(event) => { setQuantityInput(event.target.value); setQuantityError(""); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void saveQuantity(); } }} inputMode="numeric" pattern="[0-9]*" placeholder="0" disabled={busy} error={quantityError || undefined} required /><p className="mt-3 text-xs text-muted"><strong className="text-ink">Disponible:</strong> {availableQuantity(quantityEditor)}</p><p className="mt-2 text-xs text-muted">{presentationPriceLabel(quantityEditor.presentation, quantityEditor.baseUnit)}. Usa solo enteros positivos.</p></div>}
+      </Modal>
+
+      <Modal open={Boolean(priceEditor)} onClose={() => setPriceEditor(undefined)} closeDisabled={busy} title="Cambiar precio" size="sm" footer={<><Button disabled={busy} onClick={() => setPriceEditor(undefined)}>Cancelar</Button><Button disabled={busy} onClick={() => void resetPrice()}>Restablecer precio de catalogo</Button><Button variant="primary" loading={busy} onClick={() => void savePrice()}>Guardar precio</Button></>}>
+        {priceEditor && <div><dl className="mb-4 grid gap-2 text-sm"><div className="flex justify-between gap-4"><dt className="text-muted">Producto</dt><dd className="font-semibold text-right">{priceEditor.product_name}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted">Precio de catalogo</dt><dd className="font-semibold text-right">{presentationPriceLabel({ mode: priceEditor.mode, name: priceEditor.presentation_name, price: priceEditor.catalog_unit_price, base_quantity: priceEditor.base_quantity }, priceEditor.base_unit)}</dd></div></dl><Field data-autofocus label="Precio aplicado a esta venta" value={priceInput} onChange={(event) => { setPriceInput(event.target.value); setPriceError(""); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void savePrice(); } }} inputMode="decimal" placeholder="0.00" disabled={busy} error={priceError || undefined} required /><p className="mt-3 text-xs text-muted">Captura un importe mayor que cero. El precio solo aplica a esta venta.</p></div>}
+      </Modal>
+
+      <Modal open={discountOpen} onClose={cancelDiscount} closeDisabled={busy} title="Descuento de la venta" description="La vista previa se calcula y valida en el carrito de Rust." size="sm" footer={<><Button disabled={busy} onClick={cancelDiscount}>Cancelar</Button>{cart?.discount_type !== "none" && <Button disabled={busy || discountLoading} onClick={() => void removeDiscount()}>Quitar descuento</Button>}<Button variant="primary" loading={busy} disabled={busy || discountLoading || !discountQuote} onClick={() => void saveDiscount()}>Guardar descuento</Button></>}>
+        <div><fieldset disabled={busy || discountLoading}><legend className="mb-2 text-[0.625rem] font-extrabold tracking-wider text-muted uppercase">Tipo</legend><div className="grid grid-cols-2 gap-2">{(["percentage", "fixed"] as const).map((type) => <label key={type} className={`cursor-pointer rounded-control border px-3 py-3 text-center text-xs font-bold transition has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-brand ${discountType === type ? "border-brand bg-brand-soft text-brand" : "border-line text-muted"}`}><input className="sr-only" type="radio" name="discount-type" checked={discountType === type} onChange={() => { setDiscountType(type); invalidateDiscountPreview(); }} />{type === "percentage" ? "Porcentaje" : "Importe fijo"}</label>)}</div></fieldset><div className="mt-4"><Field data-autofocus label={discountType === "percentage" ? "Porcentaje" : "Importe"} value={discountInput} onChange={(event) => { setDiscountInput(event.target.value); invalidateDiscountPreview(); }} inputMode="decimal" placeholder="0.00" disabled={busy || discountLoading} error={discountError || undefined} required /></div><Button className="mt-4 w-full" loading={discountLoading} disabled={busy || discountLoading} onClick={() => void previewDiscount()}>Calcular vista previa</Button>{discountQuote && <dl className="mt-4 grid gap-2 rounded-control bg-surface-soft p-4 text-sm" aria-live="polite"><div className="flex justify-between"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(discountQuote.subtotal)}</dd></div>{discountQuote.discount_type !== "none" && <div className="flex justify-between text-danger"><dt>{discountLabel(discountQuote.discount_type, discountQuote.discount_value)}</dt><dd className="font-semibold">-{formatMoney(discountQuote.discount_amount)}</dd></div>}<div className="flex justify-between border-t border-line pt-2"><dt className="font-bold">Total</dt><dd className="font-bold text-brand">{formatMoney(discountQuote.total)}</dd></div></dl>}</div>
       </Modal>
 
       <Modal open={Boolean(receipt)} onClose={() => setReceipt(undefined)} title="Venta completada" description={receipt ? formatDateTime(receipt.sale.sale_date) : undefined} size="sm" footer={<Button variant="primary" onClick={() => setReceipt(undefined)}>Cerrar recibo</Button>}>
-        {receipt && <div><div className="rounded-card bg-brand-soft p-5 text-center"><span className="text-xs font-bold tracking-wider text-brand uppercase">Ticket POS-{String(receipt.sale.id).padStart(8, "0")}</span><strong className="mt-2 block font-heading text-3xl text-brand-dark">{formatMoney(receipt.sale.total)}</strong><span className="mt-1 block text-xs text-muted capitalize">{receipt.sale.payment_method}</span></div><div className="mt-4 divide-y divide-line">{receipt.details.map((detail) => <div key={detail.id} className="flex justify-between gap-4 py-3 text-sm"><span><strong className="block">{detail.product_name}</strong><span className="text-xs text-muted">{detail.sku} · {detail.quantity} unidades</span></span><span className="shrink-0 text-muted">{formatMoney(detail.unit_price)} c/u</span></div>)}</div>{receipt.sale.change_amount !== null && <div className="mt-4 flex justify-between border-t border-line pt-4 text-sm font-bold"><span>Cambio</span><span>{formatMoney(receipt.sale.change_amount)}</span></div>}</div>}
+        {receipt && <div><div className="rounded-card bg-brand-soft p-5 text-center"><span className="text-xs font-bold tracking-wider text-brand uppercase">Ticket POS-{String(receipt.sale.id).padStart(8, "0")}</span><strong className="mt-2 block font-heading text-3xl text-brand-dark">{formatMoney(receipt.sale.total)}</strong><span className="mt-1 block text-xs text-muted capitalize">{receipt.sale.payment_method}</span></div><div className="mt-4 divide-y divide-line">{receipt.details.map((detail) => {
+          const mode = detail.presentation_mode ?? "fixed";
+          const baseUnit = detail.base_unit ?? "piece";
+          const presentationName = detail.presentation_name ?? "Unidad";
+          const enteredQuantity = detail.entered_quantity ?? detail.quantity;
+           const priceBase = detail.presentation_base_quantity ?? detail.base_quantity ?? 1;
+           return <div key={detail.id} className="flex justify-between gap-4 py-3 text-sm"><span><strong className="block">{detail.product_name}</strong><span className="block text-xs text-muted">{presentationName} · {detail.sku}</span><span className="block text-xs text-muted">{formatEnteredQuantity(enteredQuantity, mode, presentationName, baseUnit)} · Aplicado: {presentationPriceLabel({ mode, name: presentationName, price: detail.unit_price, base_quantity: priceBase }, baseUnit)}</span>{detail.catalog_unit_price !== null && detail.catalog_unit_price !== detail.unit_price && <span className="block text-xs text-muted">Catalogo: {presentationPriceLabel({ mode, name: presentationName, price: detail.catalog_unit_price, base_quantity: priceBase }, baseUnit)}</span>}</span><strong className="shrink-0">{detail.line_total === null ? "No representable" : formatMoney(detail.line_total)}</strong></div>;
+        })}</div><dl className="mt-4 grid gap-2 border-t border-line pt-4 text-sm"><div className="flex justify-between"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(receipt.sale.subtotal)}</dd></div>{receipt.sale.discount_type !== "none" && <div className="flex justify-between text-danger"><dt>{discountLabel(receipt.sale.discount_type, receipt.sale.discount_value)}</dt><dd className="font-semibold">-{formatMoney(receipt.sale.discount_amount)}</dd></div>}<div className="flex justify-between font-bold"><dt>Total</dt><dd>{formatMoney(receipt.sale.total)}</dd></div>{receipt.sale.change_amount !== null && <div className="flex justify-between border-t border-line pt-3"><dt>Cambio</dt><dd>{formatMoney(receipt.sale.change_amount)}</dd></div>}</dl></div>}
       </Modal>
 
       <Modal open={discardOpen} onClose={() => setDiscardOpen(false)} closeDisabled={busy} title="Descartar intencion de cobro" description="Esta accion no confirma ni repite el cobro." size="sm" footer={<><Button disabled={busy} onClick={() => setDiscardOpen(false)}>Cancelar</Button><Button variant="primary" loading={busy} onClick={() => void discardIntent()}>Descartar y recargar carrito</Button></>}>

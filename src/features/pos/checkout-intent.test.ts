@@ -16,15 +16,15 @@ describe("checkout intent storage", () => {
   it("isolates pending checkout data by user", () => {
     savePendingCheckout(intent(1));
     savePendingCheckout(intent(2));
-    expect(readPendingCheckout(1)).toEqual(intent(1));
-    expect(readPendingCheckout(2)).toEqual(intent(2));
+    expect(readPendingCheckout(1)).toEqual({ ...intent(1), version: 2 });
+    expect(readPendingCheckout(2)).toEqual({ ...intent(2), version: 2 });
   });
 
   it("only clears the matching token and maps the backend payload", () => {
     const pending = intent(7, "current-token");
     savePendingCheckout(pending);
     clearPendingCheckout(7, "old-token");
-    expect(readPendingCheckout(7)).toEqual(pending);
+    expect(readPendingCheckout(7)).toEqual({ ...pending, version: 2 });
     expect(checkoutInput(pending)).toEqual({
       checkout_token: "current-token",
       cart_fingerprint: "cart-7",
@@ -40,5 +40,18 @@ describe("checkout intent storage", () => {
     localStorage.setItem("pos.checkout-intent.user.8", JSON.stringify(intent(9)));
     expect(readPendingCheckout(7)).toBeNull();
     expect(readPendingCheckout(8)).toBeNull();
+  });
+
+  it("migrates a valid legacy intent once without overwriting a current user intent", () => {
+    const legacy = intent(7, "legacy-token");
+    localStorage.setItem("pos.checkout-intent", JSON.stringify(legacy));
+    expect(readPendingCheckout(7)).toEqual(legacy);
+    expect(localStorage.getItem("pos.checkout-intent")).toBeNull();
+
+    const current = intent(7, "current-token");
+    savePendingCheckout(current);
+    localStorage.setItem("pos.checkout-intent", JSON.stringify(legacy));
+    expect(readPendingCheckout(7)).toEqual({ ...current, version: 2 });
+    expect(localStorage.getItem("pos.checkout-intent")).toBeNull();
   });
 });

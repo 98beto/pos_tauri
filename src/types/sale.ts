@@ -1,4 +1,6 @@
 import type { SaleDetail } from "./sale_detail";
+import type { BaseUnit } from "./product";
+import type { PresentationMode } from "./product_presentation";
 
 export interface Sale {
   id: number;
@@ -8,6 +10,10 @@ export interface Sale {
   checkout_token: string;
   cart_fingerprint: string;
   sale_date: string;
+  subtotal: number;
+  discount_type: CartDiscountType;
+  discount_value: number;
+  discount_amount: number;
   total: number;
   payment_method: PaymentMethod;
   cash_received: number | null;
@@ -17,6 +23,7 @@ export interface Sale {
 }
 
 export type PaymentMethod = "efectivo" | "tarjeta" | "transferencia";
+export type CartDiscountType = "none" | "percentage" | "fixed";
 
 export interface SaleReceipt {
   sale: Sale;
@@ -34,7 +41,7 @@ export interface SalesViewRow {
   sale_date: string;
   payment_method: PaymentMethod;
   total: number;
-  item_count: number;
+  line_count: number;
   user_id: number;
   user_name: string;
 }
@@ -43,7 +50,7 @@ export interface SalesViewStats {
   sale_count: number;
   total_sold: number;
   average_sale: number;
-  items_sold: number;
+  lines_sold: number;
 }
 
 export interface SalesView {
@@ -53,11 +60,21 @@ export interface SalesView {
 
 export interface SaleHistoryLine {
   product_id: number;
+  presentation_id: number | null;
   product_name: string;
   sku: string;
+  presentation_name: string | null;
+  presentation_barcode: string | null;
+  base_unit: BaseUnit | null;
+  presentation_mode: PresentationMode | null;
+  presentation_base_quantity: number | null;
   quantity: number;
+  catalog_unit_price: number | null;
   unit_price: number;
-  subtotal: number;
+  entered_quantity: number;
+  base_consumed: number;
+  movement_cost_cents: number | null;
+  subtotal: number | null;
 }
 
 export interface SaleHistoryDetail {
@@ -69,7 +86,12 @@ export interface SaleHistoryDetail {
   user_name: string;
   user_email: string;
   lines: SaleHistoryLine[];
-  item_count: number;
+  line_count: number;
+  subtotal: number;
+  discount_type: CartDiscountType;
+  discount_value: number;
+  discount_amount: number;
+  line_totals_verifiable: boolean;
   total: number;
   cash_received: number | null;
   change_amount: number | null;

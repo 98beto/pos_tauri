@@ -5,7 +5,7 @@ const LEGACY_STORAGE_KEY = "pos.checkout-intent";
 const STORAGE_KEY_PREFIX = "pos.checkout-intent.user.";
 
 export type PendingCheckout = {
-  version: 1;
+  version: 1 | 2;
   userId: number;
   checkoutToken: string;
   cartFingerprint: string;
@@ -21,7 +21,7 @@ function parsePendingCheckout(raw: string): PendingCheckout | null {
   try {
     const value = JSON.parse(raw) as Partial<PendingCheckout>;
     if (
-      value.version !== 1 ||
+      ![1, 2].includes(value.version ?? 0) ||
       !Number.isSafeInteger(value.userId) ||
       typeof value.checkoutToken !== "string" ||
       typeof value.cartFingerprint !== "string" ||
@@ -58,7 +58,7 @@ export function readPendingCheckout(userId: number): PendingCheckout | null {
 }
 
 export function savePendingCheckout(intent: PendingCheckout) {
-  localStorage.setItem(storageKey(intent.userId), JSON.stringify(intent));
+  localStorage.setItem(storageKey(intent.userId), JSON.stringify({ ...intent, version: 2 }));
 }
 
 export function clearPendingCheckout(userId: number, token: string) {

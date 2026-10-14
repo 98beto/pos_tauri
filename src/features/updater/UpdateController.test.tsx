@@ -489,7 +489,12 @@ describe("UpdateController", () => {
     render(integratedPosTree());
     await screen.findByRole("heading", { name: "Carrito actual" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Aumentar Cafe molido", hidden: true }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Aumentar Cafe molido, Bolsa 250 g",
+        hidden: true,
+      }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "leave-pos", hidden: true }));
     fireEvent.click(await screen.findByRole("button", { name: "Actualizar ahora" }));
     expect(screen.getByText(/cambio pendiente del carrito/)).toBeTruthy();

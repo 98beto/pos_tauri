@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getSaleHistoryDetail, getSalesView } from "../../api/sales";
 import { Button, EmptyState, Field, Modal, Spinner, StatCard } from "../../components/ui";
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
-import { formatDateTime, formatMoney } from "../../lib/format";
+import { formatBaseQuantity, formatDateTime, formatEnteredQuantity, formatMoney, formatPricePerUnit } from "../../lib/format";
 import type { PaymentMethod, SaleHistoryDetail, SalesView as SalesViewData } from "../../types/sale";
 
 type SalesViewProps = {
@@ -22,6 +22,14 @@ const paymentClasses: Record<PaymentMethod, string> = {
 };
 
 const selectClass = "h-11 w-full rounded-control border border-line-strong bg-surface px-3 text-sm text-ink outline-none transition focus:border-brand focus:ring-3 focus:ring-brand/12";
+
+function discountLabel(type: SaleHistoryDetail["discount_type"], value: number) {
+  if (type === "percentage") {
+    const percentage = `${Math.trunc(value / 100)}.${String(value % 100).padStart(2, "0")}`.replace(/\.00$/, "");
+    return `Descuento ${percentage}%`;
+  }
+  return "Descuento fijo";
+}
 
 export function SalesView({ onSessionRequired }: SalesViewProps) {
   const [view, setView] = useState<SalesViewData>();
@@ -140,7 +148,7 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
         <StatCard label="Ventas en resultados" value={statValue(view?.stats.sale_count)} detail={statsDetail} />
         <StatCard label="Total en resultados" value={statValue(view?.stats.total_sold, true)} detail={statsDetail} />
         <StatCard label="Promedio en resultados" value={statValue(view?.stats.average_sale, true)} detail={statsDetail} />
-        <StatCard label="Articulos en resultados" value={statValue(view?.stats.items_sold)} detail={statsDetail} />
+        <StatCard label="Lineas en resultados" value={statValue(view?.stats.lines_sold)} detail={statsDetail} />
       </div>
 
       <section className="mt-5 overflow-hidden rounded-card border border-line bg-surface">
@@ -171,23 +179,23 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
         {error && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Se muestran los resultados anteriores; no corresponden a los filtros actuales.</p>}
         {loading && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Actualizando; se muestran temporalmente los resultados anteriores.</p>}
 
-        <div className="relative overflow-x-auto" aria-label="Historial de tickets desplazable" aria-busy={loading} tabIndex={0}>
+        <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Historial de tickets desplazable" aria-busy={loading} tabIndex={0}>
           {loading && <div className="absolute inset-x-0 top-0 z-10 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}
           {!view && loading ? (
             <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div>
           ) : view?.items.length ? (
             <table aria-labelledby="sales-table-title" className="w-full min-w-[760px] text-left text-sm">
               <caption className="sr-only">Tickets del historial de ventas</caption>
-              <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Ticket</th><th className="border-b border-line px-5 py-3">Metodo</th><th className="border-b border-line px-5 py-3 text-right">Articulos</th><th className="border-b border-line px-5 py-3 text-right">Total</th><th className="border-b border-line px-5 py-3">Fecha</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
+               <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Ticket</th><th className="border-b border-line px-5 py-3">Metodo</th><th className="border-b border-line px-5 py-3 text-right">Lineas</th><th className="border-b border-line px-5 py-3 text-right">Total</th><th className="border-b border-line px-5 py-3">Fecha</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
               <tbody>
                 {view.items.map((sale) => (
                   <tr key={sale.id} className="hover:bg-surface-soft/60">
                     <td className="border-b border-line px-5 py-4"><strong className="font-mono text-xs">{sale.ticket_number}</strong><span className="mt-1 block text-xs text-muted">{sale.user_name}</span></td>
                     <td className="border-b border-line px-5 py-4"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${paymentClasses[sale.payment_method]}`}>{paymentLabels[sale.payment_method]}</span></td>
-                    <td className="border-b border-line px-5 py-4 text-right font-semibold">{sale.item_count}</td>
+                    <td className="border-b border-line px-5 py-4 text-right font-semibold">{sale.line_count}</td>
                     <td className="border-b border-line px-5 py-4 text-right font-bold">{formatMoney(sale.total)}</td>
                     <td className="border-b border-line px-5 py-4 text-xs whitespace-nowrap text-muted">{formatDateTime(sale.sale_date)}</td>
-                    <td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" disabled={detailLoading && selectedSaleId === sale.id} onClick={() => openDetail(sale.id)}>Ver detalle</Button></td>
+                    <td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" aria-label={`Ver detalle de ${sale.ticket_number}`} disabled={detailLoading && selectedSaleId === sale.id} onClick={() => openDetail(sale.id)}>Ver detalle</Button></td>
                   </tr>
                 ))}
               </tbody>
@@ -208,17 +216,45 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <div className="rounded-card bg-brand-soft p-4"><span className="text-[0.625rem] font-bold tracking-wider text-brand uppercase">Total</span><strong className="mt-2 block font-heading text-2xl text-brand-dark">{formatMoney(detail.total)}</strong></div>
               <div className="rounded-card border border-line p-4"><span className="text-[0.625rem] font-bold tracking-wider text-muted uppercase">Metodo</span><strong className="mt-2 block text-sm">{paymentLabels[detail.payment_method]}</strong></div>
-              <div className="rounded-card border border-line p-4"><span className="text-[0.625rem] font-bold tracking-wider text-muted uppercase">Articulos</span><strong className="mt-2 block text-sm">{detail.item_count}</strong></div>
+                <div className="rounded-card border border-line p-4"><span className="text-[0.625rem] font-bold tracking-wider text-muted uppercase">Lineas</span><strong className="mt-2 block text-sm">{detail.line_count}</strong></div>
               <div className="rounded-card border border-line p-4"><span className="text-[0.625rem] font-bold tracking-wider text-muted uppercase">Atendio</span><strong className="mt-2 block text-sm">{detail.user_name}</strong><span className="mt-1 block truncate text-xs text-muted">{detail.user_email}</span></div>
             </div>
 
-            <div className="mt-5 overflow-x-auto" aria-label="Lineas del ticket desplazables" tabIndex={0}>
-              <table className="w-full min-w-[620px] text-left text-sm">
-                <caption className="sr-only">Lineas historicas del ticket {detail.ticket_number}</caption>
-                <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-3 py-3">Producto</th><th className="border-b border-line px-3 py-3 text-right">Cantidad</th><th className="border-b border-line px-3 py-3 text-right">Precio</th><th className="border-b border-line px-3 py-3 text-right">Subtotal</th></tr></thead>
-                <tbody>{detail.lines.map((line) => <tr key={line.product_id}><td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="text-xs text-muted">{line.sku}</span></td><td className="border-b border-line px-3 py-4 text-right">{line.quantity}</td><td className="border-b border-line px-3 py-4 text-right">{formatMoney(line.unit_price)}</td><td className="border-b border-line px-3 py-4 text-right font-bold">{formatMoney(line.subtotal)}</td></tr>)}</tbody>
-              </table>
-            </div>
+             <div className="mt-5 overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Lineas del ticket desplazables" tabIndex={0}>
+               <table className="w-full min-w-[780px] text-left text-sm">
+                 <caption className="sr-only">Lineas historicas del ticket {detail.ticket_number}</caption>
+                 <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-3 py-3">Producto</th><th className="border-b border-line px-3 py-3">Presentacion</th><th className="border-b border-line px-3 py-3 text-right">Cantidad</th><th className="border-b border-line px-3 py-3 text-right">Precio unitario</th><th className="border-b border-line px-3 py-3 text-right">Total de linea</th></tr></thead>
+                 <tbody>{detail.lines.map((line, index) => {
+                   const hasPresentationSnapshot = line.presentation_name !== null && line.presentation_mode !== null && line.base_unit !== null;
+                   const enteredQuantity = hasPresentationSnapshot
+                     ? formatEnteredQuantity(line.entered_quantity, line.presentation_mode!, line.presentation_name!, line.base_unit!)
+                     : `${line.quantity} ${line.quantity === 1 ? "unidad" : "unidades"}`;
+                   const showBaseQuantity = hasPresentationSnapshot && line.presentation_mode === "fixed" && line.base_consumed !== line.entered_quantity;
+                    const unitPrice = hasPresentationSnapshot && line.presentation_mode === "measured"
+                       ? formatPricePerUnit(line.unit_price, line.base_unit!, line.presentation_base_quantity!)
+                     : line.presentation_name
+                       ? `${formatMoney(line.unit_price)} por ${line.presentation_name}`
+                       : formatMoney(line.unit_price);
+
+                    const catalogPrice = line.catalog_unit_price !== null && line.catalog_unit_price !== line.unit_price
+                      ? hasPresentationSnapshot && line.presentation_mode === "measured"
+                        ? formatPricePerUnit(line.catalog_unit_price, line.base_unit!, line.presentation_base_quantity!)
+                        : line.presentation_name
+                          ? `${formatMoney(line.catalog_unit_price)} por ${line.presentation_name}`
+                          : formatMoney(line.catalog_unit_price)
+                      : null;
+
+                    return <tr key={line.presentation_id ?? `legacy-line-${index}`}><td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="text-xs text-muted">{line.sku}</span></td><td className="border-b border-line px-3 py-4"><strong className="block text-sm">{line.presentation_name ?? "Sin presentacion registrada"}</strong>{line.presentation_barcode && <span className="text-xs text-muted">{line.presentation_barcode}</span>}</td><td className="border-b border-line px-3 py-4 text-right"><span className="block font-semibold">{enteredQuantity}</span>{showBaseQuantity && <span className="text-xs text-muted">Base: {formatBaseQuantity(line.base_consumed, line.base_unit!)}</span>}</td><td className="border-b border-line px-3 py-4 text-right"><span className="block">Aplicado: {unitPrice}</span>{catalogPrice && <span className="mt-1 block text-xs text-muted">Catalogo: {catalogPrice}</span>}</td><td className="border-b border-line px-3 py-4 text-right font-bold">{line.subtotal === null ? "No representable" : formatMoney(line.subtotal)}</td></tr>;
+                 })}</tbody>
+               </table>
+             </div>
+
+             <dl className="ml-auto mt-5 grid max-w-sm gap-3 rounded-card border border-line p-4 text-sm">
+               <div className="flex justify-between gap-4"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(detail.subtotal)}</dd></div>
+               {detail.discount_type !== "none" && <div className="flex justify-between gap-4 text-danger"><dt>{discountLabel(detail.discount_type, detail.discount_value)}</dt><dd className="font-semibold">-{formatMoney(detail.discount_amount)}</dd></div>}
+               <div className="flex justify-between gap-4 border-t border-line pt-3"><dt className="font-bold">Total</dt><dd className="font-bold text-brand">{formatMoney(detail.total)}</dd></div>
+               {!detail.line_totals_verifiable && <p className="text-xs text-muted">El subtotal historico se conserva; las lineas legadas no permiten verificar su suma.</p>}
+             </dl>
 
             {detail.payment_method === "efectivo" && (
               <dl className="ml-auto mt-5 grid max-w-sm gap-3 rounded-card bg-surface-soft p-4 text-sm">

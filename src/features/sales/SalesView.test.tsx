@@ -24,10 +24,10 @@ function deferred<T>() {
 
 function salesView(): SalesViewData {
   return {
-    stats: { sale_count: 2, total_sold: 3000, average_sale: 1500, items_sold: 3 },
+    stats: { sale_count: 2, total_sold: 3000, average_sale: 1500, lines_sold: 3 },
     items: [
-      { id: 1, ticket_number: "POS-00000001", sale_date: "2026-01-01", payment_method: "tarjeta", total: 2500, item_count: 2, user_id: 1, user_name: "Admin POS" },
-      { id: 2, ticket_number: "POS-00000002", sale_date: "2026-01-02", payment_method: "efectivo", total: 500, item_count: 1, user_id: 1, user_name: "Admin POS" },
+      { id: 1, ticket_number: "POS-00000001", sale_date: "2026-01-01", payment_method: "tarjeta", total: 2500, line_count: 2, user_id: 1, user_name: "Admin POS" },
+      { id: 2, ticket_number: "POS-00000002", sale_date: "2026-01-02", payment_method: "efectivo", total: 500, line_count: 1, user_id: 1, user_name: "Admin POS" },
     ],
   };
 }
@@ -42,10 +42,84 @@ function detail(id: number): SaleHistoryDetail {
     user_name: `Cajero ${id}`,
     user_email: `cajero${id}@example.com`,
     lines: [],
-    item_count: 0,
+    line_count: 0,
+    subtotal: id * 100,
+    discount_type: "none",
+    discount_value: 0,
+    discount_amount: 0,
+    line_totals_verifiable: true,
     total: id * 100,
     cash_received: null,
     change_amount: null,
+  };
+}
+
+function detailWithPresentations(): SaleHistoryDetail {
+  return {
+    ...detail(1),
+    line_count: 3,
+    subtotal: 12_500,
+    discount_type: "percentage",
+    discount_value: 1_000,
+    discount_amount: 1_250,
+    line_totals_verifiable: false,
+    total: 11_250,
+    lines: [
+      {
+        product_id: 10,
+        presentation_id: 101,
+        product_name: "Cafe historico",
+        sku: "CAFE-01",
+        presentation_name: "Bolsa 250 g",
+        presentation_barcode: "7500000000101",
+        base_unit: "gram",
+        presentation_mode: "fixed",
+        presentation_base_quantity: 250,
+        quantity: 2,
+        catalog_unit_price: 5000,
+        entered_quantity: 2,
+        base_consumed: 500,
+        unit_price: 4500,
+        movement_cost_cents: 2000,
+        subtotal: 9000,
+      },
+      {
+        product_id: 10,
+        presentation_id: 102,
+        product_name: "Cafe historico",
+        sku: "CAFE-01",
+        presentation_name: "Kilogramo",
+        presentation_barcode: null,
+        base_unit: "gram",
+        presentation_mode: "measured",
+        presentation_base_quantity: 500,
+        quantity: 250,
+        catalog_unit_price: 12000,
+        entered_quantity: 250,
+        base_consumed: 250,
+        unit_price: 12000,
+        movement_cost_cents: 1000,
+        subtotal: 3000,
+      },
+      {
+        product_id: 11,
+        presentation_id: null,
+        product_name: "Producto legacy",
+        sku: "LEGACY-01",
+        presentation_name: null,
+        presentation_barcode: null,
+        base_unit: null,
+        presentation_mode: null,
+        presentation_base_quantity: null,
+        quantity: 1,
+        catalog_unit_price: null,
+        entered_quantity: 1,
+        base_consumed: 1,
+        unit_price: 500,
+        movement_cost_cents: null,
+        subtotal: null,
+      },
+    ],
   };
 }
 
@@ -58,7 +132,7 @@ describe("SalesView", () => {
   it("sends ticket and payment filters and replaces statistics with remote results", async () => {
     vi.useFakeTimers();
     mockedGetSalesView.mockResolvedValueOnce(salesView()).mockResolvedValueOnce({
-      stats: { sale_count: 1, total_sold: 500, average_sale: 500, items_sold: 1 },
+      stats: { sale_count: 1, total_sold: 500, average_sale: 500, lines_sold: 1 },
       items: [salesView().items[1]],
     });
     render(<SalesView onSessionRequired={vi.fn()} />);
@@ -71,6 +145,8 @@ describe("SalesView", () => {
     expect(mockedGetSalesView).toHaveBeenLastCalledWith({ search: "00000002", payment_method: "efectivo" });
     expect(screen.getByText("POS-00000002")).toBeTruthy();
     expect(screen.getAllByText("Segun filtros y resultados actuales")).toHaveLength(4);
+    const region = screen.getByRole("region", { name: "Historial de tickets desplazable" });
+    expect(region.className).toContain("focus-visible:outline-2");
   });
 
   it("does not present zero statistics before an initial success or after an initial error", async () => {
@@ -107,7 +183,7 @@ describe("SalesView", () => {
 
     await act(() => vi.advanceTimersByTimeAsync(250));
     await act(async () => filtered.resolve({
-      stats: { sale_count: 1, total_sold: 2500, average_sale: 2500, items_sold: 2 },
+      stats: { sale_count: 1, total_sold: 2500, average_sale: 2500, lines_sold: 2 },
       items: [salesView().items[0]],
     }));
     expect(screen.getByText("1")).toBeTruthy();
@@ -139,9 +215,10 @@ describe("SalesView", () => {
     render(<SalesView onSessionRequired={vi.fn()} />);
 
     await act(() => vi.advanceTimersByTimeAsync(250));
-    const buttons = screen.getAllByRole("button", { name: "Ver detalle" });
-    fireEvent.click(buttons[0]);
-    fireEvent.click(buttons[1]);
+    const firstButton = screen.getByRole("button", { name: "Ver detalle de POS-00000001" });
+    const secondButton = screen.getByRole("button", { name: "Ver detalle de POS-00000002" });
+    fireEvent.click(firstButton);
+    fireEvent.click(secondButton);
     expect(mockedGetSaleHistoryDetail).toHaveBeenCalledTimes(2);
 
     await act(async () => first.resolve(detail(1)));
@@ -149,6 +226,38 @@ describe("SalesView", () => {
     await act(async () => second.resolve(detail(2)));
     expect(screen.getByText("Cajero 2")).toBeTruthy();
     expect(screen.getByRole("dialog").textContent).toContain("POS-00000002");
+  });
+
+  it("shows each presentation of the same product and preserves legacy line snapshots", async () => {
+    vi.useFakeTimers();
+    mockedGetSalesView.mockResolvedValue(salesView());
+    mockedGetSaleHistoryDetail.mockResolvedValue(detailWithPresentations());
+    render(<SalesView onSessionRequired={vi.fn()} />);
+
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Ver detalle de POS-00000001" }));
+    await act(async () => undefined);
+
+    const dialog = screen.getByRole("dialog");
+    const linesRegion = screen.getByRole("region", { name: "Lineas del ticket desplazables" });
+    expect(linesRegion.getAttribute("tabindex")).toBe("0");
+    expect(linesRegion.className).toContain("focus-visible:outline-2");
+    expect(screen.getAllByText("Cafe historico")).toHaveLength(2);
+    expect(dialog.textContent).toContain("Bolsa 250 g");
+    expect(dialog.textContent).toContain("Kilogramo");
+    expect(dialog.textContent).toContain("Base: 0.5 kg");
+    expect(dialog.textContent).toContain("0.25 kg");
+    expect(dialog.textContent).toContain("$120.00 por 500 g");
+    expect(dialog.textContent).toContain("Aplicado: $45.00 por Bolsa 250 g");
+    expect(dialog.textContent).toContain("Catalogo: $50.00 por Bolsa 250 g");
+    expect(dialog.textContent).toContain("Sin presentacion registrada");
+    expect(dialog.textContent).toContain("No representable");
+    expect(dialog.textContent).toContain("Subtotal$125.00");
+    expect(dialog.textContent).toContain("Descuento 10%-$12.50");
+    expect(dialog.textContent).toContain("Total$112.50");
+    expect(dialog.textContent).toContain("las lineas legadas no permiten verificar su suma");
+    expect(dialog.textContent).toContain("Cafe historico");
+    expect(dialog.textContent).not.toContain("Articulos");
   });
 
   it("ignores out-of-order list responses and completion after unmount", async () => {
@@ -185,7 +294,7 @@ describe("SalesView", () => {
     mockedGetSaleHistoryDetail.mockRejectedValue(new Error("SQLITE_CORRUPT /var/data.db"));
     render(<SalesView onSessionRequired={vi.fn()} />);
     await act(() => vi.advanceTimersByTimeAsync(250));
-    fireEvent.click(screen.getAllByRole("button", { name: "Ver detalle" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Ver detalle de POS-00000001" }));
     await act(async () => undefined);
 
     const alert = screen.getByRole("alert");

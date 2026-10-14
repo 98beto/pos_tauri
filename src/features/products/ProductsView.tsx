@@ -1,16 +1,18 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { createBrand, listBrands, updateBrand } from "../../api/brands";
 import { createCategory, listCategories, updateCategory } from "../../api/categories";
-import { createProduct, getProductsView, updateProduct } from "../../api/products";
+import { createProductWithPresentations, getProductsView, updateProductWithPresentations } from "../../api/products";
 import { Button, EmptyState, Field, Modal, Spinner, StatCard } from "../../components/ui";
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
-import { centsToDecimal, formatMoney } from "../../lib/format";
+import { centsToDecimal, formatBaseQuantity, formatMoney, presentationPriceLabel } from "../../lib/format";
 import type { Brand } from "../../types/brand";
 import type { Category } from "../../types/category";
-import type { ProductView, ProductViewRow } from "../../types/product";
+import type { BaseUnit, ProductView, ProductViewRow } from "../../types/product";
+import type { PresentationMode } from "../../types/product_presentation";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
 type ProductsViewProps = {
+  sessionId: number;
   onNotice: (notice: Notice) => void;
   onSessionRequired: () => void;
 };
@@ -18,21 +20,107 @@ type ProductsViewProps = {
 type ProductDraft = {
   name: string;
   sku: string;
-  price: string;
-  stock: string;
+  baseUnit: BaseUnit;
+  initialStock: string;
+  initialPurchasePrice: string;
   brandId: string;
   categoryId: string;
+  presentations: PresentationDraft[];
 };
 
-const emptyDraft: ProductDraft = { name: "", sku: "", price: "", stock: "", brandId: "", categoryId: "" };
+type SaleKind = "piece" | "package" | "exact";
+
+type PresentationDraft = {
+  key: number;
+  id?: number;
+  name: string;
+  saleKind: SaleKind;
+  mode: PresentationMode;
+  baseQuantity: string;
+  price: string;
+  barcode: string;
+  isActive: boolean;
+  isDefault: boolean;
+  isConversionLocked: boolean;
+};
+
+const unitLabels: Record<BaseUnit, { singular: string; plural: string }> = {
+  piece: { singular: "pieza", plural: "piezas" },
+  gram: { singular: "gramo", plural: "gramos" },
+  milliliter: { singular: "mililitro", plural: "mililitros" },
+};
+
+function initialPresentation(baseUnit: BaseUnit, key = 0): PresentationDraft {
+  return {
+    key,
+    name: baseUnit === "piece" ? "Pieza" : baseUnit === "gram" ? "Peso exacto" : "Volumen exacto",
+    saleKind: baseUnit === "piece" ? "piece" : "exact",
+    mode: baseUnit === "piece" ? "fixed" : "measured",
+    baseQuantity: baseUnit === "piece" ? "1" : "1000",
+    price: "",
+    barcode: "",
+    isActive: true,
+    isDefault: true,
+    isConversionLocked: false,
+  };
+}
+
+function hasMeaningfulPresentationData(draft: ProductDraft): boolean {
+  if (draft.presentations.length !== 1) return true;
+  const presentation = draft.presentations[0];
+  const initial = initialPresentation(draft.baseUnit, presentation.key);
+  return presentation.name !== initial.name
+    || presentation.saleKind !== initial.saleKind
+    || presentation.mode !== initial.mode
+    || presentation.baseQuantity !== initial.baseQuantity
+    || presentation.price.trim() !== ""
+    || presentation.barcode.trim() !== ""
+    || presentation.isActive !== initial.isActive
+    || presentation.isDefault !== initial.isDefault;
+}
+
+function saleKindOptions(baseUnit: BaseUnit): { kind: SaleKind; label: string }[] {
+  if (baseUnit === "piece") return [{ kind: "piece", label: "Pieza" }, { kind: "package", label: "Paquete" }];
+  return [{ kind: "package", label: "Paquete" }, { kind: "exact", label: baseUnit === "gram" ? "Peso exacto" : "Volumen exacto" }];
+}
+
+function saleKindChanges(kind: SaleKind, baseUnit: BaseUnit, currentQuantity: string): Partial<PresentationDraft> {
+  if (kind === "piece") return { name: "Pieza", saleKind: kind, mode: "fixed", baseQuantity: "1" };
+  if (kind === "package") return { name: "Paquete", saleKind: kind, mode: "fixed", baseQuantity: currentQuantity || "1" };
+  return { name: baseUnit === "gram" ? "Peso exacto" : "Volumen exacto", saleKind: kind, mode: "measured", baseQuantity: currentQuantity || "1000" };
+}
+
+const emptyDraft: ProductDraft = {
+  name: "",
+  sku: "",
+  baseUnit: "piece",
+  initialStock: "0",
+  initialPurchasePrice: "",
+  brandId: "",
+  categoryId: "",
+  presentations: [initialPresentation("piece")],
+};
 const selectClass = "h-11 w-full rounded-control border border-line-strong bg-surface px-3 text-sm text-ink outline-none focus:border-brand focus:ring-3 focus:ring-brand/12 disabled:bg-surface-soft";
 type LoadResult = "success" | "error" | "stale";
 
-function SelectField({ label, value, onChange, children, required = false, disabled = false }: { label: string; value: string; onChange: (value: string) => void; children: React.ReactNode; required?: boolean; disabled?: boolean }) {
-  return <label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">{label}{required && <span className="sr-only">obligatorio</span>}<select className={selectClass} value={value} onChange={(event) => onChange(event.target.value)} required={required} disabled={disabled}>{children}</select></label>;
+function estimatedInventoryValue(stockText: string, priceText: string): string {
+  const stock = stockText.trim();
+  const price = priceText.trim();
+  if (!/^\d+$/.test(stock) || !/^\d+(?:\.\d{1,2})?$/.test(price)) return "-";
+  const [whole, fraction = ""] = price.split(".");
+  const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0"));
+  const total = BigInt(stock) * cents;
+  if (total > BigInt(Number.MAX_SAFE_INTEGER)) return "-";
+  return formatMoney(Number(total));
 }
 
-export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps) {
+function SelectField({ label, value, onChange, children, required = false, disabled = false, hint }: { label: string; value: string; onChange: (value: string) => void; children: React.ReactNode; required?: boolean; disabled?: boolean; hint?: string }) {
+  const id = useId();
+  const hintId = hint ? `${id}-hint` : undefined;
+  return <div className="grid gap-2"><label htmlFor={id} className="text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">{label}{required && <span className="sr-only"> obligatorio</span>}</label><select id={id} aria-describedby={hintId} className={selectClass} value={value} onChange={(event) => onChange(event.target.value)} required={required} disabled={disabled}>{children}</select>{hint && <p id={hintId} className="text-xs leading-5 text-muted">{hint}</p>}</div>;
+}
+
+export function ProductsView({ sessionId, onNotice, onSessionRequired }: ProductsViewProps) {
   const [view, setView] = useState<ProductView>();
   const [brands, setBrands] = useState<Brand[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -48,10 +136,24 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
   const [draft, setDraft] = useState<ProductDraft>(emptyDraft);
   const [savingProduct, setSavingProduct] = useState(false);
   const [productError, setProductError] = useState("");
+  const [pendingBaseUnit, setPendingBaseUnit] = useState<BaseUnit>();
   const [catalogOpen, setCatalogOpen] = useState(false);
   const catalogRequest = useRef(0);
   const viewRequest = useRef(0);
   const productSaveInFlight = useRef(false);
+  const productSaveGeneration = useRef(0);
+  const presentationKey = useRef(1);
+  const presentationRefs = useRef(new Map<number, HTMLElement>());
+  const addPresentationRef = useRef<HTMLDivElement>(null);
+  const pendingPresentationFocus = useRef<number | "add" | null>(null);
+  const mounted = useRef(true);
+  const lifetime = useRef(0);
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+
+  function isCurrent(ownerSession: number, generation: number) {
+    return mounted.current && sessionIdRef.current === ownerSession && lifetime.current === generation;
+  }
 
   function fail(value: unknown, fallback: string, setLocalError?: (message: string) => void) {
     if (isSessionRequired(value)) {
@@ -65,26 +167,30 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
 
   async function loadCatalogs(): Promise<LoadResult> {
     const request = ++catalogRequest.current;
+    const ownerSession = sessionId;
+    const generation = lifetime.current;
     setLoading(true);
     try {
       const [nextBrands, nextCategories] = await Promise.all([listBrands(), listCategories()]);
-      if (catalogRequest.current !== request) return "stale";
+      if (!isCurrent(ownerSession, generation) || catalogRequest.current !== request) return "stale";
       setBrands(nextBrands);
       setCategories(nextCategories);
       setCatalogError("");
       return "success";
     } catch (value: unknown) {
-      if (catalogRequest.current !== request) return "stale";
+      if (!isCurrent(ownerSession, generation) || catalogRequest.current !== request) return "stale";
       if (isSessionRequired(value)) onSessionRequired();
       else setCatalogError(errorMessage(value, "No se pudieron cargar los catalogos."));
       return "error";
     } finally {
-      if (catalogRequest.current === request) setLoading(false);
+      if (isCurrent(ownerSession, generation) && catalogRequest.current === request) setLoading(false);
     }
   }
 
   async function loadView(): Promise<LoadResult> {
     const request = ++viewRequest.current;
+    const ownerSession = sessionId;
+    const generation = lifetime.current;
     setTableLoading(true);
     try {
       const nextView = await getProductsView({
@@ -92,24 +198,45 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
         brand_id: brandFilter ? Number(brandFilter) : undefined,
         category_id: categoryFilter ? Number(categoryFilter) : undefined,
       });
-      if (viewRequest.current !== request) return "stale";
+      if (!isCurrent(ownerSession, generation) || viewRequest.current !== request) return "stale";
       setView(nextView);
       setViewError("");
       return "success";
     } catch (value: unknown) {
-      if (viewRequest.current !== request) return "stale";
+      if (!isCurrent(ownerSession, generation) || viewRequest.current !== request) return "stale";
       if (isSessionRequired(value)) onSessionRequired();
       else setViewError(errorMessage(value, "No se pudieron consultar los productos."));
       return "error";
     } finally {
-      if (viewRequest.current === request) setTableLoading(false);
+      if (isCurrent(ownerSession, generation) && viewRequest.current === request) setTableLoading(false);
     }
   }
 
   useEffect(() => {
-    void loadCatalogs();
-    return () => { catalogRequest.current += 1; };
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      lifetime.current += 1;
+      catalogRequest.current += 1;
+      viewRequest.current += 1;
+      productSaveGeneration.current += 1;
+      productSaveInFlight.current = false;
+    };
   }, []);
+
+  useEffect(() => {
+    lifetime.current += 1;
+    catalogRequest.current += 1;
+    viewRequest.current += 1;
+    productSaveGeneration.current += 1;
+    productSaveInFlight.current = false;
+    setSavingProduct(false);
+    setProductOpen(false);
+    setPendingBaseUnit(undefined);
+    setCatalogOpen(false);
+    setView(undefined);
+    void loadCatalogs();
+  }, [sessionId]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void loadView(), 250);
@@ -117,33 +244,90 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
       window.clearTimeout(timeout);
       viewRequest.current += 1;
     };
-  }, [search, brandFilter, categoryFilter]);
+  }, [sessionId, search, brandFilter, categoryFilter]);
+
+  useEffect(() => {
+    const target = pendingPresentationFocus.current;
+    if (target === null) return;
+    pendingPresentationFocus.current = null;
+    if (target === "add") addPresentationRef.current?.querySelector("button")?.focus();
+    else presentationRefs.current.get(target)?.focus();
+  }, [draft.presentations]);
 
   function openCreate() {
     setEditingProduct(undefined);
-    setDraft({ ...emptyDraft, brandId: brands[0]?.id.toString() ?? "", categoryId: categories[0]?.id.toString() ?? "" });
+    setPendingBaseUnit(undefined);
+    presentationKey.current = 1;
+    setDraft({
+      ...emptyDraft,
+      presentations: [initialPresentation("piece")],
+      brandId: brands[0]?.id.toString() ?? "",
+      categoryId: categories[0]?.id.toString() ?? "",
+    });
     setProductError("");
     setProductOpen(true);
   }
 
   function openEdit(product: ProductViewRow) {
     setEditingProduct(product);
+    setPendingBaseUnit(undefined);
     setDraft({
       name: product.name,
       sku: product.sku,
-      price: centsToDecimal(product.price),
-      stock: "",
+      baseUnit: product.base_unit,
+      initialStock: "0",
+      initialPurchasePrice: "",
       brandId: product.brand_id.toString(),
       categoryId: product.category_id.toString(),
+      presentations: product.presentations.map((presentation, index) => ({
+        key: index,
+        id: presentation.id,
+        name: presentation.name,
+        saleKind: presentation.mode === "measured" ? "exact" : product.base_unit === "piece" && presentation.base_quantity === 1 ? "piece" : "package",
+        mode: presentation.mode,
+        baseQuantity: presentation.base_quantity.toString(),
+        price: centsToDecimal(presentation.price),
+        barcode: presentation.barcode ?? "",
+        isActive: presentation.is_active,
+        isDefault: presentation.is_default,
+        isConversionLocked: Boolean(presentation.is_conversion_locked),
+      })),
     });
+    presentationKey.current = product.presentations.length;
     setProductError("");
     setProductOpen(true);
+  }
+
+  function applyBaseUnit(baseUnit: BaseUnit) {
+    setDraft({ ...draft, baseUnit, presentations: [initialPresentation(baseUnit)] });
+    setPendingBaseUnit(undefined);
+  }
+
+  function changeBaseUnit(baseUnit: BaseUnit) {
+    if (baseUnit === draft.baseUnit) return;
+    if (hasMeaningfulPresentationData(draft)) setPendingBaseUnit(baseUnit);
+    else applyBaseUnit(baseUnit);
+  }
+
+  function removePresentation(index: number) {
+    const nextPresentations = draft.presentations.filter((_, itemIndex) => itemIndex !== index);
+    pendingPresentationFocus.current = nextPresentations[index]?.key ?? nextPresentations[index - 1]?.key ?? "add";
+    setDraft({ ...draft, presentations: nextPresentations });
   }
 
   async function saveProduct(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (productSaveInFlight.current) return;
+    const activePresentations = draft.presentations.filter((presentation) => presentation.isActive);
+    const defaultPresentations = draft.presentations.filter((presentation) => presentation.isDefault && presentation.isActive);
+    if (!activePresentations.length || defaultPresentations.length !== 1) {
+      setProductError("Debe haber al menos una presentacion activa y una sola predeterminada activa.");
+      return;
+    }
     productSaveInFlight.current = true;
+    const saveGeneration = ++productSaveGeneration.current;
+    const ownerSession = sessionId;
+    const generation = lifetime.current;
     setSavingProduct(true);
     setProductError("");
     let saved = false;
@@ -151,30 +335,65 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
       const common = {
         name: draft.name,
         sku: draft.sku,
-        price: draft.price,
         brand_id: Number(draft.brandId),
         category_id: Number(draft.categoryId),
+        base_unit: draft.baseUnit,
       };
-      if (editingProduct) await updateProduct(editingProduct.id, common);
-      else await createProduct({ ...common, stock: Number(draft.stock) });
+      if (editingProduct) {
+        await updateProductWithPresentations(editingProduct.id, {
+          ...common,
+          presentations: draft.presentations.map((presentation) => ({
+            id: presentation.id,
+            name: presentation.name,
+            mode: presentation.mode,
+            base_quantity: Number(presentation.baseQuantity),
+            price: presentation.price,
+            barcode: presentation.barcode.trim() || null,
+            is_default: presentation.isDefault,
+            is_active: presentation.isActive,
+          })),
+        });
+      } else {
+        await createProductWithPresentations({
+          ...common,
+          initial_stock: Number(draft.initialStock),
+          initial_purchase_price_per_base: draft.initialPurchasePrice.trim() || null,
+          presentations: draft.presentations.map((presentation) => ({
+            name: presentation.name,
+            mode: presentation.mode,
+            base_quantity: Number(presentation.baseQuantity),
+            price: presentation.price,
+            barcode: presentation.barcode.trim() || null,
+            is_default: presentation.isDefault,
+            is_active: presentation.isActive,
+          })),
+        });
+      }
+      if (!isCurrent(ownerSession, generation) || productSaveGeneration.current !== saveGeneration) return;
       saved = true;
     } catch (value: unknown) {
+      if (!isCurrent(ownerSession, generation) || productSaveGeneration.current !== saveGeneration) return;
       fail(value, "No se pudo guardar el producto.", setProductError);
     } finally {
-      productSaveInFlight.current = false;
-      setSavingProduct(false);
+      if (isCurrent(ownerSession, generation) && productSaveGeneration.current === saveGeneration) {
+        productSaveInFlight.current = false;
+        setSavingProduct(false);
+      }
     }
     if (!saved) return;
     setProductOpen(false);
     const successMessage = editingProduct ? "Producto actualizado." : "Producto creado.";
     onNotice({ tone: "success", message: successMessage });
-    if (await loadView() === "error") {
+    if (await loadView() === "error" && isCurrent(ownerSession, generation) && productSaveGeneration.current === saveGeneration) {
       onNotice({ tone: "info", message: `${successMessage} No se pudo recargar la lista; usa Reintentar carga.` });
     }
   }
 
   async function catalogsChanged(message: string) {
+    const ownerSession = sessionId;
+    const generation = lifetime.current;
     const results = await Promise.all([loadCatalogs(), loadView()]);
+    if (!isCurrent(ownerSession, generation)) return;
     if (results.includes("error")) onNotice({ tone: "info", message: `${message} No se pudieron recargar todos los datos; usa Reintentar carga.` });
     else onNotice({ tone: "success", message });
   }
@@ -197,21 +416,25 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
       : "Segun filtros actuales";
   const statValue = (value: number | undefined, money = false) =>
     statsUnavailable || value === undefined ? "-" : money ? formatMoney(value) : value;
+  const unknownCostCount = statsUnavailable ? "-" : view.items.filter((product) => product.inventory_cost_status === "unknown").length;
+  const initialInventoryValue = estimatedInventoryValue(draft.initialStock, draft.initialPurchasePrice);
 
   if (loading && !view) return <main id="main-content" tabIndex={-1} className="grid min-h-[calc(100dvh-88px)] place-items-center"><Spinner className="size-6 text-brand" /></main>;
 
   return (
     <main id="main-content" tabIndex={-1} className="p-4 outline-none sm:p-6 min-[900px]:p-8">
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
         <StatCard label="Productos" value={statValue(view?.stats.product_count)} detail={statsDetail} />
-        <StatCard label="Unidades" value={statValue(view?.stats.inventory_units)} detail={statsDetail} />
-        <StatCard label="Marcas" value={statValue(view?.stats.brand_count)} detail={statsDetail} />
-        <StatCard label="Valor inventario" value={statValue(view?.stats.inventory_value, true)} detail={statsDetail} />
+        <StatCard label="Existencia en piezas" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.piece_stock, "piece")} detail={statsDetail} />
+        <StatCard label="Existencia por peso" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.gram_stock, "gram")} detail={statsDetail} />
+        <StatCard label="Existencia por volumen" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.milliliter_stock, "milliliter")} detail={statsDetail} />
+        <StatCard label="Valor total a costo" value={statValue(view?.stats.inventory_value, true)} detail={statsDetail} />
+        <StatCard label="Sin costo registrado" value={unknownCostCount} detail="No incluidos en el valor a costo" />
       </div>
 
       <section className="mt-5 rounded-card border border-line bg-surface">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line p-4 sm:p-5">
-           <div><h2 id="products-table-title" className="font-heading text-xl font-bold">Catalogo de productos</h2><p className="mt-1 text-xs text-muted">Precios y clasificaciones del negocio.</p></div>
+           <div><h2 id="products-table-title" className="font-heading text-xl font-bold">Catalogo de productos</h2><p className="mt-1 text-xs text-muted">Existencias, presentaciones y valoracion del negocio.</p></div>
           <div className="flex flex-wrap gap-2"><Button onClick={() => setCatalogOpen(true)}>Marcas y categorias</Button><Button variant="primary" onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button></div>
         </div>
         <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3 sm:p-5">
@@ -222,27 +445,82 @@ export function ProductsView({ onNotice, onSessionRequired }: ProductsViewProps)
         {(catalogError || viewError) && <div className="m-4 flex flex-wrap items-center justify-between gap-3 rounded-control border border-danger/25 bg-danger-soft px-4 py-3 text-sm text-danger" role="alert"><span>{[catalogError, viewError].filter(Boolean).join(" ")}</span><Button size="sm" onClick={refreshAll} disabled={loading || tableLoading}>Reintentar carga</Button></div>}
         {viewError && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Se muestran los resultados anteriores; no corresponden a los filtros actuales.</p>}
         {tableLoading && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Actualizando; se muestran temporalmente los resultados anteriores.</p>}
-        <div className="relative overflow-x-auto" aria-busy={tableLoading}>{tableLoading && <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}{!view && tableLoading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.items.length ? <table aria-labelledby="products-table-title" className="w-full min-w-[760px] text-left text-sm"><caption className="sr-only">Listado de productos del catalogo</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Marca / categoria</th><th className="border-b border-line px-5 py-3 text-right">Precio</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{view.items.map((product) => <tr key={product.id} className="hover:bg-surface-soft/60"><td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="text-xs text-muted">{product.sku}</span></td><td className="border-b border-line px-5 py-4"><span className="block">{product.brand_name}</span><span className="text-xs text-muted">{product.category_name}</span></td><td className="border-b border-line px-5 py-4 text-right font-semibold">{formatMoney(product.price)}</td><td className="border-b border-line px-5 py-4 text-right"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${product.stock === 0 ? "bg-danger-soft text-danger" : "bg-brand-soft text-brand"}`}>{product.stock}</span></td><td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" onClick={() => openEdit(product)}>Editar</Button></td></tr>)}</tbody></table> : !tableLoading && !viewError && <EmptyState title="No hay productos para mostrar" description="Cambia los filtros o crea el primer producto." action={<Button onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button>} />}</div>
+        <div className="relative overflow-x-auto focus:outline-none focus:ring-3 focus:ring-brand/20" role="region" aria-busy={tableLoading} aria-label="Tabla de productos; desplaza horizontalmente para ver todas las columnas" tabIndex={0}>
+          {tableLoading && <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}
+          {!view && tableLoading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.items.length ? (
+            <table aria-labelledby="products-table-title" className="w-full min-w-[980px] text-left text-sm">
+              <caption className="sr-only">Listado de productos del catalogo</caption>
+              <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Predeterminada</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3 text-right">Activas</th><th className="border-b border-line px-5 py-3 text-right">Valor a costo</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
+              <tbody>{view.items.map((product) => <tr key={product.id} className="hover:bg-surface-soft/60">
+                <td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</span></td>
+                <td className="border-b border-line px-5 py-4"><span className="block font-semibold">{product.default_presentation.name}</span><span className="text-xs text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></td>
+                <td className="border-b border-line px-5 py-4 text-right"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${product.stock_base === 0 ? "bg-danger-soft text-danger" : "bg-brand-soft text-brand"}`}>{formatBaseQuantity(product.stock_base, product.base_unit)}</span></td>
+                <td className="border-b border-line px-5 py-4 text-right font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</td>
+                <td className="border-b border-line px-5 py-4 text-right">{product.inventory_cost_status === "known" && product.inventory_cost_cents !== null ? <span className="font-semibold">{formatMoney(product.inventory_cost_cents)}</span> : <span className="text-xs font-semibold text-muted">Sin costo registrado</span>}</td>
+                <td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" aria-label={`Editar producto ${product.name}`} onClick={() => openEdit(product)}>Editar</Button></td>
+              </tr>)}</tbody>
+            </table>
+          ) : !tableLoading && !viewError && <EmptyState title="No hay productos para mostrar" description="Cambia los filtros o crea el primer producto." action={<Button onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button>} />}
+        </div>
       </section>
 
-      <Modal open={productOpen} onClose={() => setProductOpen(false)} closeDisabled={savingProduct} title={editingProduct ? "Editar producto" : "Nuevo producto"} description={editingProduct ? "La edicion no modifica existencias." : "El stock inicial genera un movimiento de inventario."} size="md" footer={<><Button disabled={savingProduct} onClick={() => setProductOpen(false)}>Cancelar</Button><Button form="product-form" type="submit" variant="primary" loading={savingProduct}>Guardar producto</Button></>}>
+      <Modal open={productOpen} onClose={() => setProductOpen(false)} closeDisabled={savingProduct} title={editingProduct ? "Editar producto" : "Nuevo producto"} description={editingProduct ? "La unidad base y las presentaciones historicas se conservan." : "El stock inicial genera un movimiento de inventario."} size="lg" footer={<><Button disabled={savingProduct} onClick={() => setProductOpen(false)}>Cancelar</Button><Button form="product-form" type="submit" variant="primary" loading={savingProduct}>Guardar producto</Button></>}>
         <form id="product-form" onSubmit={(event) => void saveProduct(event)} className="grid gap-4 sm:grid-cols-2">
           {productError && <div className="rounded-control border border-danger/25 bg-danger-soft px-4 py-3 text-sm text-danger sm:col-span-2" role="alert">{productError}</div>}
           <Field data-autofocus label="Nombre" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required disabled={savingProduct} />
-          <Field label="SKU" value={draft.sku} onChange={(event) => setDraft({ ...draft, sku: event.target.value })} required disabled={savingProduct} />
-          <Field label="Precio" value={draft.price} onChange={(event) => setDraft({ ...draft, price: event.target.value })} inputMode="decimal" placeholder="0.00" required disabled={savingProduct} hint="Importe decimal; Rust valida y convierte a centavos." />
-          {!editingProduct && <Field label="Stock inicial" type="number" value={draft.stock} onChange={(event) => setDraft({ ...draft, stock: event.target.value })} required disabled={savingProduct} />}
+          <Field label="SKU unico del producto" value={draft.sku} onChange={(event) => setDraft({ ...draft, sku: event.target.value })} required disabled={savingProduct} hint="Las presentaciones no usan SKU." />
+          <SelectField label="Unidad base de inventario" value={draft.baseUnit} onChange={(baseUnit) => changeBaseUnit(baseUnit as BaseUnit)} required disabled={savingProduct || Boolean(editingProduct)} hint={editingProduct ? "No se puede cambiar porque las existencias ya estan registradas." : "No se puede cambiar despues de crear el producto."}><option value="piece">Pieza</option><option value="gram">Gramo</option><option value="milliliter">Mililitro</option></SelectField>
           <SelectField label="Marca" value={draft.brandId} onChange={(brandId) => setDraft({ ...draft, brandId })} required disabled={savingProduct}><option value="">Selecciona una marca</option>{brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</SelectField>
           <SelectField label="Categoria" value={draft.categoryId} onChange={(categoryId) => setDraft({ ...draft, categoryId })} required disabled={savingProduct}><option value="">Selecciona una categoria</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</SelectField>
+          <div className="hidden sm:block" aria-hidden="true" />
+          {!editingProduct && <>
+            <Field label={`Stock inicial en ${unitLabels[draft.baseUnit].plural}`} type="number" min="0" step="1" value={draft.initialStock} onChange={(event) => setDraft({ ...draft, initialStock: event.target.value })} required disabled={savingProduct} />
+            <Field label={`Precio de compra por ${unitLabels[draft.baseUnit].singular} (opcional)`} type="number" min="0" step="0.01" value={draft.initialPurchasePrice} onChange={(event) => setDraft({ ...draft, initialPurchasePrice: event.target.value })} inputMode="decimal" placeholder="Sin costo registrado" disabled={savingProduct} hint="Si lo dejas vacío, el inventario se guardará sin valoración hasta que establezcas su costo actual." />
+             <div className="rounded-control border border-line bg-surface-soft px-4 py-3 sm:col-span-2" aria-live="polite"><span className="block text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Valor inicial estimado del inventario</span><strong className="mt-1 block font-heading text-xl">{initialInventoryValue}</strong><p className="mt-1 text-xs text-muted">El valor definitivo se confirma al guardar.</p></div>
+          </>}
+          <fieldset className="grid gap-3 sm:col-span-2" disabled={savingProduct}>
+            <legend className="sr-only">Presentaciones</legend>
+            <div className="flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-heading text-lg font-bold">Presentaciones</h2><p className="mt-1 text-xs text-muted">Todas usan el SKU del producto; el codigo de barras es opcional.</p></div><div ref={addPresentationRef}><Button size="sm" onClick={() => setDraft({ ...draft, presentations: [...draft.presentations, { ...initialPresentation(draft.baseUnit, presentationKey.current++), name: "", isDefault: false }] })}>Agregar presentacion</Button></div></div>
+            {draft.presentations.map((presentation, index) => {
+              const kind = presentation.saleKind;
+              const quantityLabel = kind === "package" ? `Cantidad contenida en ${unitLabels[draft.baseUnit].plural}` : `Base del precio en ${unitLabels[draft.baseUnit].plural}`;
+              const summary = kind === "piece" ? "1 pieza por venta" : kind === "package" ? `${presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural} por paquete` : `Precio por ${presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural}`;
+              const updatePresentation = (changes: Partial<PresentationDraft>) => setDraft({ ...draft, presentations: draft.presentations.map((item) => item.key === presentation.key ? { ...item, ...changes } : item) });
+              const title = presentation.name || `Presentacion ${index + 1}`;
+              return <section key={presentation.key} ref={(node) => { if (node) presentationRefs.current.set(presentation.key, node); else presentationRefs.current.delete(presentation.key); }} tabIndex={-1} className="grid gap-3 rounded-card border border-line bg-surface p-4 shadow-sm outline-none focus-visible:ring-3 focus-visible:ring-brand/20 sm:grid-cols-2 lg:grid-cols-3" aria-label={`Presentacion ${index + 1}: ${title}`}>
+                <div className="flex flex-wrap items-start justify-between gap-3 sm:col-span-2 lg:col-span-3">
+                  <div><div className="flex flex-wrap items-center gap-2"><h3 className="font-bold">{title}</h3>{presentation.isDefault && <span className="rounded-full bg-brand-soft px-2 py-0.5 text-[0.625rem] font-extrabold tracking-wide text-brand uppercase">Predeterminada</span>}{!presentation.isActive && <span className="rounded-full bg-surface-soft px-2 py-0.5 text-[0.625rem] font-extrabold tracking-wide text-muted uppercase">Inactiva</span>}{presentation.isConversionLocked && <span className="rounded-full bg-surface-soft px-2 py-0.5 text-[0.625rem] font-extrabold tracking-wide text-muted uppercase">Historica</span>}</div><p className="mt-1 text-xs text-muted">{summary}</p></div>
+                  {!presentation.isConversionLocked && draft.presentations.length > 1 && <Button size="sm" variant="ghost" aria-label={`Quitar presentación ${title}`} onClick={() => removePresentation(index)}>Quitar</Button>}
+                </div>
+                <Field label="Nombre de presentacion" value={presentation.name} onChange={(event) => updatePresentation({ name: event.target.value })} required />
+                <fieldset className="grid gap-2" disabled={presentation.isConversionLocked}>
+                  <legend className="text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Forma de venta</legend>
+                  <div className="grid grid-cols-2 rounded-control border border-line-strong bg-surface-soft p-1">{saleKindOptions(draft.baseUnit).map((option) => <label key={option.kind} className={`cursor-pointer rounded-[calc(var(--radius-control)-0.25rem)] px-3 py-2 text-center text-sm font-bold outline-none transition has-focus-visible:ring-3 has-focus-visible:ring-brand/20 ${kind === option.kind ? "bg-surface text-brand shadow-sm" : "text-muted hover:text-ink"}`}><input className="sr-only" type="radio" name={`sale-kind-${presentation.key}`} value={option.kind} checked={kind === option.kind} onChange={() => updatePresentation(saleKindChanges(option.kind, draft.baseUnit, presentation.baseQuantity))} />{option.label}</label>)}</div>
+                </fieldset>
+                {kind !== "piece" && <Field label={quantityLabel} type="number" min="1" step="1" value={presentation.baseQuantity} onChange={(event) => updatePresentation({ baseQuantity: event.target.value })} required disabled={presentation.isConversionLocked} />}
+                {presentation.isConversionLocked && <p className="text-xs font-semibold text-muted sm:col-span-2 lg:col-span-3">Conversion bloqueada por historial.</p>}
+                <Field label="Precio de venta" type="number" min="0.01" step="0.01" value={presentation.price} onChange={(event) => updatePresentation({ price: event.target.value })} inputMode="decimal" placeholder="0.00" required />
+                <Field label="Codigo de barras (opcional)" value={presentation.barcode} onChange={(event) => updatePresentation({ barcode: event.target.value })} />
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-3 sm:col-span-2 lg:col-span-3">
+                  <label className={`flex items-center gap-2 text-sm font-semibold ${presentation.isDefault ? "cursor-not-allowed text-muted" : "cursor-pointer"}`}><input className="peer sr-only" type="checkbox" role="switch" aria-label={`${title} activa`} checked={presentation.isActive} disabled={presentation.isDefault} onChange={(event) => updatePresentation({ isActive: event.target.checked })} /><span aria-hidden="true" className="relative h-6 w-11 rounded-full bg-line-strong transition peer-checked:bg-brand peer-focus-visible:ring-3 peer-focus-visible:ring-brand/20 peer-disabled:opacity-50 after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5" />Activa</label>
+                  {presentation.isDefault ? <span className="text-xs font-bold text-brand">Presentacion predeterminada</span> : <Button size="sm" variant="ghost" aria-label={`Usar ${title} como predeterminada, presentación ${index + 1}`} onClick={() => setDraft({ ...draft, presentations: draft.presentations.map((item) => ({ ...item, isDefault: item.key === presentation.key, isActive: item.key === presentation.key ? true : item.isActive })) })}>Usar como predeterminada</Button>}
+                </div>
+              </section>;
+            })}
+          </fieldset>
         </form>
       </Modal>
 
-      <CatalogModal open={catalogOpen} brands={brands} categories={categories} onClose={() => setCatalogOpen(false)} onSessionRequired={onSessionRequired} onChanged={catalogsChanged} />
+      <Modal open={pendingBaseUnit !== undefined} onClose={() => setPendingBaseUnit(undefined)} title="Cambiar unidad base" description="Este cambio reiniciara las presentaciones capturadas." size="sm" footer={<><Button onClick={() => setPendingBaseUnit(undefined)}>Conservar datos</Button><Button variant="danger" onClick={() => pendingBaseUnit && applyBaseUnit(pendingBaseUnit)}>Cambiar y reiniciar</Button></>}>
+        <p className="text-sm text-muted">Se perderan los nombres, conversiones, precios y codigos de barras de las presentaciones actuales.</p>
+      </Modal>
+
+      <CatalogModal open={catalogOpen} sessionId={sessionId} brands={brands} categories={categories} onClose={() => setCatalogOpen(false)} onSessionRequired={onSessionRequired} onChanged={catalogsChanged} />
     </main>
   );
 }
 
-function CatalogModal({ open, brands, categories, onClose, onChanged, onSessionRequired }: { open: boolean; brands: Brand[]; categories: Category[]; onClose: () => void; onChanged: (message: string) => Promise<void>; onSessionRequired: () => void }) {
+function CatalogModal({ open, sessionId, brands, categories, onClose, onChanged, onSessionRequired }: { open: boolean; sessionId: number; brands: Brand[]; categories: Category[]; onClose: () => void; onChanged: (message: string) => Promise<void>; onSessionRequired: () => void }) {
   const [brandId, setBrandId] = useState<number>();
   const [brandName, setBrandName] = useState("");
   const [categoryId, setCategoryId] = useState<number>();
@@ -250,11 +528,29 @@ function CatalogModal({ open, brands, categories, onClose, onChanged, onSessionR
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const saveInFlight = useRef(false);
+  const mounted = useRef(true);
+  const generation = useRef(0);
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; generation.current += 1; saveInFlight.current = false; };
+  }, []);
+
+  useEffect(() => {
+    generation.current += 1;
+    saveInFlight.current = false;
+    setSaving(false);
+    setError("");
+  }, [open, sessionId]);
 
   async function save(kind: "brand" | "category", event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (saveInFlight.current) return;
     saveInFlight.current = true;
+    const saveGeneration = generation.current;
+    const ownerSession = sessionId;
     setSaving(true);
     setError("");
     let saved = false;
@@ -266,13 +562,17 @@ function CatalogModal({ open, brands, categories, onClose, onChanged, onSessionR
         if (categoryId) await updateCategory(categoryId, { name: categoryName });
         else await createCategory({ name: categoryName });
       }
+      if (!mounted.current || generation.current !== saveGeneration || sessionIdRef.current !== ownerSession) return;
       saved = true;
     } catch (value: unknown) {
+      if (!mounted.current || generation.current !== saveGeneration || sessionIdRef.current !== ownerSession) return;
       if (isSessionRequired(value)) onSessionRequired();
       else setError(errorMessage(value, "No se pudo guardar el catalogo."));
     } finally {
-      saveInFlight.current = false;
-      setSaving(false);
+      if (mounted.current && generation.current === saveGeneration && sessionIdRef.current === ownerSession) {
+        saveInFlight.current = false;
+        setSaving(false);
+      }
     }
     if (!saved) return;
     if (kind === "brand") {

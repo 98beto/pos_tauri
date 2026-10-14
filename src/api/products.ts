@@ -1,12 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateProductInput,
+  CreateProductWithPresentationsInput,
   Product,
+  ProductCodeMatch,
   ProductSelectorFilters,
   ProductSelectorRow,
   ProductView,
   ProductViewFilters,
   UpdateProductInput,
+  UpdateProductWithPresentationsInput,
 } from "../types/product";
 
 export function getProductsView(
@@ -29,8 +32,18 @@ export function findProductBySku(sku: string): Promise<Product | null> {
   return invoke<Product | null>("find_product_by_sku", { sku });
 }
 
+export function findProductByCode(code: string): Promise<ProductCodeMatch | null> {
+  return invoke<ProductCodeMatch | null>("find_product_by_code", { code });
+}
+
 export function createProduct(input: CreateProductInput): Promise<Product> {
   return invoke<Product>("create_product", { input });
+}
+
+export function createProductWithPresentations(
+  input: CreateProductWithPresentationsInput,
+): Promise<Product> {
+  return invoke<Product>("create_product_with_presentations", { input });
 }
 
 export function updateProduct(
@@ -38,4 +51,11 @@ export function updateProduct(
   input: UpdateProductInput,
 ): Promise<Product> {
   return invoke<Product>("update_product", { id, input });
+}
+
+export function updateProductWithPresentations(
+  id: number,
+  input: UpdateProductWithPresentationsInput,
+): Promise<Product> {
+  return invoke<Product>("update_product_with_presentations", { id, input });
 }
