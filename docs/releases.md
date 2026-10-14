@@ -77,6 +77,213 @@ git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
 
 El ultimo comando se ejecuta despues de confirmar los cambios de version y locks; comprueba que instalaciones y pruebas no los modificaron de nuevo. `pnpm validate:version` rechaza formatos distintos de `vX.Y.Z` y discrepancias entre los tres archivos.
 
+## Runbook v0.2.0: copia cerrada de esquema 8
+
+Este procedimiento prepara los bloques 13 y 14. No se ejecuta sobre la base activa y no autoriza una publicacion. La aplicacion usa `pos.db` dentro del directorio de datos de `com.beto98.pos-tauri`; el backup y los marcadores quedan en ese mismo directorio.
+
+### Evidencia y candidato exacto
+
+Crear fuera del repositorio un directorio de trabajo restringido, separar los datos QA de la evidencia compartible y registrar el commit candidato antes de iniciar. No guardar datos de negocio, tokens ni secretos en la evidencia:
+
+```bash
+export RELEASE_TAG=v0.2.0
+export CANDIDATE_SHA="$(git rev-parse HEAD^{commit})"
+export RELEASE_WORK_ROOT=/ruta/restringida/linea-pos-v0.2.0
+export EVIDENCE_DIR="$RELEASE_WORK_ROOT/evidence"
+export QA_SECURE_DIR="$RELEASE_WORK_ROOT/private-data"
+install -d -m 700 "$RELEASE_WORK_ROOT" "$EVIDENCE_DIR" "$QA_SECURE_DIR"
+printf '%s\n' "$CANDIDATE_SHA" > "$EVIDENCE_DIR/candidate-sha.txt"
+pnpm validate:version "$RELEASE_TAG" | tee "$EVIDENCE_DIR/version.txt"
+```
+
+El commit debe estar integrado en `main` antes de ejecutar GitHub Actions. Lanzar `Release` desde `main` con `mode=validate`, nunca con `publish`, y dejar constancia del run ID, su `headSha`, conclusion y SHA-256 del artifact `release-candidate`. `validate` no crea ni modifica releases. Descargar el artifact candidato generado por ese run, no compilar otro commit para la prueba:
+
+```bash
+gh workflow run release.yml --ref main -f mode=validate
+gh run list --workflow release.yml --event workflow_dispatch --limit 5
+gh run watch VALIDATE_RUN_ID --exit-status
+gh run view VALIDATE_RUN_ID --json databaseId,headSha,conclusion,url \
+  > "$EVIDENCE_DIR/validate-run.json"
+test "$(jq -r .headSha "$EVIDENCE_DIR/validate-run.json")" = "$CANDIDATE_SHA"
+gh run download VALIDATE_RUN_ID -n release-candidate -D "$EVIDENCE_DIR/release-candidate"
+(cd "$EVIDENCE_DIR/release-candidate" && sha256sum -- * | sort) \
+  > "$EVIDENCE_DIR/release-candidate.sha256"
+```
+
+Si `headSha` no coincide, si cambia el commit o si cualquier comprobacion falla, invalidar el candidato y repetir `validate` y toda la prueba. La copia QA se migra con el candidato descargado. Produccion se migra unicamente con el artefacto final publicado, compilado desde ese mismo commit etiquetado; `publish` vuelve a compilar y no se presupone que sus hashes sean reproducibles respecto a `validate`.
+
+### Obtener una copia v8 cerrada
+
+1. Programar una ventana sin operaciones y cerrar Linea POS en todos los procesos del equipo origen.
+2. Confirmar que no queda ningun proceso de Linea POS. No copiar una base mientras la aplicacion siga abierta.
+3. Localizar `pos.db` en el directorio de datos de `com.beto98.pos-tauri` y definir `SOURCE_DB` sin mover ni modificar el original.
+4. Comprobar que es esquema 8, integro y sin claves foraneas invalidas.
+5. Crear una instantanea consistente con la CLI de SQLite. Aunque la aplicacion este cerrada, no usar `cp` sobre un archivo que pueda tener WAL pendiente.
+
+```bash
+export SOURCE_DB=/ruta/absoluta/al/directorio-de-datos/pos.db
+export CLOSED_V8_COPY="$QA_SECURE_DIR/pos-v8-closed-copy.db"
+test "$(sqlite3 "$SOURCE_DB" 'PRAGMA user_version;')" = 8
+test "$(sqlite3 "$SOURCE_DB" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$SOURCE_DB" 'PRAGMA foreign_key_check;')"
+sqlite3 "$SOURCE_DB" ".timeout 5000" ".backup '$CLOSED_V8_COPY'"
+chmod 600 "$CLOSED_V8_COPY"
+test "$(sqlite3 "$CLOSED_V8_COPY" 'PRAGMA user_version;')" = 8
+test "$(sqlite3 "$CLOSED_V8_COPY" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$CLOSED_V8_COPY" 'PRAGMA foreign_key_check;')"
+```
+
+Si la copia sale del equipo autorizado, anonimizarla mediante un procedimiento aprobado o no transferirla. No adjuntar la base, el backup ni el manifiesto completo a Actions, issues o evidencia compartida.
+
+Guardar comparables previos sin valores personales. Como minimo, registrar conteos y stock por ID; conservar por separado una lista autorizada de tickets historicos a revisar:
+
+```bash
+sqlite3 -readonly -header -csv "$CLOSED_V8_COPY" \
+  'SELECT "products" AS table_name, COUNT(*) AS rows FROM products UNION ALL SELECT "sales", COUNT(*) FROM sales UNION ALL SELECT "sale_details", COUNT(*) FROM sale_details UNION ALL SELECT "inventory_movements", COUNT(*) FROM inventory_movements;' \
+  > "$EVIDENCE_DIR/v8-counts.csv"
+sqlite3 -readonly -header -csv "$CLOSED_V8_COPY" \
+  'SELECT id, stock, inventory_cost_cents FROM products ORDER BY id;' \
+  > "$EVIDENCE_DIR/v8-product-state.csv"
+```
+
+### Migrar solamente la copia
+
+Usar una maquina QA sin acceso al directorio de datos real. En Linux, el AppImage puede aislarse fijando `XDG_DATA_HOME`; confirmar la ruta creada antes de abrir cualquier otro binario:
+
+```bash
+export QA_ROOT="$QA_SECURE_DIR/runtime"
+install -d -m 700 "$QA_ROOT"
+export XDG_DATA_HOME="$QA_ROOT/data"
+export QA_APP_DATA="$XDG_DATA_HOME/com.beto98.pos-tauri"
+install -d -m 700 "$QA_APP_DATA"
+cp "$CLOSED_V8_COPY" "$QA_APP_DATA/pos.db"
+chmod 600 "$QA_APP_DATA/pos.db"
+XDG_DATA_HOME="$XDG_DATA_HOME" "$EVIDENCE_DIR/release-candidate/Linea.POS_0.2.0_amd64.AppImage"
+```
+
+En Windows usar una VM o usuario QA desechable y confirmar mediante la ruta mostrada por el sistema que `pos.db` pertenece a ese perfil aislado. No cambiar el identificador Tauri para la prueba y no apuntar el candidato al perfil de produccion.
+
+Tras el primer inicio, cerrar completamente la aplicacion y validar:
+
+```bash
+export MIGRATED_DB="$QA_APP_DATA/pos.db"
+test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA user_version;')" = 12
+test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$MIGRATED_DB" 'PRAGMA foreign_key_check;')"
+mapfile -t V8_BACKUPS < <(find "$QA_APP_DATA" -maxdepth 1 -name 'pos-v8-before-v0.2.0-*.db' -print)
+mapfile -t COMPLETED_MANIFESTS < <(find "$QA_APP_DATA" -maxdepth 1 -name 'pos-v0.2.0-migration-completed-*.json' -print)
+test "${#V8_BACKUPS[@]}" -eq 1
+test "${#COMPLETED_MANIFESTS[@]}" -eq 1
+test ! -e "$QA_APP_DATA/pos-v0.2.0-migration-pending.json"
+```
+
+Debe existir exactamente un backup y un manifiesto completado para este intento, y no debe quedar `pos-v0.2.0-migration-pending.json`. Leer la ruta desde el manifiesto, no elegir el backup por fecha o nombre:
+
+```bash
+export MANIFEST="${COMPLETED_MANIFESTS[0]}"
+export V8_BACKUP="$(jq -er 'select(.source_version == 8 and .target_version == 12) | .backup_path' "$MANIFEST")"
+test -f "$V8_BACKUP"
+test "$(sqlite3 "$V8_BACKUP" 'PRAGMA user_version;')" = 8
+test "$(sqlite3 "$V8_BACKUP" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$V8_BACKUP" 'PRAGMA foreign_key_check;')"
+```
+
+Repetir los CSV de conteos y stock sobre `MIGRATED_DB` y compararlos con los de v8. Verificar manualmente una muestra de tickets historicos, incluidos efectivo y cambio. Abrir y cerrar otra vez `v0.2.0`; confirmar que permanece en esquema 12 y que no aparece un segundo backup. En la copia migrada probar compra, venta, ajuste y valoracion, y registrar resultado, SO, arquitectura, formato del instalador y hashes. Las operaciones funcionales de prueba ocurren despues de las comparaciones historicas y nunca se esperan en el backup v8.
+
+### Ensayo de rollback durable a v0.1.0
+
+Ejecutar este ensayo sobre el directorio QA anterior. No intentar abrir esquema 12 con `v0.1.0`.
+
+1. Cerrar completamente `v0.2.0` y confirmar que no queda ningun proceso.
+2. Crear y validar una copia de diagnostico del esquema 12.
+3. Volver a leer `backup_path` del manifiesto completado o, tras un fallo, de `pos-v0.2.0-migration-pending.json`.
+4. Validar nuevamente el backup v8 antes de restaurar.
+5. Restaurar primero a un archivo temporal en el mismo directorio y persistirlo. Antes de promoverlo, mover `pos.db`, `pos.db-wal` y `pos.db-shm` existentes a nombres de cuarentena en ese mismo directorio y sincronizar el directorio. Nunca puede coexistir el v8 promovido con sidecars del v12.
+6. Si habia marcador pendiente, archivarlo como evidencia fuera del nombre activo solo despues de validar la restauracion; de lo contrario bloquearia correctamente el siguiente inicio.
+7. Conservar la base v12 y sus sidecars en cuarentena, junto con la copia diagnostica y los marcadores archivados, hasta cerrar la investigacion. No borrarlos como parte del rollback.
+
+La finalizacion de migracion y restauracion publica primero un manifiesto completado independiente: escribe y sincroniza un temporal exclusivo, lo renombra al nombre final y sincroniza el directorio. Solo entonces retira el marcador activo y vuelve a sincronizar el directorio. Si un corte deja ambos archivos, el siguiente inicio solo retira el activo despues de comprobar que los manifiestos coinciden y volver a sincronizar el completado; si difieren o cualquier sincronizacion falla, bloquea la apertura.
+
+```bash
+export MIGRATION_STATE="$MANIFEST"
+if test -f "$QA_APP_DATA/pos-v0.2.0-migration-pending.json"; then
+  export MIGRATION_STATE="$QA_APP_DATA/pos-v0.2.0-migration-pending.json"
+fi
+export V8_BACKUP="$(jq -er 'select(.source_version == 8 and .target_version == 12) | .backup_path' "$MIGRATION_STATE")"
+test -f "$V8_BACKUP"
+test "$(sqlite3 "$V8_BACKUP" 'PRAGMA user_version;')" = 8
+test "$(sqlite3 "$V8_BACKUP" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$V8_BACKUP" 'PRAGMA foreign_key_check;')"
+sqlite3 "$MIGRATED_DB" ".backup '$QA_APP_DATA/pos-v12-diagnostic.db'"
+test "$(sqlite3 "$QA_APP_DATA/pos-v12-diagnostic.db" 'PRAGMA user_version;')" = 12
+export RESTORE_TMP="$QA_APP_DATA/.pos-v8-restore.tmp"
+export RESTORE_ID="$(date +%s)-$$"
+export QUARANTINE_DB="$QA_APP_DATA/.pos-quarantine-$RESTORE_ID.db"
+export QUARANTINE_WAL="$QA_APP_DATA/.pos-quarantine-$RESTORE_ID-sidecar-wal"
+export QUARANTINE_SHM="$QA_APP_DATA/.pos-quarantine-$RESTORE_ID-sidecar-shm"
+rm -f -- "$RESTORE_TMP"
+sqlite3 "$V8_BACKUP" ".backup '$RESTORE_TMP'"
+test "$(sqlite3 "$RESTORE_TMP" 'PRAGMA user_version;')" = 8
+test "$(sqlite3 "$RESTORE_TMP" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$RESTORE_TMP" 'PRAGMA foreign_key_check;')"
+chmod 600 "$RESTORE_TMP"
+sync -f "$RESTORE_TMP"
+test -f "$MIGRATED_DB" && mv -- "$MIGRATED_DB" "$QUARANTINE_DB"
+test ! -f "$MIGRATED_DB-wal" || mv -- "$MIGRATED_DB-wal" "$QUARANTINE_WAL"
+test ! -f "$MIGRATED_DB-shm" || mv -- "$MIGRATED_DB-shm" "$QUARANTINE_SHM"
+sync -f "$QA_APP_DATA"
+mv -- "$RESTORE_TMP" "$MIGRATED_DB"
+sync -f "$QA_APP_DATA"
+if test -f "$QA_APP_DATA/pos-v0.2.0-migration-pending.json"; then
+  mv -- "$QA_APP_DATA/pos-v0.2.0-migration-pending.json" \
+    "$EVIDENCE_DIR/pending-marker-from-rollback-test.json"
+fi
+test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA user_version;')" = 8
+test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA quick_check;')" = ok
+test -z "$(sqlite3 "$MIGRATED_DB" 'PRAGMA foreign_key_check;')"
+```
+
+Si falla cualquier movimiento de cuarentena, no promover `RESTORE_TMP`: conservar el namespace parcial y restaurar primero todos los nombres originales. Si falla la promocion, su sincronizacion, la validacion o el archivado del marcador, aislar el v8 promovido como `.pos-restore-failed-*.db`, devolver sidecars y base v12 desde cuarentena (sidecars primero, base al final), sincronizar el directorio y conservar el archivo fallido. Si cualquiera de esos pasos de rollback falla, la recuperacion esta incompleta: no iniciar ninguna version y escalar usando backup, marcador y cuarentenas.
+
+En Windows no se acepta un procedimiento equivalente basado solo en `Move-Item`, porque no ofrece una confirmacion de durabilidad del directorio. La primitiva de mantenimiento del backend abre el directorio con `CreateFileW` (`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH`) y exige que `FlushFileBuffers` tenga exito despues de publicar el completado, antes de retirar el activo, y despues de retirarlo. Si el filesystem, permisos o runtime no admiten esa operacion, restore y migracion fallan de forma cerrada y conservan el marcador activo o un manifiesto completado ya durable; no se debe afirmar exito ni abrir la base cuando ambos no coincidan. Ejecutar el ensayo Windows solo en un volumen local NTFS con la aplicacion cerrada y mediante esa primitiva probada, no mediante una sustitucion manual de archivos.
+
+Instalar o ejecutar el artefacto publicado e inmutable de `v0.1.0` con ese mismo perfil QA. Verificar productos, stock, ventas y tickets previos, cerrar y reabrir. Comparar otra vez con `v8-counts.csv` y `v8-product-state.csv`. Registrar que toda operacion creada despues de migrar a `v0.2.0` se pierde al restaurar el backup; el rollback de produccion debe decidirse antes de reanudar operacion prolongada.
+
+### Despliegue controlado y publicacion
+
+No continuar hasta que `validate`, migracion, reapertura y rollback hayan pasado sobre el mismo candidato. Si cambia un byte o commit, repetir todo.
+
+1. Congelar UI, contratos, migraciones `009`-`012` y commit candidato.
+2. Confirmar CI verde, `pnpm validate:version v0.2.0` y que el SHA validado pertenece a `main`.
+3. Crear el tag anotado inmutable `v0.2.0` exactamente sobre `CANDIDATE_SHA` y verificarlo antes de enviarlo.
+4. Autorizar `mode=publish` solamente despues de la aprobacion operacional. Este modo puede publicar y no forma parte del ensayo local.
+5. Confirmar que el run de publicacion usa el SHA etiquetado; comparar los SHA-256 locales y remotos de ese mismo run y validar firmas y `latest.json`.
+6. Instalar primero el artefacto final en un equipo controlado, confirmar backup, manifiesto, esquema 12, funciones principales y reapertura; despues liberar los demas equipos.
+
+```bash
+test "$(git rev-parse HEAD^{commit})" = "$CANDIDATE_SHA"
+git tag -a v0.2.0 "$CANDIDATE_SHA" -m "Linea POS v0.2.0"
+git rev-parse 'v0.2.0^{commit}'
+git push origin v0.2.0
+# Solo con autorizacion explicita; publica una release:
+gh workflow run release.yml --ref main -f mode=publish -f tag=v0.2.0
+```
+
+### Checklist y evidencia minima
+
+- [ ] Aplicacion de origen cerrada y copia consistente con `user_version=8`, `quick_check=ok` y cero filas de `foreign_key_check`.
+- [ ] Commit SHA, validate run URL/ID, plataforma, instalador y SHA-256 registrados.
+- [ ] `headSha` de `mode=validate` igual al commit candidato.
+- [ ] Conteos, stock, costos, tickets, efectivo, cambio, IDs, fechas y tokens historicos conservados.
+- [ ] Esquema final 12 integro y reapertura sin otra migracion ni otro backup.
+- [ ] Un unico manifiesto completado apunta al backup exacto; backup v8 valido y protegido.
+- [ ] Compra, venta, ajuste y valoracion pasan solamente sobre la copia QA.
+- [ ] Rollback restaura durablemente esquema 8 y `v0.1.0` abre y reabre los datos esperados.
+- [ ] Perdida esperada de operaciones posteriores a la migracion entendida y ventana de decision acordada.
+- [ ] Sin bases, backups, manifiestos con rutas sensibles, datos personales, tokens ni secretos en evidencia compartida.
+- [ ] Cualquier cambio posterior al ensayo invalida el candidato y repite `validate`, migracion y rollback.
+- [ ] Tag y `publish` aprobados explicitamente y ejecutados solo despues de completar los puntos anteriores.
+
 Crear un commit normal mediante pull request. Cuando este en `main`, crear el tag anotado sobre el commit exacto y publicarlo:
 
 ```bash
