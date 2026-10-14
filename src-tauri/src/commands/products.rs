@@ -4,8 +4,9 @@ use crate::{
     db::Database,
     error::AppError,
     models::product::{
-        CreateProductInput, Product, ProductSelectorFilters, ProductSelectorRow, ProductView,
-        ProductViewFilters, UpdateProductInput,
+        CreateProductInput, CreateProductWithPresentationsInput, Product, ProductCodeMatch,
+        ProductSelectorFilters, ProductSelectorRow, ProductView, ProductViewFilters,
+        UpdateProductInput, UpdateProductWithPresentationsInput,
     },
     services::products,
 };
@@ -40,7 +41,7 @@ pub fn list_product_selector(
             "No se pudo acceder a la base de datos",
         )
     })?;
-    products::selector(&connection, &state.cart, filters)
+    products::selector(&connection, &state.cart.quantities(), filters)
 }
 
 #[tauri::command]
@@ -65,6 +66,17 @@ pub fn find_product_by_sku(
 }
 
 #[tauri::command]
+pub fn find_product_by_code(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    code: String,
+) -> Result<Option<ProductCodeMatch>, AppError> {
+    with_authenticated_connection(&database, &session, |connection, _| {
+        products::find_by_code(connection, &code)
+    })
+}
+
+#[tauri::command]
 pub fn create_product(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,
@@ -72,6 +84,17 @@ pub fn create_product(
 ) -> Result<Product, AppError> {
     with_authenticated_connection(&database, &session, |connection, _| {
         products::create(connection, input)
+    })
+}
+
+#[tauri::command]
+pub fn create_product_with_presentations(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    input: CreateProductWithPresentationsInput,
+) -> Result<Product, AppError> {
+    with_authenticated_connection(&database, &session, |connection, _| {
+        products::create_with_presentations(connection, input)
     })
 }
 
@@ -84,5 +107,17 @@ pub fn update_product(
 ) -> Result<Product, AppError> {
     with_authenticated_connection(&database, &session, |connection, _| {
         products::update(connection, id, input)
+    })
+}
+
+#[tauri::command]
+pub fn update_product_with_presentations(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    id: i64,
+    input: UpdateProductWithPresentationsInput,
+) -> Result<Product, AppError> {
+    with_authenticated_connection(&database, &session, |connection, _| {
+        products::update_with_presentations(connection, id, input)
     })
 }

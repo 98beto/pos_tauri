@@ -4,7 +4,7 @@ use crate::{
     db::Database,
     error::AppError,
     models::{
-        cart::{Cart, CashChangeQuote, CheckoutCartInput},
+        cart::{Cart, CartDiscountQuote, CashChangeQuote, CheckoutCartInput},
         sale::SaleReceipt,
     },
     services::{cart, sales, ServiceResult},
@@ -13,8 +13,8 @@ use crate::{
 use super::AuthSession;
 
 fn with_cart<T>(
-    database: &State<'_, Database>,
-    session: &State<'_, AuthSession>,
+    database: &Database,
+    session: &AuthSession,
     operation: impl FnOnce(&mut rusqlite::Connection, i64, &mut cart::SessionCart) -> ServiceResult<T>,
 ) -> Result<T, AppError> {
     // Session first is the single lock order for cart operations and serializes checkout.
@@ -46,10 +46,10 @@ pub fn get_cart(
 pub fn add_cart_item(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,
-    product_id: i64,
+    presentation_id: i64,
 ) -> Result<Cart, AppError> {
     with_cart(&database, &session, |connection, _, items| {
-        cart::add(connection, items, product_id)
+        cart::add(connection, items, presentation_id)
     })
 }
 
@@ -57,10 +57,79 @@ pub fn add_cart_item(
 pub fn increment_cart_item(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,
-    product_id: i64,
+    presentation_id: i64,
 ) -> Result<Cart, AppError> {
     with_cart(&database, &session, |connection, _, items| {
-        cart::increment(connection, items, product_id)
+        cart::increment(connection, items, presentation_id)
+    })
+}
+
+#[tauri::command]
+pub fn set_cart_item_quantity(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    presentation_id: i64,
+    entered_quantity: i64,
+) -> Result<Cart, AppError> {
+    with_cart(&database, &session, |connection, _, items| {
+        cart::set_quantity(connection, items, presentation_id, entered_quantity)
+    })
+}
+
+#[tauri::command]
+pub fn set_cart_item_unit_price(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    presentation_id: i64,
+    unit_price: String,
+) -> Result<Cart, AppError> {
+    with_cart(&database, &session, |connection, _, state| {
+        cart::set_unit_price(connection, state, presentation_id, &unit_price)
+    })
+}
+
+#[tauri::command]
+pub fn reset_cart_item_unit_price(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    presentation_id: i64,
+) -> Result<Cart, AppError> {
+    with_cart(&database, &session, |connection, _, state| {
+        cart::reset_unit_price(connection, state, presentation_id)
+    })
+}
+
+#[tauri::command]
+pub fn set_cart_discount(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    discount_type: String,
+    value: String,
+) -> Result<Cart, AppError> {
+    with_cart(&database, &session, |connection, _, state| {
+        cart::set_discount(connection, state, &discount_type, &value)
+    })
+}
+
+#[tauri::command]
+pub fn quote_cart_discount(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    discount_type: String,
+    value: String,
+) -> Result<CartDiscountQuote, AppError> {
+    with_cart(&database, &session, |connection, _, state| {
+        cart::quote_discount(connection, state, &discount_type, &value)
+    })
+}
+
+#[tauri::command]
+pub fn remove_cart_discount(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+) -> Result<Cart, AppError> {
+    with_cart(&database, &session, |connection, _, state| {
+        cart::remove_discount(connection, state)
     })
 }
 
@@ -68,10 +137,10 @@ pub fn increment_cart_item(
 pub fn decrement_cart_item(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,
-    product_id: i64,
+    presentation_id: i64,
 ) -> Result<Cart, AppError> {
     with_cart(&database, &session, |connection, _, items| {
-        cart::decrement(connection, items, product_id)
+        cart::decrement(connection, items, presentation_id)
     })
 }
 
@@ -79,10 +148,10 @@ pub fn decrement_cart_item(
 pub fn remove_cart_item(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,
-    product_id: i64,
+    presentation_id: i64,
 ) -> Result<Cart, AppError> {
     with_cart(&database, &session, |connection, _, items| {
-        cart::remove(connection, items, product_id)
+        cart::remove(connection, items, presentation_id)
     })
 }
 
@@ -131,9 +200,15 @@ fn checkout_and_clear(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use rusqlite::Connection;
 
-    use crate::{db::migrations, models::cart::CheckoutCartInput, services::cart::SessionCart};
+    use crate::{
+        db::{migrations, Database},
+        models::cart::CheckoutCartInput,
+        services::cart::SessionCart,
+    };
 
     fn database() -> Connection {
         let mut connection = Connection::open_in_memory().unwrap();
@@ -155,13 +230,21 @@ mod tests {
             )
             .unwrap();
         connection.execute("INSERT INTO products (name, name_search_key, price, stock, sku, sku_search_key, brand_id, category_id) VALUES ('Producto', 'producto', 1250, 2, 'SKU-1', 'sku-1', 1, 1)", []).unwrap();
+        connection.execute("INSERT INTO product_presentations (product_id, name, mode, base_quantity, price, is_default) VALUES (1, 'Pieza', 'fixed', 1, 1250, 1)", []).unwrap();
         connection
     }
 
-    fn input(token: &str, cash: &str) -> CheckoutCartInput {
+    fn input(
+        connection: &Connection,
+        cart: &SessionCart,
+        token: &str,
+        cash: &str,
+    ) -> CheckoutCartInput {
         CheckoutCartInput {
             checkout_token: token.into(),
-            cart_fingerprint: "cart-v2|1:1:1250".into(),
+            cart_fingerprint: crate::services::cart::get(connection, cart)
+                .unwrap()
+                .cart_fingerprint,
             payment_method: "efectivo".into(),
             cash_received: Some(cash.into()),
         }
@@ -172,20 +255,64 @@ mod tests {
         let mut connection = database();
         let mut cart: SessionCart = [(1, 1)].into();
 
-        let error =
-            super::checkout_and_clear(&mut connection, 1, &mut cart, input("failed", "1.00"))
-                .unwrap_err();
+        let failed = input(&connection, &cart, "failed", "1.00");
+        let error = super::checkout_and_clear(&mut connection, 1, &mut cart, failed).unwrap_err();
         assert_eq!(error.code, "INSUFFICIENT_CASH");
-        assert_eq!(cart.get(&1), Some(&1));
+        assert_eq!(
+            cart.lines.get(&1).map(|entry| entry.entered_quantity),
+            Some(1)
+        );
 
-        super::checkout_and_clear(&mut connection, 1, &mut cart, input("successful", "20.00"))
-            .unwrap();
+        let successful = input(&connection, &cart, "successful", "20.00");
+        super::checkout_and_clear(&mut connection, 1, &mut cart, successful).unwrap();
         assert!(cart.is_empty());
 
-        let retried =
-            super::checkout_and_clear(&mut connection, 1, &mut cart, input("successful", "20.00"))
-                .unwrap();
+        let persisted_fingerprint = connection
+            .query_row(
+                "SELECT cart_fingerprint FROM sales WHERE checkout_token='successful'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retried = super::checkout_and_clear(
+            &mut connection,
+            1,
+            &mut cart,
+            CheckoutCartInput {
+                checkout_token: "successful".into(),
+                cart_fingerprint: persisted_fingerprint,
+                payment_method: "efectivo".into(),
+                cash_received: Some("20.00".into()),
+            },
+        )
+        .unwrap();
         assert_eq!(retried.sale.checkout_token, "successful");
         assert!(cart.is_empty());
+    }
+
+    #[test]
+    fn cart_mutations_require_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+
+        let error = super::with_cart(&database, &session, |connection, _, state| {
+            crate::services::cart::set_unit_price(connection, state, 1, "1.00")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, "SESSION_REQUIRED");
+    }
+
+    #[test]
+    fn cart_quotes_require_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+
+        let error = super::with_cart(&database, &session, |connection, _, state| {
+            crate::services::cart::quote_discount(connection, state, "percentage", "10")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, "SESSION_REQUIRED");
     }
 }

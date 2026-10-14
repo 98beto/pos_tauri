@@ -4,7 +4,7 @@ mod error;
 mod models;
 mod services;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 #[cfg(desktop)]
@@ -16,13 +16,19 @@ fn updater_is_configured(plugins: &tauri::utils::config::PluginConfig) -> bool {
 const GENERIC_ERROR_MESSAGE: &str = "The application encountered an unexpected error.";
 
 #[cfg(debug_assertions)]
-fn run_error_message(error: &tauri::Error) -> String {
+fn run_error_message(
+    error: &tauri::Error,
+    _recovery: Option<&db::RecoveryStartupMessage>,
+) -> String {
     format!("Tauri application failed: {error:#}")
 }
 
 #[cfg(not(debug_assertions))]
-fn run_error_message<T>(_error: &T) -> &'static str {
-    GENERIC_ERROR_MESSAGE
+fn run_error_message<T>(_error: &T, recovery: Option<&db::RecoveryStartupMessage>) -> String {
+    recovery
+        .map(|message| message.as_str())
+        .unwrap_or(GENERIC_ERROR_MESSAGE)
+        .to_owned()
 }
 
 #[cfg(all(not(debug_assertions), not(test)))]
@@ -39,15 +45,22 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_process::init());
 
+    let recovery_message = Arc::new(Mutex::new(None));
+    let setup_recovery_message = Arc::clone(&recovery_message);
     let result = builder
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(desktop)]
             if updater_is_configured(&app.config().plugins) {
                 app.handle()
                     .plugin(tauri_plugin_updater::Builder::new().build())?;
             }
 
-            let connection = db::open_database(app)?;
+            let connection = db::open_database(app).map_err(|error| {
+                if let Some(message) = error.recovery_startup_message() {
+                    *setup_recovery_message.lock().unwrap() = Some(message);
+                }
+                Box::<dyn std::error::Error>::from(error)
+            })?;
             #[cfg(debug_assertions)]
             services::auth::seed_debug_user(&connection)?;
             app.manage(db::Database(Mutex::new(connection)));
@@ -66,6 +79,12 @@ pub fn run() {
             commands::cart::get_cart,
             commands::cart::add_cart_item,
             commands::cart::increment_cart_item,
+            commands::cart::set_cart_item_quantity,
+            commands::cart::set_cart_item_unit_price,
+            commands::cart::reset_cart_item_unit_price,
+            commands::cart::set_cart_discount,
+            commands::cart::quote_cart_discount,
+            commands::cart::remove_cart_discount,
             commands::cart::decrement_cart_item,
             commands::cart::remove_cart_item,
             commands::cart::clear_cart,
@@ -81,11 +100,17 @@ pub fn run() {
             commands::products::get_products_view,
             commands::products::list_product_selector,
             commands::products::find_product_by_sku,
+            commands::products::find_product_by_code,
             commands::products::create_product,
+            commands::products::create_product_with_presentations,
             commands::products::update_product,
+            commands::products::update_product_with_presentations,
             commands::inventory::list_inventory_movements,
             commands::inventory::get_inventory_view,
+            commands::inventory::get_product_inventory_detail,
             commands::inventory::create_inventory_movement,
+            commands::inventory::quote_inventory_movement,
+            commands::inventory::search_inventory_products,
             commands::sales::list_sales,
             commands::sales::get_sales_view,
             commands::sales::get_sale_history_detail,
@@ -93,7 +118,8 @@ pub fn run() {
         .run(tauri::generate_context!());
 
     if let Err(error) = result {
-        eprintln!("{}", run_error_message(&error));
+        let recovery_message = recovery_message.lock().unwrap();
+        eprintln!("{}", run_error_message(&error, recovery_message.as_ref()));
         std::process::exit(1);
     }
 }
@@ -160,7 +186,7 @@ mod tests {
     fn debug_error_message_includes_error_details() {
         let error = tauri::Error::AssetNotFound("database initialization failed".into());
 
-        assert!(run_error_message(&error).contains("database initialization failed"));
+        assert!(run_error_message(&error, None).contains("database initialization failed"));
     }
 
     #[cfg(not(debug_assertions))]
@@ -168,6 +194,30 @@ mod tests {
     fn release_error_message_does_not_require_error_formatting() {
         struct SensitiveError;
 
-        assert_eq!(run_error_message(&SensitiveError), GENERIC_ERROR_MESSAGE);
+        assert_eq!(
+            run_error_message(&SensitiveError, None),
+            GENERIC_ERROR_MESSAGE
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_error_message_only_exposes_typed_recovery_details() {
+        let backup = std::path::PathBuf::from("/exact/recovery/backup.db");
+        let recovery = db::DatabaseOpenError::Recovery {
+            message: "Restaure el backup".into(),
+            backup_path: backup.clone(),
+        }
+        .recovery_startup_message()
+        .unwrap();
+
+        assert_eq!(
+            run_error_message(&"arbitrary secret", Some(&recovery)),
+            format!("Restaure el backup: {}", backup.display())
+        );
+        assert_eq!(
+            run_error_message(&"arbitrary secret", None),
+            GENERIC_ERROR_MESSAGE
+        );
     }
 }

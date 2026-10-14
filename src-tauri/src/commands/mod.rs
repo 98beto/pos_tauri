@@ -10,15 +10,15 @@ use crate::{
     db::Database,
     error::AppError,
     models::user::User,
-    services::{ServiceError, ServiceResult},
+    services::{cart::CartState, ServiceError, ServiceResult},
 };
 use rusqlite::Connection;
-use std::{collections::BTreeMap, sync::Mutex};
+use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct SessionState {
     pub(super) current_user: Option<User>,
-    pub(super) cart: BTreeMap<i64, i64>,
+    pub(super) cart: CartState,
 }
 
 impl SessionState {
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(state.authenticated_user().unwrap(), &user);
         assert!(state.cart.is_empty());
 
-        state.cart.insert(9, 1);
+        state.cart = [(9, 1)].into();
         state.clear();
         assert_eq!(
             state.authenticated_user().unwrap_err().code,

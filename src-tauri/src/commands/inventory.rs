@@ -4,7 +4,9 @@ use crate::{
     db::Database,
     error::AppError,
     models::inventory_movement::{
-        CreateInventoryMovementInput, InventoryMovement, InventoryView, InventoryViewFilters,
+        CreateInventoryMovementInput, InventoryMovement, InventoryMovementQuote,
+        InventoryProductSearchResult, InventoryView, InventoryViewFilters, ProductInventoryDetail,
+        ProductInventoryDetailFilters, QuoteInventoryMovementInput,
     },
     services::inventory,
 };
@@ -21,6 +23,48 @@ fn create_authenticated(
     })
 }
 
+fn detail_authenticated(
+    database: &Database,
+    session: &AuthSession,
+    product_id: i64,
+    filters: ProductInventoryDetailFilters,
+) -> Result<ProductInventoryDetail, AppError> {
+    with_authenticated_connection(database, session, |connection, _| {
+        inventory::product_detail(connection, product_id, filters)
+    })
+}
+
+fn view_authenticated(
+    database: &Database,
+    session: &AuthSession,
+    filters: InventoryViewFilters,
+) -> Result<InventoryView, AppError> {
+    with_authenticated_connection(database, session, |connection, _| {
+        inventory::view(connection, filters)
+    })
+}
+
+fn quote_authenticated(
+    database: &Database,
+    session: &AuthSession,
+    input: QuoteInventoryMovementInput,
+) -> Result<InventoryMovementQuote, AppError> {
+    with_authenticated_connection(database, session, |connection, _| {
+        inventory::quote(connection, input)
+    })
+}
+
+fn search_products_authenticated(
+    database: &Database,
+    session: &AuthSession,
+    search: Option<String>,
+    page: i64,
+) -> Result<InventoryProductSearchResult, AppError> {
+    with_authenticated_connection(database, session, |connection, _| {
+        inventory::search_products(connection, search, page)
+    })
+}
+
 #[tauri::command]
 pub fn create_inventory_movement(
     database: State<'_, Database>,
@@ -30,13 +74,35 @@ pub fn create_inventory_movement(
     create_authenticated(&database, &session, input)
 }
 
+#[tauri::command]
+pub fn quote_inventory_movement(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    input: QuoteInventoryMovementInput,
+) -> Result<InventoryMovementQuote, AppError> {
+    quote_authenticated(&database, &session, input)
+}
+
+#[tauri::command]
+pub fn search_inventory_products(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    search: Option<String>,
+    page: i64,
+) -> Result<InventoryProductSearchResult, AppError> {
+    search_products_authenticated(&database, &session, search, page)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use rusqlite::Connection;
 
-    use crate::{db::Database, models::inventory_movement::CreateInventoryMovementInput};
+    use crate::{
+        db::Database,
+        models::inventory_movement::{CreateInventoryMovementInput, QuoteInventoryMovementInput},
+    };
 
     #[test]
     fn create_requires_an_authenticated_session() {
@@ -48,16 +114,81 @@ mod tests {
             &session,
             CreateInventoryMovementInput {
                 product_id: 1,
+                presentation_id: None,
                 reason: "compra".into(),
                 movement_type: "entrada".into(),
                 quantity: "1".into(),
+                unit_price: Some("1.00".into()),
+                supplier: None,
+                document_reference: None,
+                note: None,
                 operation_token: "command-auth-test".into(),
+                quote_fingerprint: Some("inventory-quote-v1:test".into()),
             },
         )
         .unwrap_err();
 
         assert_eq!(error.code, "SESSION_REQUIRED");
     }
+
+    #[test]
+    fn product_detail_requires_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+
+        let error =
+            super::detail_authenticated(&database, &session, 1, Default::default()).unwrap_err();
+
+        assert_eq!(error.code, "SESSION_REQUIRED");
+    }
+
+    #[test]
+    fn inventory_view_requires_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+
+        let error = super::view_authenticated(&database, &session, Default::default()).unwrap_err();
+
+        assert_eq!(error.code, "SESSION_REQUIRED");
+    }
+
+    #[test]
+    fn quote_requires_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+        let error = super::quote_authenticated(
+            &database,
+            &session,
+            QuoteInventoryMovementInput {
+                product_id: 1,
+                presentation_id: None,
+                reason: "compra".into(),
+                movement_type: "entrada".into(),
+                quantity: "1".into(),
+                unit_price: Some("1.00".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "SESSION_REQUIRED");
+    }
+
+    #[test]
+    fn product_search_requires_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+        let error = super::search_products_authenticated(&database, &session, None, 1).unwrap_err();
+        assert_eq!(error.code, "SESSION_REQUIRED");
+    }
+}
+
+#[tauri::command]
+pub fn get_product_inventory_detail(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    product_id: i64,
+    filters: ProductInventoryDetailFilters,
+) -> Result<ProductInventoryDetail, AppError> {
+    detail_authenticated(&database, &session, product_id, filters)
 }
 
 #[tauri::command]
@@ -66,9 +197,7 @@ pub fn get_inventory_view(
     session: State<'_, AuthSession>,
     filters: InventoryViewFilters,
 ) -> Result<InventoryView, AppError> {
-    with_authenticated_connection(&database, &session, |connection, _| {
-        inventory::view(connection, filters)
-    })
+    view_authenticated(&database, &session, filters)
 }
 
 #[tauri::command]

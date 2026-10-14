@@ -988,6 +988,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2590,19 +2600,23 @@ dependencies = [
 
 [[package]]
 name = "pos_tauri"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "argon2",
+ "fs2",
  "rusqlite",
  "rusqlite_migration",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "unicode-casefold",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
