@@ -567,6 +567,7 @@ where
         copy_sqlite_database(&source, &temporary_path)?;
         fs::OpenOptions::new()
             .read(true)
+            .write(true)
             .open(&temporary_path)
             .and_then(|file| file.sync_all())
             .map_err(|_| {
@@ -642,12 +643,12 @@ where
     let mut moved_sidecars = 0;
     let quarantine_result = (|| -> std::io::Result<()> {
         if destination_existed {
-            fs::rename(database_path, &quarantined_database)?;
+            durable_rename(database_path, &quarantined_database)?;
             moved_database = true;
             secure_file(&quarantined_database)?;
         }
         for (original, quarantine) in &quarantined_sidecars {
-            fs::rename(original, quarantine)?;
+            durable_rename(original, quarantine)?;
             moved_sidecars += 1;
             secure_file(quarantine)?;
         }
@@ -671,7 +672,7 @@ where
         ));
     }
 
-    if fs::rename(&temporary_path, database_path).is_err() {
+    if durable_rename(&temporary_path, database_path).is_err() {
         return Err(rollback_or_recovery_error(
             "No se pudo promover la base restaurada; conserve el backup",
             backup_path,
@@ -781,14 +782,14 @@ where
             .ok()
             .filter(|exists| !exists)
             .ok_or(())
-            .and_then(|_| fs::rename(&pending_path, &archived_path).map_err(|_| ()))
+            .and_then(|_| durable_rename(&pending_path, &archived_path).map_err(|_| ()))
             .and_then(|_| sync_directory(directory).map_err(|_| ()))
             .and_then(|_| hook(RestoreStage::MigrationMarkerArchived).map_err(|_| ()));
         if archive_result.is_err() {
             drop(restored);
             if archived_path.exists()
                 && !pending_path.exists()
-                && (fs::rename(&archived_path, &pending_path).is_err()
+                && (durable_rename(&archived_path, &pending_path).is_err()
                     || sync_directory(directory).is_err())
             {
                 return Err(incomplete_recovery_error(
@@ -918,7 +919,7 @@ fn rollback_restored_files(
     let mut promoted_moved = !promoted;
     if promoted {
         match database_path.try_exists() {
-            Ok(true) => match fs::rename(database_path, failed_database) {
+            Ok(true) => match durable_rename(database_path, failed_database) {
                 Ok(()) => promoted_moved = true,
                 Err(_) => failures.push("aislar base restaurada".into()),
             },
@@ -929,7 +930,7 @@ fn rollback_restored_files(
 
     for (original, quarantine) in quarantined_sidecars.iter().rev() {
         match quarantine.try_exists() {
-            Ok(true) if fs::rename(quarantine, original).is_err() => {
+            Ok(true) if durable_rename(quarantine, original).is_err() => {
                 failures.push("restaurar sidecar SQLite".into())
             }
             Err(_) => failures.push("comprobar sidecar en cuarentena".into()),
@@ -940,7 +941,7 @@ fn rollback_restored_files(
     if promoted_moved {
         if let Some(quarantine) = quarantined_database {
             match quarantine.try_exists() {
-                Ok(true) if fs::rename(quarantine, database_path).is_err() => {
+                Ok(true) if durable_rename(quarantine, database_path).is_err() => {
                     failures.push("restaurar base anterior".into())
                 }
                 Err(_) => failures.push("comprobar base anterior en cuarentena".into()),
@@ -1039,10 +1040,8 @@ fn write_marker_bytes(path: &Path, bytes: &[u8], attempt_id: &str) -> OpenResult
         file.write_all(bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| safe_error("No se pudo persistir el marcador de migracion", &temporary))?;
-        fs::hard_link(&temporary, path)
+        durable_publish_new(&temporary, path)
             .map_err(|_| safe_error("Ya existe un marcador de migracion", path))?;
-        sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
-            .map_err(|_| safe_error("No se pudo persistir el directorio del marcador", path))?;
         Ok(())
     })();
     let _ = fs::remove_file(&temporary);
@@ -1110,7 +1109,7 @@ where
         drop(file);
 
         hook(MarkerCompletionStage::CompletedRename)
-            .and_then(|_| fs::rename(&temporary, completed_path))
+            .and_then(|_| durable_publish_new(&temporary, completed_path))
             .map_err(|_| {
                 safe_error(
                     "No se pudo publicar el manifiesto completado",
@@ -1203,6 +1202,7 @@ where
 
     fs::OpenOptions::new()
         .read(true)
+        .write(true)
         .open(completed_path)
         .and_then(|file| file.sync_all())
         .map_err(|_| {
@@ -1278,45 +1278,9 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    use std::{os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-        Storage::FileSystem::{
-            CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_WRITE_THROUGH,
-            FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING,
-        },
-    };
-
-    let wide: Vec<u16> = directory
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    let flushed = unsafe { FlushFileBuffers(handle) };
-    let flush_error = (flushed == 0).then(std::io::Error::last_os_error);
-    let closed = unsafe { CloseHandle(handle) };
-    if let Some(error) = flush_error {
-        return Err(error);
-    }
-    if closed == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    // Windows persists each critical namespace move with MOVEFILE_WRITE_THROUGH.
+    // A residual active marker after deletion is safe and reconciled on startup.
     Ok(())
 }
 
@@ -1326,6 +1290,62 @@ fn sync_directory(_directory: &Path) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "directory durability is not implemented for this platform",
     ))
+}
+
+#[cfg(windows)]
+fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    fn verbatim(path: &Path) -> std::io::Result<Vec<u16>> {
+        let absolute = std::path::absolute(path)?;
+        let wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        let verbatim_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        let device_prefix = [b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16];
+        let mut result = if wide.starts_with(&verbatim_prefix) || wide.starts_with(&device_prefix) {
+            wide
+        } else if wide.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            let mut result: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+            result.extend_from_slice(&wide[2..]);
+            result
+        } else {
+            let mut result: Vec<u16> = r"\\?\".encode_utf16().collect();
+            result.extend_from_slice(&wide);
+            result
+        };
+        result.push(0);
+        Ok(result)
+    }
+
+    let source = verbatim(source)?;
+    let destination = verbatim(destination)?;
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn durable_publish_new(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    durable_rename(temporary, destination)
+}
+
+#[cfg(not(windows))]
+fn durable_publish_new(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::hard_link(temporary, destination)?;
+    sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 #[cfg(unix)]
@@ -2109,20 +2129,36 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_directory_flush_is_supported_by_the_test_volume() {
+    fn windows_write_through_publish_is_supported_and_does_not_overwrite() {
         let temp = TempDir::new().unwrap();
-        let file = temp.path().join("durable-entry");
-        fs::write(&file, b"durable").unwrap();
+        let source = temp.path().join("durable-entry.tmp");
+        let destination = temp.path().join("durable-entry");
+        fs::write(&source, b"durable").unwrap();
         fs::OpenOptions::new()
             .read(true)
-            .open(&file)
+            .write(true)
+            .open(&source)
             .unwrap()
             .sync_all()
             .unwrap();
 
-        sync_directory(temp.path()).expect(
-            "the Windows test volume must support durable directory metadata or fail the gate",
-        );
+        durable_publish_new(&source, &destination)
+            .expect("the Windows test volume must support write-through moves");
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"durable");
+
+        let second = temp.path().join("second.tmp");
+        fs::write(&second, b"replacement").unwrap();
+        assert!(durable_publish_new(&second, &destination).is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"durable");
+
+        let long_directory = temp.path().join("x".repeat(240));
+        fs::create_dir(&long_directory).unwrap();
+        let long_source = long_directory.join("source.tmp");
+        let long_destination = long_directory.join("destination");
+        fs::write(&long_source, b"long path").unwrap();
+        durable_publish_new(&long_source, &long_destination).unwrap();
+        assert_eq!(fs::read(long_destination).unwrap(), b"long path");
     }
 
     #[cfg(windows)]
