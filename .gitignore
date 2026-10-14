@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 *.tsbuildinfo
+/docs/demo.html
 
 # Local environments and signing material
 .env
