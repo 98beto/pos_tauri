@@ -181,6 +181,10 @@ test("sanitizes, signs, verifies, and uploads exactly six Linux assets in order"
   assert.match(verifyBlock, /node scripts\/verify-updater-signatures\.mjs --artifact "\$asset" --signature "\$asset\.sig"/);
   assert.match(linux, /while IFS= read -r -d '' candidate/);
   assert.match(linux, /find "\$directory" -maxdepth 1 -name "\$pattern" -print0/);
+  assert.match(linux, /\[\[ "\$basename" == "\$expected" \]\]/);
+  assert.match(linux, /"Linea POS_\$\{version\}_amd64\.AppImage"/);
+  assert.match(linux, /"Linea POS_\$\{version\}_amd64\.deb"/);
+  assert.match(linux, /"Linea POS-\$\{version\}-1\.x86_64\.rpm"/);
   assert.equal(occurrences(linux, /locate_one .* (?:AppImage|DEB|RPM) /g), 3);
   assert.equal(occurrences(linux, /pnpm tauri signer sign "\$(?:APPIMAGE|DEB|RPM)"/g), 3);
   assert.match(linux, /rm -f -- "\$asset\.sig"/);

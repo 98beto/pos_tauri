@@ -223,7 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           locate_one() {
-            local directory=$1 pattern=$2 label=$3 output=$4
+            local directory=$1 pattern=$2 label=$3 output=$4 expected=$5
             local matches_file
             local -a matches=()
             matches_file="$(mktemp "$RUNNER_TEMP/linux-asset-matches.XXXXXX")"
@@ -237,8 +237,8 @@ jobs:
               exit 1
             }
             local asset=${matches[0]} basename=${matches[0]##*/}
-            [[ "$basename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]] || {
-              echo "Unsafe $label filename" >&2
+            [[ "$basename" == "$expected" ]] || {
+              echo "Unexpected $label filename" >&2
               exit 1
             }
             [[ -f "$asset" && ! -L "$asset" && -s "$asset" ]] || {
@@ -248,9 +248,11 @@ jobs:
             rm -f -- "$asset.sig"
             printf '%s=%s\n' "$output" "$asset" >> "$GITHUB_OUTPUT"
           }
-          locate_one src-tauri/target/release/bundle/appimage '*.AppImage' AppImage appimage
-          locate_one src-tauri/target/release/bundle/deb '*.deb' DEB deb
-          locate_one src-tauri/target/release/bundle/rpm '*.rpm' RPM rpm
+          version='${{ needs.validate.outputs.tag }}'
+          version=${version#v}
+          locate_one src-tauri/target/release/bundle/appimage '*.AppImage' AppImage appimage "Linea POS_${version}_amd64.AppImage"
+          locate_one src-tauri/target/release/bundle/deb '*.deb' DEB deb "Linea POS_${version}_amd64.deb"
+          locate_one src-tauri/target/release/bundle/rpm '*.rpm' RPM rpm "Linea POS-${version}-1.x86_64.rpm"
       - name: Sanitize final AppImage bytes
         env:
           APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
