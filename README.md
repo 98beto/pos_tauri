@@ -1,58 +1,105 @@
 # Linea POS
 
-Aplicacion de punto de venta de escritorio construida con Tauri 2, React y SQLite. El repositorio publica instaladores para Linux y Windows y ofrece actualizaciones firmadas para AppImage, DEB, RPM y NSIS.
+Aplicación de punto de venta de escritorio para registrar ventas, administrar productos y controlar el inventario de un negocio desde una interfaz rápida y sencilla.
 
-## Requisitos
+Linea POS guarda la información en una base de datos SQLite local y está disponible para Linux y Windows. La aplicación está construida con Tauri 2, React, TypeScript y Rust.
 
-- Node.js 24.15.0.
+## Características
+
+- Registro de ventas con pagos en efectivo, tarjeta o transferencia.
+- Búsqueda de productos por nombre, SKU o código de barras.
+- Carrito con cantidades, precios personalizados y descuentos porcentuales o fijos.
+- Cálculo del efectivo recibido y el cambio a entregar.
+- Catálogo de productos organizado por marcas y categorías.
+- Presentaciones por pieza, paquete, peso, volumen o longitud, cada una con su propio precio y código de barras.
+- Control de existencias, compras, ajustes y valoración con costo acumulado, costo promedio y valor total a costo.
+- Corrección segura del precio de compras con recálculo cronológico de costos dependientes.
+- Consulta de movimientos y detalle histórico por producto.
+- Historial de tickets con filtros, totales y detalle de cada venta.
+- Configuración inicial y autenticación del propietario.
+- Actualizaciones firmadas de la aplicación.
+
+## Capturas de pantalla
+
+> Próximamente: capturas del punto de venta, el catálogo de productos y el control de inventario.
+
+## Tecnologías
+
+| Área | Tecnologías |
+| --- | --- |
+| Aplicación de escritorio | [Tauri 2](https://tauri.app/) |
+| Interfaz | [React 19](https://react.dev/), TypeScript y [Tailwind CSS 4](https://tailwindcss.com/) |
+| Herramientas frontend | [Vite](https://vite.dev/) y pnpm |
+| Backend local | Rust y comandos de Tauri |
+| Base de datos | SQLite, `rusqlite` y migraciones versionadas |
+| Seguridad | Argon2 para contraseñas y CSP de Tauri |
+| Pruebas | Vitest, Testing Library y pruebas de Rust |
+| Distribución | Tauri Updater y actualizaciones firmadas |
+
+## Descargas
+
+Las versiones publicadas se encuentran en [GitHub Releases](https://github.com/98beto/pos_tauri/releases). El proyecto genera paquetes para:
+
+- Linux: AppImage, DEB y RPM.
+- Windows: instalador NSIS.
+
+## Desarrollo local
+
+### Requisitos
+
+- Node.js 24.15.0, fijado en `.node-version`.
 - pnpm 12.4.1, fijado por `packageManager`.
 - Rust 1.98.1 con `rustfmt` y `clippy`, fijado en `rust-toolchain.toml`.
-- Dependencias de sistema de Tauri 2 para la plataforma de desarrollo.
+- [Dependencias de sistema de Tauri 2](https://tauri.app/start/prerequisites/) para la plataforma de desarrollo.
 
-## Desarrollo
+### Instalación y ejecución
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm tauri dev
 ```
 
-El modo desarrollo no requiere claves ni configuracion de release, no registra el updater y no consulta el endpoint de produccion.
+El modo de desarrollo no necesita claves de firma ni configuración de publicación. Tampoco registra el actualizador ni consulta el endpoint de producción.
 
-Comprobaciones principales:
+### Comandos útiles
 
 ```bash
+# Ejecutar la interfaz en el navegador
+pnpm dev
+
+# Ejecutar todas las pruebas de frontend y de los scripts de release
 pnpm test
+
+# Comprobar tipos y generar el frontend de producción
 pnpm build
+
+# Ensayar migración, backup y restauración SQLite desde los esquemas 8 y 12 hasta el 13
+pnpm qa:migration-v8-v13
+
+# Comprobar formato, lint y pruebas del backend
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-## Ensayo de migracion SQLite v8 a v12
+## Estructura del proyecto
 
-El ensayo crea datos ficticios v8 con las migraciones 001-008 verificadas byte a byte contra `main` en `e2ab2d2`, copia la base a un runtime aislado y la abre mediante la misma funcion privada `open_database_path` usada por produccion. No abre la GUI ni lee o acepta una ruta de datos de la aplicacion.
-
-```bash
-pnpm qa:migration-v8-v12
+```text
+.
+├── src/                    # Interfaz React, componentes, vistas y adaptadores de Tauri
+├── src-tauri/
+│   ├── migrations/         # Migraciones versionadas de SQLite
+│   └── src/                # Comandos, servicios, modelos y acceso a datos en Rust
+├── scripts/                # Validaciones y herramientas de publicación y QA
+└── docs/                   # Documentación técnica y operativa
 ```
 
-El comando no acepta argumentos y crea un directorio unico `pos-tauri-v8-v12-qa-*` directamente bajo `/tmp` (o el temporal del sistema). Al terminar imprime la ruta conservada. Contiene `before-v8.db`, `before-v8-report.json`, `runtime/pos.db`, el backup v8, el manifiesto completado, `result.json` y `README.txt` para inspeccion manual con SQLite o cualquier visor JSON.
+La interfaz invoca comandos de Tauri definidos en Rust. Estos comandos aplican las reglas de negocio y persisten los datos en `pos.db`, dentro del directorio de datos de la aplicación.
 
-Credenciales ficticias: `admin@pos.local` / `PosDemo123!`.
+## Calidad y pruebas
 
-El ensayo comprueba versiones 8 y 12, `quick_check`, claves foraneas, backup y marcadores, segunda apertura idempotente, autenticacion, IDs y secuencias con huecos, stock, totales, efectivo/cambio, fechas, tokens, snapshots historicos y backfills de 009-012. Los artefactos son deliberadamente temporales y no deben usarse como datos reales.
+Además de las pruebas automatizadas, el proyecto incluye un ensayo reproducible de las rutas SQLite `8 -> 13` y `12 -> 13`. Verifica preservación literal de costos y datos comerciales, extensión exclusiva con centímetros, backup, marcadores, reapertura y restauración. Consulta [`docs/quality-assurance.md`](docs/quality-assurance.md).
 
 ## Releases
 
-La operacion de versiones, firma, publicacion y pruebas N-1 a N se describe en [`docs/releases.md`](docs/releases.md). No se deben crear tags de release sin completar sus prerrequisitos.
-
-## Comprobacion manual de modales
-
-Cuando una vista use `Modal`, comprobar antes de entregarla:
-
-1. Abrir dos modales anidados o simultaneos y pulsar Escape: solo se cierra el superior.
-2. Recorrer el modal superior con Tab y Shift+Tab: el foco no sale de su panel.
-3. Cerrar el superior: el foco vuelve a su disparador dentro del modal anterior, o al primer control de este si el disparador ya no existe.
-4. Cerrar el ultimo modal: se recuperan el foco original, el scroll y los valores previos de `inert` y `aria-hidden`.
-5. Con un modal superior abierto, confirmar en las herramientas de accesibilidad que el contenido de fondo y los modales inferiores estan aislados, y que solo el superior tiene `aria-modal=true`.
-6. Ejecutar la aplicacion Tauri y confirmar que no aparecen infracciones de `style-src` en la consola.
+La preparación de versiones, firma, publicación, actualización automática y pruebas de migración se documenta en [`docs/releases.md`](docs/releases.md). No se deben crear tags de release sin completar sus prerrequisitos.

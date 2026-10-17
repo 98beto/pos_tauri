@@ -4,9 +4,10 @@ use crate::{
     db::Database,
     error::AppError,
     models::inventory_movement::{
-        CreateInventoryMovementInput, InventoryMovement, InventoryMovementQuote,
-        InventoryProductSearchResult, InventoryView, InventoryViewFilters, ProductInventoryDetail,
-        ProductInventoryDetailFilters, QuoteInventoryMovementInput,
+        ConfirmPurchaseCostCorrectionInput, CreateInventoryMovementInput, InventoryMovement,
+        InventoryMovementQuote, InventoryProductSearchResult, InventoryView, InventoryViewFilters,
+        ProductInventoryDetail, ProductInventoryDetailFilters, PurchaseCostCorrectionQuote,
+        QuoteInventoryMovementInput, QuotePurchaseCostCorrectionInput,
     },
     services::inventory,
 };
@@ -65,6 +66,26 @@ fn search_products_authenticated(
     })
 }
 
+fn quote_correction_authenticated(
+    database: &Database,
+    session: &AuthSession,
+    input: QuotePurchaseCostCorrectionInput,
+) -> Result<PurchaseCostCorrectionQuote, AppError> {
+    with_authenticated_connection(database, session, |connection, _| {
+        inventory::quote_purchase_cost_correction(connection, input)
+    })
+}
+
+fn confirm_correction_authenticated(
+    database: &Database,
+    session: &AuthSession,
+    input: ConfirmPurchaseCostCorrectionInput,
+) -> Result<PurchaseCostCorrectionQuote, AppError> {
+    with_authenticated_connection(database, session, |connection, _| {
+        inventory::confirm_purchase_cost_correction(connection, input)
+    })
+}
+
 #[tauri::command]
 pub fn create_inventory_movement(
     database: State<'_, Database>,
@@ -93,6 +114,24 @@ pub fn search_inventory_products(
     search_products_authenticated(&database, &session, search, page)
 }
 
+#[tauri::command]
+pub fn quote_purchase_cost_correction(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    input: QuotePurchaseCostCorrectionInput,
+) -> Result<PurchaseCostCorrectionQuote, AppError> {
+    quote_correction_authenticated(&database, &session, input)
+}
+
+#[tauri::command]
+pub fn confirm_purchase_cost_correction(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    input: ConfirmPurchaseCostCorrectionInput,
+) -> Result<PurchaseCostCorrectionQuote, AppError> {
+    confirm_correction_authenticated(&database, &session, input)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -101,7 +140,10 @@ mod tests {
 
     use crate::{
         db::Database,
-        models::inventory_movement::{CreateInventoryMovementInput, QuoteInventoryMovementInput},
+        models::inventory_movement::{
+            ConfirmPurchaseCostCorrectionInput, CreateInventoryMovementInput,
+            QuoteInventoryMovementInput, QuotePurchaseCostCorrectionInput,
+        },
     };
 
     #[test]
@@ -123,7 +165,7 @@ mod tests {
                 document_reference: None,
                 note: None,
                 operation_token: "command-auth-test".into(),
-                quote_fingerprint: Some("inventory-quote-v1:test".into()),
+                quote_fingerprint: Some("inventory-quote-v3:test".into()),
             },
         )
         .unwrap_err();
@@ -166,6 +208,9 @@ mod tests {
                 movement_type: "entrada".into(),
                 quantity: "1".into(),
                 unit_price: Some("1.00".into()),
+                supplier: Some("Proveedor".into()),
+                document_reference: Some("FAC-1".into()),
+                note: Some("Nota".into()),
             },
         )
         .unwrap_err();
@@ -178,6 +223,39 @@ mod tests {
         let session = super::AuthSession(Mutex::new(Default::default()));
         let error = super::search_products_authenticated(&database, &session, None, 1).unwrap_err();
         assert_eq!(error.code, "SESSION_REQUIRED");
+    }
+
+    #[test]
+    fn purchase_cost_correction_requires_an_authenticated_session() {
+        let database = Database(Mutex::new(Connection::open_in_memory().unwrap()));
+        let session = super::AuthSession(Mutex::new(Default::default()));
+        assert_eq!(
+            super::quote_correction_authenticated(
+                &database,
+                &session,
+                QuotePurchaseCostCorrectionInput {
+                    movement_id: 1,
+                    new_unit_price: "1.00".into(),
+                },
+            )
+            .unwrap_err()
+            .code,
+            "SESSION_REQUIRED"
+        );
+        assert_eq!(
+            super::confirm_correction_authenticated(
+                &database,
+                &session,
+                ConfirmPurchaseCostCorrectionInput {
+                    movement_id: 1,
+                    new_unit_price: "1.00".into(),
+                    quote_fingerprint: "purchase-cost-correction-v1:test".into(),
+                },
+            )
+            .unwrap_err()
+            .code,
+            "SESSION_REQUIRED"
+        );
     }
 }
 

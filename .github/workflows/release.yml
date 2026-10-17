@@ -18,8 +18,13 @@ on:
         description: Existing vX.Y.Z tag (required only for publish)
         required: false
         type: string
+      candidate_run_id:
+        description: QA-approved validate run ID (required for manual publish; tag publication may uniquely discover it)
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -31,8 +36,8 @@ env:
   PNPM_VERSION: 12.4.1
 
 jobs:
-  validate:
-    name: Validate release source
+  release-source:
+    name: Resolve release source
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     outputs:
@@ -51,6 +56,7 @@ jobs:
         env:
           DISPATCH_MODE: ${{ inputs.mode }}
           DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           DISPATCH_REF: ${{ github.ref }}
           EVENT_NAME: ${{ github.event_name }}
           REQUEST_EVENT: ${{ github.event.workflow_run.event }}
@@ -72,6 +78,10 @@ jobs:
             fi
 
             if [[ "$mode" == "validate" ]]; then
+              if [[ -n "$DISPATCH_CANDIDATE_RUN_ID" ]]; then
+                echo "Validate mode does not accept candidate_run_id" >&2
+                exit 1
+              fi
               sha="$(git rev-parse origin/main^{commit})"
               version="$(git show "$sha:package.json" | jq -er .version)"
               tag="v$version"
@@ -80,6 +90,10 @@ jobs:
                 exit 1
               fi
             else
+              if [[ ! "$DISPATCH_CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Manual publish requires candidate_run_id as a positive Actions run ID" >&2
+                exit 1
+              fi
               tag="$DISPATCH_TAG"
               if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
                 echo "Publish mode requires an existing vX.Y.Z tag" >&2
@@ -128,6 +142,22 @@ jobs:
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate release source
+    needs: release-source
+    if: needs.release-source.outputs.mode == 'validate'
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ needs.release-source.outputs.mode }}
+      tag: ${{ needs.release-source.outputs.tag }}
+      sha: ${{ needs.release-source.outputs.sha }}
+    steps:
+      # actions/checkout v5.1.0; update this SHA when renewing the action.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.release-source.outputs.sha }}
+          persist-credentials: false
       # pnpm/action-setup v5.0.0; update this SHA when renewing the action.
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
         with:
@@ -157,13 +187,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: pnpm install --frozen-lockfile
       - run: git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
-      - run: node scripts/validate-version.mjs "${{ steps.release-source.outputs.tag }}"
+      - run: node scripts/validate-version.mjs "${{ needs.release-source.outputs.tag }}"
       - run: pnpm test
       - run: pnpm build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml
+      - run: pnpm qa:migration-v8-v13
       - run: git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
 
   linux:
@@ -560,6 +591,23 @@ jobs:
             --tag "$TAG" \
             --assets release-assets \
             --manifest release-assets/latest.json
+      - name: Record candidate provenance and exact publication hashes
+        env:
+          SHA: ${{ needs.validate.outputs.sha }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          hashes="$RUNNER_TEMP/release-candidate-sha256"
+          (cd release-assets && sha256sum -- * | sort) > "$hashes"
+          [[ "$(wc -l < "$hashes")" -eq 10 ]]
+          mv -- "$hashes" release-assets/SHA256SUMS
+          jq -n \
+            --arg tag "$TAG" \
+            --arg sha "$SHA" \
+            --arg artifact_name "release-candidate-$SHA" \
+            --argjson validate_run_id "$GITHUB_RUN_ID" \
+            '{schema:1,tag:$tag,sha:$sha,artifact_name:$artifact_name,validate_run_id:$validate_run_id,publication_asset_count:10}' \
+            > release-assets/candidate-provenance.json
       - name: Require exactly nine native assets and latest.json
         run: |
           set -euo pipefail
@@ -567,8 +615,10 @@ jobs:
           find release-assets -mindepth 1 -maxdepth 1 -print0 > "$assets_file"
           mapfile -d '' assets < "$assets_file"
           rm -f -- "$assets_file"
-          [[ "${#assets[@]}" -eq 10 ]]
+          [[ "${#assets[@]}" -eq 12 ]]
           [[ -f release-assets/latest.json && ! -L release-assets/latest.json && -s release-assets/latest.json ]]
+          [[ -f release-assets/SHA256SUMS && ! -L release-assets/SHA256SUMS && -s release-assets/SHA256SUMS ]]
+          [[ -f release-assets/candidate-provenance.json && ! -L release-assets/candidate-provenance.json && -s release-assets/candidate-provenance.json ]]
           for asset in "${assets[@]}"; do
             [[ -f "$asset" && ! -L "$asset" && -s "$asset" ]]
           done
@@ -576,57 +626,112 @@ jobs:
       - name: Upload verified release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: release-candidate
+          name: release-candidate-${{ needs.validate.outputs.sha }}
           if-no-files-found: error
           retention-days: 7
           path: release-assets/*
 
   publish:
     name: Atomically publish verified candidate
-    needs: [validate, assemble]
-    if: needs.validate.outputs.mode == 'publish'
+    needs: release-source
+    if: needs.release-source.outputs.mode == 'publish'
     runs-on: ubuntu-24.04
-    environment: release
+    environment: release-publication
     permissions:
+      actions: read
       contents: write
     steps:
       # actions/checkout v5.1.0; update this SHA when renewing the action.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: ${{ needs.validate.outputs.sha }}
+          ref: ${{ needs.release-source.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
-      # pnpm/action-setup v5.0.0; update this SHA when renewing the action.
-      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
-        with:
-          version: 12.4.1
-          run_install: false
       # actions/setup-node v5.0.0; update this SHA when renewing the action.
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 24.15.0
-      # actions/download-artifact v7.0.0; update this SHA when renewing the action.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
-        with:
-          name: release-candidate
-          path: release-candidate
+      - name: Resolve the QA-approved validate artifact
+        id: candidate
+        env:
+          ARTIFACT_NAME: release-candidate-${{ needs.release-source.outputs.sha }}
+          EXPECTED_SHA: ${{ needs.release-source.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_RUN_ID" && ! "$REQUESTED_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "candidate_run_id must be a positive Actions run ID" >&2
+            exit 1
+          fi
+          candidates_file="$(mktemp "$RUNNER_TEMP/release-candidates.XXXXXX")"
+          gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT_NAME&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | [.id, .workflow_run.id] | @tsv' > "$candidates_file"
+          matches=()
+          while IFS=$'\t' read -r artifact_id run_id; do
+            [[ -n "$artifact_id" && -n "$run_id" ]] || continue
+            if [[ -n "$REQUESTED_RUN_ID" && "$run_id" != "$REQUESTED_RUN_ID" ]]; then
+              continue
+            fi
+            run_json="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id")"
+            if [[ "$(jq -r .name <<< "$run_json")" == "Release" \
+              && "$(jq -r .event <<< "$run_json")" == "workflow_dispatch" \
+              && "$(jq -r .conclusion <<< "$run_json")" == "success" \
+              && "$(jq -r .head_sha <<< "$run_json")" == "$EXPECTED_SHA" ]]; then
+              matches+=("$artifact_id:$run_id")
+            fi
+          done < "$candidates_file"
+          rm -f -- "$candidates_file"
+          if [[ "${#matches[@]}" -ne 1 ]]; then
+            echo "Expected exactly one successful validate candidate for $EXPECTED_SHA; found ${#matches[@]}. Supply candidate_run_id when retrying or when multiple candidates exist." >&2
+            exit 1
+          fi
+          echo "artifact_id=${matches[0]%%:*}" >> "$GITHUB_OUTPUT"
+          echo "validate_run_id=${matches[0]#*:}" >> "$GITHUB_OUTPUT"
+      - name: Download the immutable validate artifact
+        env:
+          ARTIFACT_ID: ${{ steps.candidate.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir release-candidate
+          gh api "/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUNNER_TEMP/release-candidate.zip"
+          unzip -q "$RUNNER_TEMP/release-candidate.zip" -d release-candidate
       - name: Install minisign
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends minisign
-      - run: pnpm install --frozen-lockfile
-      - name: Verify candidate before changing the draft
+      - name: Verify provenance, hashes, and signatures before changing the draft
         env:
-          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-source.outputs.sha }}
+          TAG: ${{ needs.release-source.outputs.tag }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+          VALIDATE_RUN_ID: ${{ steps.candidate.outputs.validate_run_id }}
         run: |
-          node scripts/verify-updater-signatures.mjs --assets release-candidate --tag "$TAG"
-          node scripts/latest-json.mjs validate --tag "$TAG" --assets release-candidate --manifest release-candidate/latest.json
+          set -euo pipefail
+          jq -e \
+            --arg tag "$TAG" \
+            --arg sha "$EXPECTED_SHA" \
+            --arg artifact_name "release-candidate-$EXPECTED_SHA" \
+            --argjson validate_run_id "$VALIDATE_RUN_ID" \
+            '.schema == 1 and .tag == $tag and .sha == $sha and .artifact_name == $artifact_name and .validate_run_id == $validate_run_id and .publication_asset_count == 10' \
+            release-candidate/candidate-provenance.json
+          [[ "$(find release-candidate -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 12 ]]
+          [[ "$(wc -l < release-candidate/SHA256SUMS)" -eq 10 ]]
+          (cd release-candidate && sha256sum --check --strict SHA256SUMS)
+          mkdir publication-assets
+          while read -r _ filename; do
+            [[ "$filename" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$ ]]
+            cp -- "release-candidate/$filename" publication-assets/
+          done < release-candidate/SHA256SUMS
+          [[ "$(find publication-assets -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 10 ]]
+          node scripts/verify-updater-signatures.mjs --assets publication-assets --tag "$TAG"
+          node scripts/latest-json.mjs validate --tag "$TAG" --assets publication-assets --manifest publication-assets/latest.json
       - name: Create or reuse the draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          TAG: ${{ needs.release-source.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-source.outputs.sha }}
         run: |
           set -euo pipefail
           verify_release_source() {
@@ -649,8 +754,8 @@ jobs:
       - name: Reconcile draft assets and verify the remote candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          TAG: ${{ needs.release-source.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-source.outputs.sha }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
         run: |
           set -euo pipefail
@@ -664,7 +769,7 @@ jobs:
           }
           [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
           assets_file="$(mktemp "$RUNNER_TEMP/release-candidate-assets.XXXXXX")"
-          find release-candidate -maxdepth 1 -type f -print0 > "$assets_file"
+          find publication-assets -maxdepth 1 -type f -print0 > "$assets_file"
           mapfile -d '' assets < "$assets_file"
           rm -f -- "$assets_file"
           [[ "${#assets[@]}" -eq 10 ]]
@@ -692,18 +797,18 @@ jobs:
             --tag "$TAG" \
             --assets "$RUNNER_TEMP/remote-assets" \
             --manifest "$RUNNER_TEMP/remote-assets/latest.json"
-          local_assets="$(find release-candidate -maxdepth 1 -type f -printf '%f\n' | sort)"
+          local_assets="$(find publication-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
           remote_assets="$(find "$RUNNER_TEMP/remote-assets" -maxdepth 1 -type f -printf '%f\n' | sort)"
           [[ "$local_assets" == "$remote_assets" ]]
-          (cd release-candidate && sha256sum -- * | sort) > "$RUNNER_TEMP/local-sha256"
+          (cd publication-assets && sha256sum -- * | sort) > "$RUNNER_TEMP/local-sha256"
           (cd "$RUNNER_TEMP/remote-assets" && sha256sum -- * | sort) > "$RUNNER_TEMP/remote-sha256"
           [[ "$(wc -l < "$RUNNER_TEMP/local-sha256")" -eq 10 ]]
           diff -u "$RUNNER_TEMP/local-sha256" "$RUNNER_TEMP/remote-sha256"
       - name: Publish only after all remote checks pass
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.validate.outputs.tag }}
-          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          TAG: ${{ needs.release-source.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.release-source.outputs.sha }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
         run: |
           set -euo pipefail
@@ -721,7 +826,7 @@ jobs:
             --tag "$TAG" \
             --assets "$RUNNER_TEMP/final-remote-assets" \
             --manifest "$RUNNER_TEMP/final-remote-assets/latest.json"
-          (cd release-candidate && sha256sum -- * | sort) > "$RUNNER_TEMP/final-local-sha256"
+          (cd publication-assets && sha256sum -- * | sort) > "$RUNNER_TEMP/final-local-sha256"
           (cd "$RUNNER_TEMP/final-remote-assets" && sha256sum -- * | sort) > "$RUNNER_TEMP/final-remote-sha256"
           [[ "$(wc -l < "$RUNNER_TEMP/final-local-sha256")" -eq 10 ]]
           diff -u "$RUNNER_TEMP/final-local-sha256" "$RUNNER_TEMP/final-remote-sha256"

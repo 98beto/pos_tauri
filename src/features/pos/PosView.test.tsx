@@ -164,6 +164,61 @@ const measuredCart: Cart = {
   cart_fingerprint: "cart-measured-3",
 };
 
+const lengthPresentation = {
+  ...fixedPresentation,
+  id: 401,
+  product_id: 40,
+  name: "Metro",
+  mode: "measured" as const,
+  base_quantity: 100,
+  price: 2_500,
+  barcode: "7500000000401",
+};
+const lengthProduct: ProductSelectorRow = {
+  ...product,
+  id: 40,
+  name: "Cable electrico",
+  sku: "CABLE-1",
+  stock: 850,
+  stock_base: 850,
+  base_unit: "centimeter",
+  available_stock: 850,
+  presentations: [lengthPresentation],
+  default_presentation: lengthPresentation,
+};
+
+function lengthCart(enteredQuantity: number): Cart {
+  const lineTotal = Math.floor((enteredQuantity * lengthPresentation.price + 50) / 100);
+  return {
+    lines: [{
+      presentation_id: lengthPresentation.id,
+      presentation_name: lengthPresentation.name,
+      presentation_barcode: lengthPresentation.barcode,
+      product_id: lengthProduct.id,
+      product_name: lengthProduct.name,
+      sku: lengthProduct.sku,
+      base_unit: "centimeter",
+      mode: "measured",
+      base_quantity: 100,
+      catalog_unit_price: 2_500,
+      applied_unit_price: 2_500,
+      price_overridden: false,
+      entered_quantity: enteredQuantity,
+      base_consumed: enteredQuantity,
+      stock_base: 850,
+      available: true,
+      line_total: lineTotal,
+    }],
+    line_count: 1,
+    subtotal: lineTotal,
+    discount_type: "none",
+    discount_value: 0,
+    discount_amount: 0,
+    total: lineTotal,
+    cart_fingerprint: `cart-length-${enteredQuantity}`,
+  };
+}
+
 function updaterControls(overrides: Partial<UpdaterControls> = {}): UpdaterControls {
   return {
     enabled: true,
@@ -579,6 +634,55 @@ describe("PosView", () => {
     expect(incrementCartItem).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [1, "1 cm"],
+    [75, "75 cm"],
+    [100, "1 m"],
+    [125, "1.25 m"],
+  ])("formats a measured length of %i centimeters as %s without step controls", async (centimeters, formatted) => {
+    mockedGetCart.mockResolvedValueOnce(lengthCart(centimeters));
+    await renderLoaded();
+
+    expect(screen.getByText(formatted)).toBeTruthy();
+    expect(screen.getByText("$25.00 por metro")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Aumentar Cable electrico/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Reducir Cable electrico/ })).toBeNull();
+  });
+
+  it("captures 75 centimeters directly and preserves the per-meter line total", async () => {
+    mockedGetCart.mockResolvedValueOnce(emptyCart);
+    vi.mocked(listProductSelector).mockResolvedValueOnce([lengthProduct]);
+    vi.mocked(setCartItemQuantity).mockResolvedValueOnce(lengthCart(75));
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: /Agregar producto/ }));
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Agregar Cable electrico, Metro" }));
+
+    const quantity = screen.getByLabelText(/^Cantidad en centimetros/);
+    expect(quantity.getAttribute("inputmode")).toBe("numeric");
+    fireEvent.change(quantity, { target: { value: "75" } });
+    await settleMutation(screen.getByRole("button", { name: "Guardar cantidad" }));
+
+    expect(setCartItemQuantity).toHaveBeenCalledWith(401, 75);
+    expect(screen.getByText("75 cm")).toBeTruthy();
+    expect(screen.getAllByText("$18.75")).toHaveLength(3);
+    expect(incrementCartItem).not.toHaveBeenCalled();
+    expect(decrementCartItem).not.toHaveBeenCalled();
+  });
+
+  it.each(["1.5", "+75", "-75"])("rejects invalid centimeter quantity %j before IPC", async (value) => {
+    mockedGetCart.mockResolvedValueOnce(lengthCart(75));
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "Editar cantidad de Cable electrico, Metro" }));
+    fireEvent.change(screen.getByLabelText(/^Cantidad en centimetros/), { target: { value } });
+    fireEvent.click(screen.getByRole("button", { name: "Guardar cantidad" }));
+
+    expect(screen.getByRole("alert").textContent).toContain("entera mayor que cero");
+    expect(setCartItemQuantity).not.toHaveBeenCalled();
+    expect(incrementCartItem).not.toHaveBeenCalled();
+    expect(decrementCartItem).not.toHaveBeenCalled();
+  });
+
   it("prefills and replaces an existing fixed quantity with one IPC call", async () => {
     mockedGetCart.mockResolvedValueOnce(cart);
     vi.mocked(setCartItemQuantity).mockResolvedValueOnce({
@@ -722,9 +826,9 @@ describe("PosView", () => {
       presentation_id: fixedPresentation.id,
       product: {
         ...product,
-        inventory_cost_cents: null,
-        inventory_cost_status: "unknown",
-        average_cost_cents: null,
+        inventory_cost_cents: 0,
+        inventory_cost_status: "known",
+        average_cost_cents: 0,
         created_at: "",
         updated_at: "",
         presentations: selectorProduct.presentations,
@@ -749,9 +853,9 @@ describe("PosView", () => {
       match_kind: "sku",
       product: {
         ...product,
-        inventory_cost_cents: null,
-        inventory_cost_status: "unknown",
-        average_cost_cents: null,
+        inventory_cost_cents: 0,
+        inventory_cost_status: "known",
+        average_cost_cents: 0,
         created_at: "",
         updated_at: "",
         presentations: selectorProduct.presentations,
@@ -822,6 +926,100 @@ describe("PosView", () => {
     expect(screen.getByText("Bolsa historica 250 g · CAFE-OLD")).toBeTruthy();
     expect(screen.getByText(/2 Bolsa historica 250 g/)).toBeTruthy();
     expect(screen.getByText("$25.00")).toBeTruthy();
+    expect(screen.getByText("Costo de inventario: $10.00")).toBeTruthy();
+  });
+
+  it("keeps catalog and custom price snapshots while showing the global discount separately", async () => {
+    mockedCheckoutCart.mockResolvedValueOnce({
+      sale: {
+        ...receipt.sale,
+        subtotal: 1_500,
+        discount_type: "fixed",
+        discount_value: 150,
+        discount_amount: 150,
+        total: 1_350,
+      },
+      details: [{
+        id: 93,
+        product_id: lengthProduct.id,
+        sale_id: receipt.sale.id,
+        record_version: 2,
+        presentation_id: lengthPresentation.id,
+        product_name: lengthProduct.name,
+        sku: lengthProduct.sku,
+        presentation_name: lengthPresentation.name,
+        presentation_barcode: lengthPresentation.barcode,
+        base_unit: "centimeter",
+        presentation_mode: "measured",
+        presentation_base_quantity: 100,
+        quantity: 75,
+        catalog_unit_price: 2_500,
+        unit_price: 2_000,
+        entered_quantity: 75,
+        base_quantity: 75,
+        line_total: 1_500,
+        movement_cost_cents: 600,
+        created_at: "2026-01-01",
+        updated_at: "2026-01-01",
+      }],
+    });
+    await renderLoaded();
+    await enterValidCash();
+    await settleMutation(screen.getByRole("button", { name: /Cobrar/ }));
+
+    const dialog = screen.getByRole("dialog", { name: "Venta completada" });
+    expect(dialog.textContent).toContain("75 cm · Aplicado: $20.00 por metro");
+    expect(dialog.textContent).toContain("Catalogo: $25.00 por metro");
+    expect(dialog.textContent).toContain("Costo de inventario: $6.00");
+    expect(dialog.textContent).toContain("$15.00");
+    expect(dialog.textContent).toContain("Subtotal$15.00");
+    expect(dialog.textContent).toContain("Descuento-$1.50");
+    expect(dialog.textContent).toContain("Total$13.50");
+  });
+
+  it.each([
+    ["null", null],
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["unsafe integer", Number.MAX_SAFE_INTEGER + 1],
+  ])("labels measured receipt prices whose presentation base is %s as unavailable", async (_case, presentationBaseQuantity) => {
+    mockedCheckoutCart.mockResolvedValueOnce({
+      ...receipt,
+      details: [{
+        id: 94,
+        product_id: lengthProduct.id,
+        sale_id: receipt.sale.id,
+        record_version: 1,
+        presentation_id: lengthPresentation.id,
+        product_name: lengthProduct.name,
+        sku: lengthProduct.sku,
+        presentation_name: lengthPresentation.name,
+        presentation_barcode: lengthPresentation.barcode,
+        base_unit: "centimeter",
+        presentation_mode: "measured",
+        presentation_base_quantity: presentationBaseQuantity,
+        quantity: 75,
+        catalog_unit_price: 2_500,
+        unit_price: 2_000,
+        entered_quantity: 75,
+        base_quantity: null,
+        line_total: 1_500,
+        movement_cost_cents: 600,
+        created_at: "2026-01-01",
+        updated_at: "2026-01-01",
+      }],
+    });
+    await renderLoaded();
+    await enterValidCash();
+    await settleMutation(screen.getByRole("button", { name: /Cobrar/ }));
+
+    const dialog = screen.getByRole("dialog", { name: "Venta completada" });
+    expect(dialog.textContent).toContain("Aplicado: $20.00 · base no disponible");
+    expect(dialog.textContent).toContain("Catalogo: $25.00 · base no disponible");
+    expect(dialog.textContent).toContain("Costo de inventario: $6.00");
+    expect(dialog.textContent).toContain("$15.00");
+    expect(dialog.textContent).not.toContain("por 1");
   });
 
   it("renders a legacy NULL line total without inventing an amount", async () => {
@@ -841,6 +1039,7 @@ describe("PosView", () => {
     await enterValidCash();
     await settleMutation(screen.getByRole("button", { name: /Cobrar/ }));
     expect(screen.getByText("No representable")).toBeTruthy();
+    expect(screen.getByText("Costo de inventario: Desconocido")).toBeTruthy();
   });
 
   it("labels the horizontally scrollable cart table", async () => {

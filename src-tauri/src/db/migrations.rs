@@ -24,11 +24,23 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     M::up(include_str!(
         "../../migrations/012_add_sale_pricing_and_discounts.sql"
     )),
+    M::up(include_str!(
+        "../../migrations/013_measured_presentations_centimeters.sql"
+    )),
 ];
 const MIGRATIONS: Migrations<'_> = Migrations::from_slice(MIGRATIONS_SLICE);
 
 pub fn run(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
     MIGRATIONS.to_latest(connection)
+}
+
+pub(crate) fn run_to_v12(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
+    MIGRATIONS.to_version(connection, 12)
+}
+
+#[cfg(test)]
+pub(crate) fn run_to_v13(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
+    MIGRATIONS.to_version(connection, 13)
 }
 
 #[cfg(test)]
@@ -121,15 +133,64 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert_eq!(table_count, 8);
+    }
+
+    #[test]
+    fn v13_adds_centimeter_without_replacing_cost_columns() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        super::run(&mut connection).unwrap();
+
+        connection.execute_batch(
+            "INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
+             INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
+             INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents)
+             VALUES('Cable','cable',100,0,'CABLE','cable',1,1,'centimeter',0);
+             INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default)
+             VALUES(1,'Metro','measured',100,100,1);
+             INSERT INTO users(first_name,last_name,email,password_hash)
+             VALUES('Ada','Lovelace','ada@pos.local','hash');
+             INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method)
+             VALUES(1,'Ada Lovelace','ada@pos.local','checkout','cart',CURRENT_TIMESTAMP,100,'none',0,0,100,'tarjeta');
+             INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total)
+             VALUES(1,1,2,1,'Cable','CABLE','Metro','centimeter','measured',100,1,100,1,1,1);
+             INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity)
+             VALUES(1,'Cable','CABLE','cable','cable',1,'centimeter','initial_stock','ajuste','entrada',1);",
+        ).unwrap();
+        for (table, column) in [
+            ("products", "inventory_cost_cents"),
+            ("sale_details", "movement_cost_cents"),
+            ("inventory_movements", "unit_price_cents"),
+            ("inventory_movements", "movement_cost_cents"),
+            ("inventory_movements", "inventory_cost_before_cents"),
+            ("inventory_movements", "inventory_cost_after_cents"),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                        params![table, column],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        for statement in [
+            "UPDATE products SET base_unit='unknown' WHERE id=1",
+            "UPDATE sale_details SET base_unit='unknown' WHERE id=1",
+            "UPDATE inventory_movements SET base_unit='unknown' WHERE id=1",
+        ] {
+            assert!(connection.execute(statement, []).is_err(), "{statement}");
+        }
     }
 
     #[test]
     fn inventory_v2_enforces_price_search_key_and_fingerprint_constraints() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_v8_fixture(&mut connection);
-        super::run(&mut connection).unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
 
         let insert = |unit_price: Option<i64>,
                       supplier: Option<&str>,
@@ -235,7 +296,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         create_v8_fixture(&mut connection);
 
-        super::run(&mut connection).unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
 
         assert_eq!(version(&connection), 12);
         assert_eq!(
@@ -528,7 +589,7 @@ mod tests {
             )
             .unwrap();
 
-        super::run(&mut connection).unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
 
         connection
             .execute(
@@ -585,6 +646,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(connection.last_insert_rowid(), 44);
+    }
+
+    #[test]
+    fn v13_rebuild_preserves_historical_sequences_for_empty_tables() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
+        connection
+            .execute_batch(
+                "UPDATE sqlite_sequence SET seq=40 WHERE name='products';
+                 INSERT INTO sqlite_sequence(name,seq) SELECT 'products',40
+                   WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='products');
+                 UPDATE sqlite_sequence SET seq=50 WHERE name='product_presentations';
+                 INSERT INTO sqlite_sequence(name,seq) SELECT 'product_presentations',50
+                   WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='product_presentations');
+                 UPDATE sqlite_sequence SET seq=60 WHERE name='sale_details';
+                 INSERT INTO sqlite_sequence(name,seq) SELECT 'sale_details',60
+                   WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='sale_details');
+                 UPDATE sqlite_sequence SET seq=70 WHERE name='inventory_movements';
+                 INSERT INTO sqlite_sequence(name,seq) SELECT 'inventory_movements',70
+                   WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='inventory_movements');",
+            )
+            .unwrap();
+
+        super::MIGRATIONS.to_version(&mut connection, 13).unwrap();
+
+        let sequences = connection
+            .prepare("SELECT name,seq FROM sqlite_sequence WHERE name IN ('products','product_presentations','sale_details','inventory_movements') ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            sequences,
+            vec![
+                ("inventory_movements".into(), 70),
+                ("product_presentations".into(), 50),
+                ("products".into(), 40),
+                ("sale_details".into(), 60),
+            ]
+        );
+    }
+
+    #[test]
+    fn v13_rebuild_preserves_sequence_presence_for_empty_tables() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
+        let before = connection
+            .prepare("SELECT name,seq FROM sqlite_sequence ORDER BY name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        super::MIGRATIONS.to_version(&mut connection, 13).unwrap();
+        let after = connection
+            .prepare("SELECT name,seq FROM sqlite_sequence ORDER BY name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn v13_rebuild_preserves_sequence_values_without_normalizing_to_max_id() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
+                 INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
+                 INSERT INTO products(id,name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id)
+                 VALUES(10,'Producto','producto',100,0,'SKU','sku',1,1);
+                 UPDATE sqlite_sequence SET seq=3 WHERE name='products';",
+            )
+            .unwrap();
+
+        super::MIGRATIONS.to_version(&mut connection, 13).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='products'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -698,7 +856,7 @@ mod tests {
             )
             .unwrap();
 
-        super::run(&mut connection).unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
         assert_eq!(version(&connection), 12);
         let migrated: (i64, i64, Option<i64>) = connection
             .query_row(
@@ -933,7 +1091,7 @@ mod tests {
             connection
                 .pragma_update(None, "foreign_keys", true)
                 .unwrap();
-            assert_eq!(version(&connection), 12);
+            assert_eq!(version(&connection), 13);
             assert_eq!(
                 connection
                     .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -962,7 +1120,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        super::run(&mut connection).unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
 
         connection
             .execute(
@@ -1061,7 +1219,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        super::run(&mut connection).unwrap();
+        super::MIGRATIONS.to_version(&mut connection, 12).unwrap();
         connection.execute_batch(
             "INSERT INTO users (first_name, last_name, email, password_hash)
              VALUES ('Admin', 'POS', 'admin@pos.local', 'hash');
@@ -1123,8 +1281,11 @@ mod tests {
                         'idx_sales_user_id',
                         'idx_sales_sale_date',
                         'idx_sales_payment_method_sale_date',
-                        'idx_products_sku',
-                        'idx_products_name_search_key',
+                         'idx_products_sku',
+                         'idx_products_category_id',
+                         'idx_products_brand_id',
+                         'idx_products_name',
+                         'idx_products_name_search_key',
                         'idx_products_sku_search_key',
                         'idx_brands_name_search_key',
                         'idx_categories_name_search_key',
@@ -1140,6 +1301,8 @@ mod tests {
                          'idx_product_presentations_product_active',
                          'idx_product_presentations_identity',
                          'idx_sale_details_presentation_id',
+                         'idx_sale_details_product_id',
+                         'idx_sale_details_sale_id',
                          'idx_sale_details_sale_presentation_v2',
                          'idx_sale_details_line_identity',
                          'idx_inventory_movements_sale_detail_id',
@@ -1152,7 +1315,29 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(index_count, 26);
+        assert_eq!(index_count, 31);
+        let explicit_index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_autoindex_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(explicit_index_count, 31);
+
+        connection
+            .execute_batch(
+                "INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
+                 INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
+                 INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id)
+                 VALUES('Uno','uno',1,0,'SKU-1','sku-compartido',1,1);",
+            )
+            .unwrap();
+        assert!(connection.execute(
+            "INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id)
+             VALUES('Dos','dos',1,0,'SKU-2','sku-compartido',1,1)",
+            [],
+        ).is_err());
     }
 
     #[test]

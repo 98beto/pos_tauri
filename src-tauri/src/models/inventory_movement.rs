@@ -14,6 +14,7 @@ pub struct InventoryMovement {
     pub sale_id: Option<i64>,
     pub ticket_reference: Option<String>,
     pub record_version: i64,
+    pub origin: String,
     pub presentation_id: Option<i64>,
     pub presentation_name: Option<String>,
     pub presentation_barcode: Option<String>,
@@ -75,6 +76,12 @@ pub struct QuoteInventoryMovementInput {
     pub quantity: String,
     #[serde(default)]
     pub unit_price: Option<String>,
+    #[serde(default)]
+    pub supplier: Option<String>,
+    #[serde(default)]
+    pub document_reference: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,8 +171,51 @@ pub struct InventoryViewStats {
     pub piece_stock: i64,
     pub gram_stock: i64,
     pub milliliter_stock: i64,
+    pub centimeter_stock: i64,
     pub inventory_value_cents: i64,
     pub products_without_cost: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotePurchaseCostCorrectionInput {
+    pub movement_id: i64,
+    pub new_unit_price: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmPurchaseCostCorrectionInput {
+    pub movement_id: i64,
+    pub new_unit_price: String,
+    pub quote_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PurchaseCostCorrectionQuote {
+    pub movement_id: i64,
+    pub product_id: i64,
+    pub product_name: String,
+    pub product_sku: String,
+    pub base_unit: BaseUnit,
+    pub capture_name: String,
+    pub presentation_id: Option<i64>,
+    pub presentation_name: Option<String>,
+    pub presentation_mode: Option<PresentationMode>,
+    pub presentation_base_quantity: Option<i64>,
+    pub entered_quantity: i64,
+    pub base_quantity: i64,
+    pub previous_unit_price_cents: i64,
+    pub new_unit_price_cents: i64,
+    pub previous_movement_cost_cents: i64,
+    pub new_movement_cost_cents: i64,
+    pub current_inventory_cost_cents: Option<i64>,
+    pub corrected_inventory_cost_cents: Option<i64>,
+    pub affected_movement_count: i64,
+    pub affected_sale_count: i64,
+    pub first_affected_at: String,
+    pub last_affected_at: String,
+    pub quote_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,7 +245,7 @@ pub struct ProductInventoryDetail {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn create_input_keeps_the_legacy_payload_compatible() {
+    fn create_input_defaults_optional_v4_fields() {
         let input: super::CreateInventoryMovementInput =
             serde_json::from_value(serde_json::json!({
                 "product_id": 7,
@@ -207,7 +257,7 @@ mod tests {
             .unwrap();
         assert_eq!(input.movement_type, "salida");
         assert_eq!(input.presentation_id, None);
-        assert_eq!(input.unit_price, None);
+        assert_eq!(input.supplier, None);
         assert_eq!(input.quote_fingerprint, None);
 
         let serialized = serde_json::to_value(input).unwrap();
@@ -221,7 +271,6 @@ mod tests {
             "product_search": "producto",
             "product_page": 2,
             "base_unit": "gram",
-            "cost_status": "known",
             "movement_search": "factura",
             "movement_page": 3,
             "reason": "compra",

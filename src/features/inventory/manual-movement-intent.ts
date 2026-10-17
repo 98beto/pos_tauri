@@ -28,7 +28,38 @@ export type PendingManualMovementV2 = {
   quoteFingerprint: string | null;
 };
 
-export type PendingManualMovement = PendingManualMovementV1 | PendingManualMovementV2;
+export type PendingManualMovementV3 = {
+  version: 3;
+  userId: number;
+  operationToken: string;
+  productId: number;
+  presentationId: number | null;
+  reason: "compra" | "ajuste";
+  type: "entrada" | "salida";
+  quantity: string;
+  supplier: string | null;
+  documentReference: string | null;
+  note: string | null;
+  quoteFingerprint: string;
+};
+
+export type PendingManualMovementV4 = {
+  version: 4;
+  userId: number;
+  operationToken: string;
+  productId: number;
+  presentationId: number | null;
+  reason: "compra" | "ajuste" | "valoracion";
+  type: "entrada" | "salida" | "valoracion";
+  quantity: string;
+  unitPrice: string | null;
+  supplier: string | null;
+  documentReference: string | null;
+  note: string | null;
+  quoteFingerprint: string;
+};
+
+export type PendingManualMovement = PendingManualMovementV1 | PendingManualMovementV2 | PendingManualMovementV3 | PendingManualMovementV4;
 
 export type ClearPendingManualMovementResult = "cleared" | "absent" | "mismatch" | "error";
 
@@ -65,6 +96,27 @@ function parsePendingMovement(raw: string): PendingManualMovement | null {
       optionalString(value.note) &&
       (value.quoteFingerprint === undefined || optionalString(value.quoteFingerprint))
     ) return { ...value, quoteFingerprint: value.quoteFingerprint ?? null } as unknown as PendingManualMovementV2;
+    if (
+      value.version === 3 &&
+      (value.presentationId === null || Number.isSafeInteger(value.presentationId)) &&
+      ["compra", "ajuste"].includes(String(value.reason)) &&
+      ["entrada", "salida"].includes(String(value.type)) &&
+      optionalString(value.supplier) &&
+      optionalString(value.documentReference) &&
+      optionalString(value.note) &&
+      typeof value.quoteFingerprint === "string" && value.quoteFingerprint.length > 0
+    ) return value as unknown as PendingManualMovementV3;
+    if (
+      value.version === 4 &&
+      (value.presentationId === null || Number.isSafeInteger(value.presentationId)) &&
+      ["compra", "ajuste", "valoracion"].includes(String(value.reason)) &&
+      ["entrada", "salida", "valoracion"].includes(String(value.type)) &&
+      optionalString(value.unitPrice) &&
+      optionalString(value.supplier) &&
+      optionalString(value.documentReference) &&
+      optionalString(value.note) &&
+      typeof value.quoteFingerprint === "string" && value.quoteFingerprint.length > 0
+    ) return value as unknown as PendingManualMovementV4;
     return null;
   } catch {
     return null;
@@ -88,7 +140,7 @@ export function savePendingManualMovement(intent: PendingManualMovement) {
 
 export function replacePendingManualMovement(
   current: PendingManualMovement,
-  replacement: PendingManualMovementV2,
+  replacement: PendingManualMovementV4,
 ): boolean {
   try {
     const key = storageKey(current.userId);
@@ -125,7 +177,7 @@ export function clearPendingManualMovement(userId: number, token: string): Clear
   }
 }
 
-export function manualMovementInput(intent: PendingManualMovement): CreateInventoryMovementInput {
+export function manualMovementInput(intent: PendingManualMovementV4): CreateInventoryMovementInput {
   const input: CreateInventoryMovementInput = {
     product_id: intent.productId,
     reason: intent.reason,
@@ -133,13 +185,11 @@ export function manualMovementInput(intent: PendingManualMovement): CreateInvent
     quantity: intent.quantity,
     operation_token: intent.operationToken,
   };
-  if (intent.version === 2) {
-    input.presentation_id = intent.presentationId;
-    input.unit_price = intent.unitPrice;
-    input.supplier = intent.supplier;
-    input.document_reference = intent.documentReference;
-    input.note = intent.note;
-    input.quote_fingerprint = intent.quoteFingerprint;
-  }
+  input.presentation_id = intent.presentationId;
+  input.unit_price = intent.unitPrice;
+  input.supplier = intent.supplier;
+  input.document_reference = intent.documentReference;
+  input.note = intent.note;
+  input.quote_fingerprint = intent.quoteFingerprint;
   return input;
 }

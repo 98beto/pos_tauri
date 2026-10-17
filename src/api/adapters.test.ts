@@ -4,8 +4,8 @@ import { currentUser, initializeOwner, isAuthenticated, login, logout, ownerExis
 import { createBrand, listBrands, updateBrand } from "./brands";
 import { addCartItem, checkoutCart, clearCart, decrementCartItem, getCart, incrementCartItem, quoteCartDiscount, quoteCashChange, removeCartDiscount, removeCartItem, resetCartItemUnitPrice, setCartDiscount, setCartItemQuantity, setCartItemUnitPrice } from "./cart";
 import { createCategory, listCategories, updateCategory } from "./categories";
-import { createInventoryMovement, getInventoryView, getProductInventoryDetail, listInventoryMovements, quoteInventoryMovement, searchInventoryProducts } from "./inventory";
-import { createProduct, createProductWithPresentations, findProductByCode, findProductBySku, getProductsView, listProductSelector, listProducts, updateProduct, updateProductWithPresentations } from "./products";
+import { confirmPurchaseCostCorrection, createInventoryMovement, getInventoryView, getProductInventoryDetail, listInventoryMovements, quoteInventoryMovement, quotePurchaseCostCorrection, searchInventoryProducts } from "./inventory";
+import { createProductWithPresentations, findProductByCode, findProductBySku, getProductsView, listProductSelector, listProducts, updateProductWithPresentations } from "./products";
 import { getSaleHistoryDetail, getSalesView, listSales } from "./sales";
 
 beforeEach(() => invokeMock.mockReset().mockResolvedValue(undefined));
@@ -29,35 +29,36 @@ describe("Tauri API adapters", () => {
   });
 
   it("maps views and CRUD operations without changing backend field names", async () => {
-    const product = { name: "Cafe", sku: "CAFE", price: "12.50", stock: 0 as const, brand_id: 1, category_id: 2 };
-    const productUpdate = { name: "Cafe", sku: "CAFE", price: "13.00", brand_id: 1, category_id: 2 };
     const presentation = { name: "Kilogramo", mode: "measured" as const, base_quantity: 1000, price: "120.00", barcode: null, is_default: true, is_active: true };
-    const productWithPresentations = { name: "Cafe", sku: "CAFE", brand_id: 1, category_id: 2, base_unit: "gram" as const, initial_stock: 2000, initial_purchase_price_per_base: "0.08", presentations: [presentation] };
+    const productWithPresentations = { name: "Cafe", sku: "CAFE", brand_id: 1, category_id: 2, base_unit: "gram" as const, presentations: [presentation] };
     const productWithPresentationsUpdate = { name: "Cafe", sku: "CAFE", brand_id: 1, category_id: 2, base_unit: "gram" as const, presentations: [{ ...presentation, id: 8 }] };
-    const quote = { product_id: 4, presentation_id: 8, reason: "compra" as const, type: "entrada" as const, quantity: "2", unit_price: "80.00" };
-    const movement = { ...quote, supplier: "Proveedor", document_reference: "FAC-1", note: "Recepcion", operation_token: "movement-token", quote_fingerprint: "inventory-quote-v1:test" };
+    const quote = { product_id: 4, presentation_id: 8, reason: "compra" as const, type: "entrada" as const, quantity: "2", supplier: "Proveedor", document_reference: "FAC-1", note: "Recepcion" };
+    const movement = { ...quote, operation_token: "movement-token", quote_fingerprint: "inventory-quote-v3:test" };
+    const correctionQuote = { movement_id: 12, new_unit_price: "4.50" };
+    const correctionConfirm = { ...correctionQuote, quote_fingerprint: "purchase-cost-correction:test" };
     await Promise.all([
       getProductsView({ search: "caf", brand_id: 1, category_id: 2 }), listProductSelector({ search: "caf", category_id: 2 }),
-      listProducts(), findProductBySku("CAFE"), findProductByCode("750123"), createProduct(product), updateProduct(4, productUpdate),
+      listProducts(), findProductBySku("CAFE"), findProductByCode("750123"),
       createProductWithPresentations(productWithPresentations), updateProductWithPresentations(4, productWithPresentationsUpdate),
       listBrands(), createBrand({ name: "Origen" }), updateBrand(1, { name: "Nuevo origen" }),
       listCategories(), createCategory({ name: "Bebidas" }), updateCategory(2, { name: "Calientes" }),
-      getInventoryView({ product_search: "caf", product_page: 2, base_unit: "gram", cost_status: "known", movement_search: "FAC-1", movement_page: 3, reason: "compra", type: "entrada" }),
+      getInventoryView({ product_search: "caf", product_page: 2, base_unit: "gram", movement_search: "FAC-1", movement_page: 3, reason: "compra", type: "entrada" }),
       getProductInventoryDetail(4, { movement_search: "FAC-1", reason: "compra", type: "entrada", date_from: "2026-09-01", date_to: "2026-09-30", page: 2 }),
-       listInventoryMovements(), searchInventoryProducts("caf", 2), quoteInventoryMovement(quote), createInventoryMovement(movement),
+       listInventoryMovements(), searchInventoryProducts("caf", 2), quoteInventoryMovement(quote), createInventoryMovement(movement), quotePurchaseCostCorrection(correctionQuote), confirmPurchaseCostCorrection(correctionConfirm),
       getSalesView({ search: "0001", payment_method: "efectivo" }), getSaleHistoryDetail(9), listSales(),
     ]);
 
     expect(invokeMock.mock.calls).toEqual([
       ["get_products_view", { filters: { search: "caf", brand_id: 1, category_id: 2 } }],
       ["list_product_selector", { filters: { search: "caf", category_id: 2 } }], ["list_products"], ["find_product_by_sku", { sku: "CAFE" }], ["find_product_by_code", { code: "750123" }],
-      ["create_product", { input: product }], ["update_product", { id: 4, input: productUpdate }],
       ["create_product_with_presentations", { input: productWithPresentations }], ["update_product_with_presentations", { id: 4, input: productWithPresentationsUpdate }],
       ["list_brands"], ["create_brand", { input: { name: "Origen" } }], ["update_brand", { id: 1, input: { name: "Nuevo origen" } }],
       ["list_categories"], ["create_category", { input: { name: "Bebidas" } }], ["update_category", { id: 2, input: { name: "Calientes" } }],
-      ["get_inventory_view", { filters: { product_search: "caf", product_page: 2, base_unit: "gram", cost_status: "known", movement_search: "FAC-1", movement_page: 3, reason: "compra", type: "entrada" } }],
+      ["get_inventory_view", { filters: { product_search: "caf", product_page: 2, base_unit: "gram", movement_search: "FAC-1", movement_page: 3, reason: "compra", type: "entrada" } }],
         ["get_product_inventory_detail", { productId: 4, filters: { movement_search: "FAC-1", reason: "compra", type: "entrada", date_from: "2026-09-01", date_to: "2026-09-30", page: 2 } }], ["list_inventory_movements"], ["search_inventory_products", { search: "caf", page: 2 }], ["quote_inventory_movement", { input: quote }],
       ["create_inventory_movement", { input: movement }],
+      ["quote_purchase_cost_correction", { input: correctionQuote }],
+      ["confirm_purchase_cost_correction", { input: correctionConfirm }],
       ["get_sales_view", { filters: { search: "0001", payment_method: "efectivo" } }],
       ["get_sale_history_detail", { saleId: 9 }], ["list_sales"],
     ]);

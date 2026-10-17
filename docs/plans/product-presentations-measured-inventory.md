@@ -2,6 +2,8 @@
 
 **Estado:** implementado.
 
+**Evolucion:** el modelo de costo de compra, costo promedio y valoracion sigue vigente. [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md) reemplaza la captura de stock y costo inicial, agrega centimetros y define la correccion segura de precios de compra.
+
 **Referencia visual:** `demo.html` contiene el prototipo navegable acordado para Productos, POS, Inventario y Ventas. Sus datos son simulados y no representan funcionalidad ya implementada.
 
 ## Objetivo

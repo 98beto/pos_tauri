@@ -15,7 +15,7 @@
     "test:release": "node --test scripts/release-config.node-test.mjs scripts/latest-json.node-test.mjs scripts/verify-updater-signatures.node-test.mjs scripts/sanitize-appimage.node-test.mjs scripts/release-workflow.node-test.mjs scripts/tauri-signature.integration.node-test.mjs",
     "test:signature-integration": "node --test scripts/tauri-signature.integration.node-test.mjs",
     "test:run": "vitest run",
-    "qa:migration-v8-v12": "node scripts/run-v8-v12-migration-qa.mjs",
+    "qa:migration-v8-v13": "node scripts/run-v8-v13-migration-qa.mjs",
     "validate:version": "node scripts/validate-version.mjs",
     "build": "tsc -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
     "preview": "vite preview",

@@ -616,7 +616,7 @@ mod tests {
     fn database() -> (Connection, i64, i64) {
         let mut connection = Connection::open_in_memory().unwrap();
         migrations::run(&mut connection).unwrap();
-        connection.execute_batch("INSERT INTO brands(name,name_search_key) VALUES('M','m'); INSERT INTO categories(name,name_search_key) VALUES('C','c'); INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES('Tornillo','tornillo',100,200,'T','t',1,1,'piece',1000); INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default) VALUES(1,'Pieza','fixed',1,100,1); INSERT INTO product_presentations(product_id,name,mode,base_quantity,price) VALUES(1,'Bolsa','fixed',100,8000);").unwrap();
+        connection.execute_batch("INSERT INTO brands(name,name_search_key) VALUES('M','m'); INSERT INTO categories(name,name_search_key) VALUES('C','c'); INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit) VALUES('Tornillo','tornillo',100,200,'T','t',1,1,'piece'); INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default) VALUES(1,'Pieza','fixed',1,100,1); INSERT INTO product_presentations(product_id,name,mode,base_quantity,price) VALUES(1,'Bolsa','fixed',100,8000);").unwrap();
         (connection, 1, 2)
     }
 

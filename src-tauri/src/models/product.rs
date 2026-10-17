@@ -10,6 +10,7 @@ pub enum BaseUnit {
     Piece,
     Gram,
     Milliliter,
+    Centimeter,
 }
 
 impl BaseUnit {
@@ -18,6 +19,16 @@ impl BaseUnit {
             Self::Piece => "piece",
             Self::Gram => "gram",
             Self::Milliliter => "milliliter",
+            Self::Centimeter => "centimeter",
+        }
+    }
+
+    #[allow(dead_code)] // Shared domain rule; the UI consumes it now and later Rust blocks will reuse it.
+    pub fn standard_base_quantity(self) -> Option<i64> {
+        match self {
+            Self::Piece => None,
+            Self::Gram | Self::Milliliter => Some(1_000),
+            Self::Centimeter => Some(100),
         }
     }
 }
@@ -30,6 +41,7 @@ impl TryFrom<&str> for BaseUnit {
             "piece" => Ok(Self::Piece),
             "gram" => Ok(Self::Gram),
             "milliliter" => Ok(Self::Milliliter),
+            "centimeter" => Ok(Self::Centimeter),
             _ => Err(()),
         }
     }
@@ -57,35 +69,12 @@ pub struct Product {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CreateProductInput {
-    pub name: String,
-    pub price: String,
-    pub stock: i64,
-    pub sku: String,
-    pub brand_id: i64,
-    pub category_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateProductInput {
-    pub name: String,
-    pub price: String,
-    pub sku: String,
-    pub brand_id: i64,
-    pub category_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateProductWithPresentationsInput {
     pub name: String,
     pub sku: String,
     pub brand_id: i64,
     pub category_id: i64,
     pub base_unit: BaseUnit,
-    pub initial_stock: i64,
-    pub initial_purchase_price_per_base: Option<String>,
     pub presentations: Vec<CreateProductPresentationInput>,
 }
 
@@ -150,8 +139,10 @@ pub struct ProductViewStats {
     pub piece_stock: i64,
     pub gram_stock: i64,
     pub milliliter_stock: i64,
+    pub centimeter_stock: i64,
     pub brand_count: i64,
-    pub inventory_value: i64,
+    pub inventory_value_cents: i64,
+    pub products_without_cost: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,44 +186,4 @@ pub struct ProductSelectorRow {
     pub category_name: String,
     pub presentations: Vec<ProductPresentation>,
     pub default_presentation: ProductPresentation,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CreateProductInput, CreateProductWithPresentationsInput, UpdateProductInput,
-        UpdateProductWithPresentationsInput,
-    };
-
-    #[test]
-    fn legacy_and_presentation_payloads_are_unambiguous() {
-        let incomplete_create = serde_json::json!({
-            "name": "Producto",
-            "price": "1.00",
-            "stock": 0,
-            "sku": "SKU",
-            "brand_id": 1,
-            "category_id": 1,
-            "presentations": []
-        });
-        assert!(serde_json::from_value::<CreateProductInput>(incomplete_create.clone()).is_err());
-        assert!(
-            serde_json::from_value::<CreateProductWithPresentationsInput>(incomplete_create)
-                .is_err()
-        );
-
-        let incomplete_update = serde_json::json!({
-            "name": "Producto",
-            "price": "1.00",
-            "sku": "SKU",
-            "brand_id": 1,
-            "category_id": 1,
-            "presentations": []
-        });
-        assert!(serde_json::from_value::<UpdateProductInput>(incomplete_update.clone()).is_err());
-        assert!(
-            serde_json::from_value::<UpdateProductWithPresentationsInput>(incomplete_update)
-                .is_err()
-        );
-    }
 }

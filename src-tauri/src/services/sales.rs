@@ -13,9 +13,10 @@ use crate::models::{
 };
 
 use super::{
+    allocate_grouped_cost,
     cart::{self, SessionCart},
-    checked_total, normalize_search, proportional_cost_removal, search_key, validate_id,
-    ServiceError, ServiceResult,
+    checked_total, normalize_search, proportional_cost_withdrawal, search_key, validate_id,
+    CostAllocationLine, ServiceError, ServiceResult,
 };
 
 const CHECKOUT_TOKEN_MAX_LENGTH: usize = 128;
@@ -209,8 +210,8 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
     let mut statement = connection.prepare(
         "SELECT product_id, presentation_id, product_name, sku, presentation_name,
                 presentation_barcode, base_unit, presentation_mode, presentation_base_quantity,
-                 quantity, catalog_unit_price, unit_price, entered_quantity, base_quantity, line_total,
-                movement_cost_cents
+                 quantity, catalog_unit_price, unit_price, entered_quantity, base_quantity,
+                 line_total, movement_cost_cents
          FROM sale_details WHERE sale_id = ?1 ORDER BY id",
     )?;
     let raw_lines = statement
@@ -345,18 +346,23 @@ pub fn checkout(
     let mut lines = Vec::with_capacity(cart.len());
     let mut demands: BTreeMap<i64, ProductDemand> = BTreeMap::new();
     for resolved in &resolved_cart.lines {
-        let inventory_cost_before = transaction.query_row(
-            "SELECT inventory_cost_cents FROM products WHERE id = ?1",
-            [resolved.product_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )?;
         let line_index = lines.len();
-        let demand = demands.entry(resolved.product_id).or_insert(ProductDemand {
-            stock_before: resolved.stock_base,
-            inventory_cost_before,
-            base_consumed: 0,
-            line_indices: Vec::new(),
-        });
+        let demand = match demands.entry(resolved.product_id) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let (stock_before, inventory_cost_before) = transaction.query_row(
+                    "SELECT stock,inventory_cost_cents FROM products WHERE id=?1",
+                    [resolved.product_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )?;
+                entry.insert(ProductDemand {
+                    stock_before,
+                    inventory_cost_before,
+                    base_consumed: 0,
+                    line_indices: Vec::new(),
+                })
+            }
+        };
         demand.base_consumed = checked_total(
             demand.base_consumed,
             resolved.base_consumed,
@@ -437,25 +443,20 @@ pub fn checkout(
 
     for (product_id, demand) in demands {
         let stock_after = demand.stock_before - demand.base_consumed;
-        let removed_cost = demand
-            .inventory_cost_before
-            .map(|cost| proportional_cost_removal(cost, demand.base_consumed, demand.stock_before))
-            .transpose()?;
-        let inventory_cost_after = match (demand.inventory_cost_before, removed_cost) {
-            (Some(before), Some(removed)) => Some(before - removed),
-            (None, _) if stock_after == 0 => Some(0),
-            (None, _) => None,
-            _ => unreachable!(),
-        };
+        let withdrawal = proportional_cost_withdrawal(
+            demand.inventory_cost_before,
+            demand.stock_before,
+            demand.base_consumed,
+        )?;
         let changed = transaction.execute(
-            "UPDATE products SET stock = ?1, inventory_cost_cents = ?2,
-                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?3 AND stock = ?4",
+            "UPDATE products SET stock=?1,inventory_cost_cents=?2,updated_at=CURRENT_TIMESTAMP
+             WHERE id=?3 AND stock=?4 AND inventory_cost_cents IS ?5",
             params![
                 stock_after,
-                inventory_cost_after,
+                withdrawal.inventory_cost_after_cents,
                 product_id,
-                demand.stock_before
+                demand.stock_before,
+                demand.inventory_cost_before
             ],
         )?;
         if changed != 1 {
@@ -465,26 +466,40 @@ pub fn checkout(
             ));
         }
 
-        let allocations =
-            removed_cost.map(|cost| allocate_cost(cost, &demand.line_indices, &lines));
+        let allocations = withdrawal
+            .movement_cost_cents
+            .map(|total_cost| {
+                allocate_grouped_cost(
+                    total_cost,
+                    &demand
+                        .line_indices
+                        .iter()
+                        .map(|&line_index| CostAllocationLine {
+                            stable_id: lines[line_index].presentation_id,
+                            base_quantity: lines[line_index].base_consumed,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?;
         let mut movement_stock_before = demand.stock_before;
-        let mut movement_cost_before = demand.inventory_cost_before;
+        let mut movement_inventory_cost_before = demand.inventory_cost_before;
         for (position, &line_index) in demand.line_indices.iter().enumerate() {
             let line = &lines[line_index];
-            let line_cost = allocations.as_ref().map(|values| values[position]);
+            let line_cost = allocations.as_ref().map(|costs| costs[position]);
             let movement_stock_after = movement_stock_before - line.base_consumed;
-            let movement_cost_after = match (movement_cost_before, line_cost) {
-                (Some(before), Some(cost)) => Some(before - cost),
-                (None, _) if movement_stock_after == 0 => Some(0),
-                (None, _) => None,
-                _ => unreachable!(),
+            let movement_inventory_cost_after = match (movement_inventory_cost_before, line_cost) {
+                (Some(cost_before), Some(cost)) => Some(cost_before - cost),
+                (None, None) if movement_stock_after == 0 => Some(0),
+                (None, None) => None,
+                _ => unreachable!("known grouped cost has known line allocations"),
             };
             transaction.execute(
                 "INSERT INTO sale_details (product_id, sale_id, record_version, presentation_id,
                      product_name, sku, presentation_name, presentation_barcode, base_unit,
                      presentation_mode, presentation_base_quantity, quantity, catalog_unit_price,
                      unit_price, entered_quantity, base_quantity, line_total, movement_cost_cents)
-                  VALUES (?1, ?2, 3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?11, ?14, ?15, ?16)",
+                  VALUES (?1, ?2, 2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?11, ?14, ?15, ?16)",
                 params![
                     line.product_id,
                     sale_id,
@@ -510,10 +525,11 @@ pub fn checkout(
                      product_search_key, sku_search_key, sale_id, record_version, presentation_id,
                      sale_detail_id, presentation_name, presentation_barcode, base_unit,
                      presentation_mode, presentation_base_quantity, origin, reason, type, quantity,
-                     entered_quantity, base_quantity, unit_price_cents, stock_before, stock_after,
-                     movement_cost_cents, inventory_cost_before_cents, inventory_cost_after_cents)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 2, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                          'sale', 'venta', 'salida', ?14, ?15, ?14, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     entered_quantity, base_quantity, unit_price_cents, movement_cost_cents,
+                     stock_before, stock_after, inventory_cost_before_cents,
+                     inventory_cost_after_cents)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 2, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                           'sale', 'venta', 'salida', ?14, ?15, ?14, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     line.product_id,
                     line.product_name,
@@ -531,18 +547,21 @@ pub fn checkout(
                     line.base_consumed,
                     line.entered_quantity,
                     line.applied_unit_price,
+                    line_cost,
                     movement_stock_before,
                     movement_stock_after,
-                    line_cost,
-                    movement_cost_before,
-                    movement_cost_after
+                    movement_inventory_cost_before,
+                    movement_inventory_cost_after
                 ],
             )?;
             movement_stock_before = movement_stock_after;
-            movement_cost_before = movement_cost_after;
+            movement_inventory_cost_before = movement_inventory_cost_after;
         }
         debug_assert_eq!(movement_stock_before, stock_after);
-        debug_assert_eq!(movement_cost_before, inventory_cost_after);
+        debug_assert_eq!(
+            movement_inventory_cost_before,
+            withdrawal.inventory_cost_after_cents
+        );
     }
 
     let persisted_total: i64 = transaction.query_row(
@@ -559,34 +578,6 @@ pub fn checkout(
     let receipt = receipt_by_id(&transaction, sale_id)?;
     transaction.commit()?;
     Ok(receipt)
-}
-
-fn allocate_cost(total_cost: i64, indices: &[usize], lines: &[PricedLine]) -> Vec<i64> {
-    let total_base: i128 = indices
-        .iter()
-        .map(|index| i128::from(lines[*index].base_consumed))
-        .sum();
-    let mut allocations = Vec::with_capacity(indices.len());
-    let mut remainders = Vec::with_capacity(indices.len());
-    let mut allocated = 0_i64;
-    for (position, index) in indices.iter().copied().enumerate() {
-        let numerator = i128::from(total_cost) * i128::from(lines[index].base_consumed);
-        let floor = i64::try_from(numerator / total_base).expect("proportional cost is bounded");
-        allocations.push(floor);
-        allocated += floor;
-        remainders.push((
-            numerator % total_base,
-            lines[index].presentation_id,
-            position,
-        ));
-    }
-    remainders.sort_by_key(|(remainder, presentation_id, _)| {
-        (std::cmp::Reverse(*remainder), *presentation_id)
-    });
-    for &(_, _, position) in remainders.iter().take((total_cost - allocated) as usize) {
-        allocations[position] += 1;
-    }
-    allocations
 }
 
 pub fn quote_cash_change(
@@ -640,8 +631,7 @@ fn receipt_by_id(connection: &Connection, sale_id: i64) -> ServiceResult<SaleRec
         "SELECT id, product_id, sale_id, record_version, presentation_id, product_name, sku,
                 presentation_name, presentation_barcode, base_unit, presentation_mode,
                  presentation_base_quantity, quantity, catalog_unit_price, unit_price, entered_quantity, base_quantity,
-                line_total, movement_cost_cents,
-                created_at, updated_at
+                 line_total, movement_cost_cents, created_at, updated_at
          FROM sale_details WHERE sale_id = ?1 ORDER BY id",
     )?;
     let details = statement
@@ -710,7 +700,7 @@ fn reconstruct_v5_fingerprint(receipt: &SaleReceipt) -> ServiceResult<String> {
         .details
         .iter()
         .map(|detail| {
-            if detail.record_version != 3 {
+            if detail.record_version != 2 {
                 return Err(checkout_token_reused());
             }
             let mode = PresentationMode::try_from(
@@ -914,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn checkout_persists_two_lines_aggregated_stock_and_exact_cost_sequence() {
+    fn checkout_persists_two_lines_with_exact_grouped_cost_sequence() {
         let (mut connection, piece, bag) = database(250, Some(1001));
         let cart: SessionCart = [(piece, 3), (bag, 1)].into();
         let checkout_input = input(&connection, &cart, "two-lines");
@@ -937,19 +927,20 @@ mod tests {
                 .sum::<i64>(),
             103
         );
-        let product: (i64, i64) = connection
-            .query_row(
-                "SELECT stock,inventory_cost_cents FROM products WHERE id=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(product, (147, 589));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT stock,inventory_cost_cents FROM products WHERE id=1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (147, 589)
+        );
         let movements: Vec<[i64; 8]> = connection
             .prepare(
-                "SELECT stock_before, stock_after, movement_cost_cents,
-                        inventory_cost_before_cents, inventory_cost_after_cents,
-                        sale_id, sale_detail_id, unit_price_cents
+                "SELECT stock_before,stock_after,sale_id,sale_detail_id,unit_price_cents,
+                        movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents
                  FROM inventory_movements ORDER BY id",
             )
             .unwrap()
@@ -968,10 +959,25 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(movements[0], [250, 247, 12, 1001, 989, 1, 1, 100]);
-        assert_eq!(movements[1], [247, 147, 400, 989, 589, 1, 2, 8000]);
+        assert_eq!(movements[0], [250, 247, 1, 1, 100, 12, 1001, 989]);
+        assert_eq!(movements[1], [247, 147, 1, 2, 8000, 400, 989, 589]);
         assert_eq!(
-            movements.iter().map(|movement| movement[2]).sum::<i64>(),
+            receipt
+                .details
+                .iter()
+                .map(|line| line.movement_cost_cents.unwrap())
+                .collect::<Vec<_>>(),
+            movements
+                .iter()
+                .map(|movement| movement[5])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            receipt
+                .details
+                .iter()
+                .map(|line| line.movement_cost_cents.unwrap())
+                .sum::<i64>(),
             412
         );
         let foreign_key_errors: i64 = connection
@@ -983,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_removes_all_cost_and_unknown_cost_stays_null_until_zero() {
+    fn exhaustion_clears_known_and_unknown_inventory_cost() {
         let (mut known, piece, _) = database(3, Some(10));
         let cart = [(piece, 3)].into();
         let checkout_input = input(&known, &cart, "known");
@@ -993,7 +999,7 @@ mod tests {
                 .query_row(
                     "SELECT stock,inventory_cost_cents FROM products",
                     [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)) }
                 )
                 .unwrap(),
             (0, 0)
@@ -1061,9 +1067,10 @@ mod tests {
         );
         assert_eq!(
             connection
-                .query_row("SELECT inventory_cost_cents FROM products", [], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row("SELECT inventory_cost_cents FROM products", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
                 .unwrap(),
             9
         );
@@ -1095,7 +1102,7 @@ mod tests {
     fn reads_legacy_receipt_from_persisted_snapshots_and_line_values() {
         let (mut connection, _, _) = database(5, None);
         connection.execute("INSERT INTO sales (user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method) VALUES (1,'Historico','old@local','legacy','cart-v2|1:2:125',CURRENT_TIMESTAMP,250,'none',0,0,250,'tarjeta')", []).unwrap();
-        connection.execute("INSERT INTO sale_details (product_id,sale_id,record_version,product_name,sku,quantity,unit_price) VALUES (1,1,1,'Nombre viejo','SKU-VIEJO',2,125)", []).unwrap();
+        connection.execute("INSERT INTO sale_details (product_id,sale_id,record_version,product_name,sku,quantity,unit_price,movement_cost_cents) VALUES (1,1,1,'Nombre viejo','SKU-VIEJO',2,125,75)", []).unwrap();
         connection
             .execute("UPDATE products SET name='Nuevo',price=999 WHERE id=1", [])
             .unwrap();
@@ -1104,6 +1111,7 @@ mod tests {
         assert_eq!(detail.total, 250);
         assert_eq!(detail.lines[0].product_name, "Nombre viejo");
         assert_eq!(detail.lines[0].subtotal, None);
+        assert_eq!(detail.lines[0].movement_cost_cents, Some(75));
 
         let retry = CheckoutCartInput {
             checkout_token: "legacy".into(),
@@ -1113,6 +1121,7 @@ mod tests {
         };
         let receipt = super::checkout(&mut connection, 1, &SessionCart::new(), retry).unwrap();
         assert_eq!(receipt.sale.id, 1);
+        assert_eq!(receipt.details[0].movement_cost_cents, Some(75));
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
@@ -1287,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn checkout_persists_v3_override_discount_and_undiscounted_inventory_cost() {
+    fn custom_price_and_discount_do_not_change_inventory_cost() {
         let (mut connection, piece, _) = database(10, Some(1000));
         let mut cart = SessionCart::from([(piece, 2)]);
         cart::set_unit_price(&connection, &mut cart, piece, "0.75").unwrap();
@@ -1317,17 +1326,17 @@ mod tests {
                 receipt.details[0].line_total,
                 receipt.details[0].movement_cost_cents,
             ),
-            (3, Some(100), 75, Some(150), Some(200))
+            (2, Some(100), 75, Some(150), Some(200))
         );
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT movement_cost_cents FROM inventory_movements WHERE sale_id=?1",
+                    "SELECT unit_price_cents,movement_cost_cents FROM inventory_movements WHERE sale_id=?1",
                     [receipt.sale.id],
-                    |row| row.get::<_, i64>(0),
+                    |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?)),
                 )
                 .unwrap(),
-            200
+            (75, 200)
         );
 
         let retry = CheckoutCartInput {
@@ -1414,7 +1423,7 @@ mod tests {
         let original = {
             let mut connection = open_database(&path);
             let (_, first_product_bag) = prepare(&mut connection, 200, Some(2000));
-            connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES ('Tuerca','tuerca',200,20,'TUE-1','tue-1',1,1,'piece',4000)", []).unwrap();
+            connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit) VALUES ('Tuerca','tuerca',200,20,'TUE-1','tue-1',1,1,'piece')", []).unwrap();
             let second_product = connection.last_insert_rowid();
             connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (?1,'Pieza','fixed',1,200,1)", [second_product]).unwrap();
             let second_product_piece = connection.last_insert_rowid();
@@ -1593,6 +1602,47 @@ mod tests {
     }
 
     #[test]
+    fn checkout_rejects_aggregate_quantity_overflow_without_writes() {
+        let (mut connection, piece, bag) = database(crate::services::JS_MAX_SAFE_INTEGER, Some(1));
+        connection
+            .execute(
+                "UPDATE product_presentations SET price=1 WHERE id=?1",
+                [piece],
+            )
+            .unwrap();
+        let cart = SessionCart::from([(piece, crate::services::JS_MAX_SAFE_INTEGER), (bag, 1)]);
+        let checkout_input = CheckoutCartInput {
+            checkout_token: "overflow".into(),
+            cart_fingerprint: "unreachable".into(),
+            payment_method: "tarjeta".into(),
+            cash_received: None,
+        };
+
+        assert_eq!(
+            super::checkout(&mut connection, 1, &cart, checkout_input)
+                .unwrap_err()
+                .code,
+            "CART_AMOUNT_OVERFLOW"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT stock,inventory_cost_cents FROM products",
+                    [],
+                    |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)) }
+                )
+                .unwrap(),
+            (crate::services::JS_MAX_SAFE_INTEGER, 1)
+        );
+    }
+
+    #[test]
     fn sales_view_filters_stats_and_overflow_are_preserved() {
         let (mut connection, piece, bag) = database(200, Some(1000));
         let empty = super::view(&connection, Default::default()).unwrap();
@@ -1759,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn measured_volume_persists_exact_stock_cost_transitions_and_movement_foreign_keys() {
+    fn measured_volume_persists_cost_snapshots_and_movement_foreign_keys() {
         let (mut connection, _, _) = database(5, Some(500));
         connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES ('Aceite','aceite',12000,2000,'ACE-1','ace-1',1,1,'milliliter',1000)", []).unwrap();
         connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (2,'Litro','measured',1000,12000,1)", []).unwrap();
@@ -1776,15 +1826,15 @@ mod tests {
                 .query_row(
                     "SELECT stock,inventory_cost_cents FROM products WHERE id=2",
                     [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 )
                 .unwrap(),
             (1750, 875)
         );
         let transition: (i64, i64, i64, i64, i64, i64, i64) = connection
             .query_row(
-                "SELECT stock_before,stock_after,movement_cost_cents,
-                        inventory_cost_before_cents,inventory_cost_after_cents,sale_id,sale_detail_id
+                "SELECT stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,
+                        inventory_cost_after_cents,sale_id,sale_detail_id
                  FROM inventory_movements WHERE product_id=2",
                 [],
                 |row| {
@@ -1812,43 +1862,40 @@ mod tests {
     }
 
     #[test]
-    fn cost_allocation_assigns_residual_without_losing_cents() {
-        let lines = vec![
-            super::PricedLine {
-                presentation_id: 2,
-                presentation_name: String::new(),
-                presentation_barcode: None,
-                product_id: 1,
-                product_name: String::new(),
-                sku: String::new(),
-                base_unit: "piece".into(),
-                mode: crate::models::product_presentation::PresentationMode::Fixed,
-                presentation_base_quantity: 1,
-                catalog_unit_price: 1,
-                applied_unit_price: 1,
-                entered_quantity: 1,
-                base_consumed: 1,
-                line_total: 1,
-            },
-            super::PricedLine {
-                presentation_id: 1,
-                presentation_name: String::new(),
-                presentation_barcode: None,
-                product_id: 1,
-                product_name: String::new(),
-                sku: String::new(),
-                base_unit: "piece".into(),
-                mode: crate::models::product_presentation::PresentationMode::Fixed,
-                presentation_base_quantity: 1,
-                catalog_unit_price: 1,
-                applied_unit_price: 1,
-                entered_quantity: 1,
-                base_consumed: 1,
-                line_total: 1,
-            },
-        ];
-        let allocated = super::allocate_cost(1, &[0, 1], &lines);
-        assert_eq!(allocated, vec![0, 1]);
-        assert_eq!(allocated.iter().sum::<i64>(), 1);
+    fn checkout_75_centimeters_at_the_meter_price() {
+        let (mut connection, _, _) = database(5, None);
+        connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES ('Cable','cable',2500,200,'CAB-1','cab-1',1,1,'centimeter',1600)", []).unwrap();
+        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (2,'Metro','measured',100,2500,1)", []).unwrap();
+        let meter = connection.last_insert_rowid();
+        let cart = [(meter, 75)].into();
+        let checkout_input = input(&connection, &cart, "measured-length");
+
+        let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
+
+        assert_eq!(receipt.sale.total, 1875);
+        assert_eq!(receipt.details[0].entered_quantity, Some(75));
+        assert_eq!(receipt.details[0].base_quantity, Some(75));
+        assert_eq!(receipt.details[0].line_total, Some(1875));
+        assert_eq!(receipt.details[0].movement_cost_cents, Some(600));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT stock,inventory_cost_cents FROM products WHERE id=2",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            (125, 1000)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT movement_cost_cents,inventory_cost_before_cents FROM inventory_movements WHERE product_id=2",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (600, 1600)
+        );
     }
 }

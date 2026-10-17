@@ -48,6 +48,7 @@ jobs:
       - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml
+      - run: pnpm qa:migration-v8-v13
       - run: git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
 
   windows-rust:

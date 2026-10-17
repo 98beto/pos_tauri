@@ -39,6 +39,11 @@ export function formatBaseQuantity(quantity: number, baseUnit: BaseUnit) {
   if (baseUnit === "milliliter") {
     return `${quantityFormatter.format(quantity / 1_000)} L`;
   }
+  if (baseUnit === "centimeter") {
+    return quantity < 100
+      ? `${quantityFormatter.format(quantity)} cm`
+      : `${quantityFormatter.format(quantity / 100)} m`;
+  }
   return `${quantityFormatter.format(Math.trunc(quantity))} ${quantity === 1 ? "pieza" : "piezas"}`;
 }
 
@@ -58,6 +63,9 @@ export function formatPriceUnitLabel(baseUnit: BaseUnit, baseQuantity = 1_000) {
   }
   if (baseUnit === "milliliter") {
     return baseQuantity === 1_000 ? "litro" : `${quantityFormatter.format(baseQuantity)} ml`;
+  }
+  if (baseUnit === "centimeter") {
+    return baseQuantity === 100 ? "metro" : `${quantityFormatter.format(baseQuantity)} cm`;
   }
   return "pieza";
 }

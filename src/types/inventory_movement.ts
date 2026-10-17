@@ -1,8 +1,4 @@
-import type {
-  BaseUnit,
-  InventoryCostStatus,
-  InventoryProductRow,
-} from "./product";
+import type { BaseUnit, InventoryCostStatus, InventoryProductRow } from "./product";
 import type { PresentationMode } from "./product_presentation";
 
 export type InventoryMovementReason =
@@ -22,6 +18,7 @@ export interface InventoryMovement {
   sale_id: number | null;
   ticket_reference: string | null;
   record_version: number;
+  origin: "manual" | "sale" | "initial_stock";
   presentation_id: number | null;
   presentation_name: string | null;
   presentation_barcode: string | null;
@@ -50,8 +47,8 @@ export interface InventoryMovement {
 export interface CreateInventoryMovementInput {
   product_id: number;
   presentation_id?: number | null;
-  reason: InventoryMovementReason;
-  type: InventoryMovementType;
+  reason: "compra" | "ajuste" | "valoracion";
+  type: "entrada" | "salida" | "valoracion";
   quantity: string;
   unit_price?: string | null;
   supplier?: string | null;
@@ -63,7 +60,7 @@ export interface CreateInventoryMovementInput {
 
 export type QuoteInventoryMovementInput = Omit<
   CreateInventoryMovementInput,
-  "supplier" | "document_reference" | "note" | "operation_token"
+  "operation_token" | "quote_fingerprint"
 >;
 
 export interface InventoryMovementQuote {
@@ -133,8 +130,44 @@ export interface InventoryViewStats {
   piece_stock: number;
   gram_stock: number;
   milliliter_stock: number;
+  centimeter_stock: number;
   inventory_value_cents: number;
   products_without_cost: number;
+}
+
+export interface QuotePurchaseCostCorrectionInput {
+  movement_id: number;
+  new_unit_price: string;
+}
+
+export interface ConfirmPurchaseCostCorrectionInput extends QuotePurchaseCostCorrectionInput {
+  quote_fingerprint: string;
+}
+
+export interface PurchaseCostCorrectionQuote {
+  movement_id: number;
+  product_id: number;
+  product_name: string;
+  product_sku: string;
+  base_unit: BaseUnit;
+  capture_name: string;
+  presentation_id: number | null;
+  presentation_name: string | null;
+  presentation_mode: PresentationMode | null;
+  presentation_base_quantity: number | null;
+  entered_quantity: number;
+  base_quantity: number;
+  previous_unit_price_cents: number;
+  new_unit_price_cents: number;
+  previous_movement_cost_cents: number;
+  new_movement_cost_cents: number;
+  current_inventory_cost_cents: number | null;
+  corrected_inventory_cost_cents: number | null;
+  affected_movement_count: number;
+  affected_sale_count: number;
+  first_affected_at: string;
+  last_affected_at: string;
+  quote_fingerprint: string;
 }
 
 export interface InventoryView {

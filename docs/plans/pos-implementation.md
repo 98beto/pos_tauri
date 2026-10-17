@@ -1,5 +1,7 @@
 # Plan de implementacion del POS
 
+**Evolucion:** este plan general es historico. La captura inicial de stock/costo fue reemplazada por [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md); el resto de la evolucion se conserva en los planes enlazados desde [`README.md`](./README.md).
+
 ## Objetivo
 
 Integrar el diseno y las funcionalidades de `demo.html` en la aplicacion React + Tauri, utilizando los servicios SQLite existentes.

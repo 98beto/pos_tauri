@@ -13,10 +13,13 @@ describe("quantity formatting", () => {
     expect(formatBaseQuantity(2_500, "piece")).toBe("2,500 piezas");
   });
 
-  it("converts grams to kilograms and milliliters to liters with at most three decimals", () => {
+  it("converts measured stock to kilograms, liters, centimeters and meters", () => {
     expect(formatBaseQuantity(250, "gram")).toBe("0.25 kg");
     expect(formatBaseQuantity(1_234, "gram")).toBe("1.234 kg");
     expect(formatBaseQuantity(1_500, "milliliter")).toBe("1.5 L");
+    expect(formatBaseQuantity(75, "centimeter")).toBe("75 cm");
+    expect(formatBaseQuantity(100, "centimeter")).toBe("1 m");
+    expect(formatBaseQuantity(850, "centimeter")).toBe("8.5 m");
   });
 
   it("formats entered quantities according to the presentation mode", () => {
@@ -30,6 +33,8 @@ describe("price labels", () => {
     expect(formatPriceUnitLabel("piece")).toBe("pieza");
     expect(formatPriceUnitLabel("gram")).toBe("kg");
     expect(formatPriceUnitLabel("milliliter")).toBe("litro");
+    expect(formatPriceUnitLabel("centimeter", 100)).toBe("metro");
+    expect(formatPriceUnitLabel("centimeter", 25)).toBe("25 cm");
     expect(formatPricePerUnit(12_000, "gram")).toContain("por kg");
   });
 

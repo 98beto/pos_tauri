@@ -66,11 +66,11 @@ async function runCanonicalization(root) {
 }
 
 test("uses least privilege and disables checkout credential persistence", () => {
-  assert.match(release, /^permissions:\n  contents: read$/m);
+  assert.match(release, /^permissions:\n  actions: read\n  contents: read$/m);
   assert.match(release, /^  assemble:[\s\S]*?^    permissions:\n      contents: read$/m);
-  assert.match(release, /^  publish:[\s\S]*?^    permissions:\n      contents: write$/m);
-  assert.equal(occurrences(release, /uses: actions\/checkout@/g), 6);
-  assert.equal(occurrences(release, /persist-credentials: false/g), 6);
+  assert.match(release, /^  publish:[\s\S]*?^    permissions:\n      actions: read\n      contents: write$/m);
+  assert.equal(occurrences(release, /uses: actions\/checkout@/g), 7);
+  assert.equal(occurrences(release, /persist-credentials: false/g), 7);
   assert.equal(occurrences(ci, /uses: actions\/checkout@/g), 2);
   assert.equal(occurrences(ci, /persist-credentials: false/g), 2);
   assert.match(releaseRequest, /^permissions: \{\}$/m);
@@ -104,7 +104,8 @@ test("exposes validate and publish modes while deriving validate metadata withou
 
 test("builds and publishes only the validated immutable commit", () => {
   assert.match(release, /^      sha: \$\{\{ steps\.release-source\.outputs\.sha \}\}$/m);
-  assert.equal(occurrences(release, /ref: \$\{\{ needs\.validate\.outputs\.sha \}\}/g), 5);
+  assert.equal(occurrences(release, /ref: \$\{\{ needs\.validate\.outputs\.sha \}\}/g), 4);
+  assert.equal(occurrences(release, /ref: \$\{\{ needs\.release-source\.outputs\.sha \}\}/g), 2);
   assert.equal(occurrences(release, /args: .* -- --locked$/gm), 3);
   assert.equal(occurrences(release, /git diff --exit-code -- src-tauri\/Cargo\.lock/g), 3);
   assert.equal(occurrences(release, /Remote tag no longer resolves to the validated main commit/g), 3);
@@ -119,7 +120,7 @@ test("captures git, find, and gh producer output before consuming it", () => {
     ["find release-linux -maxdepth 1 -type f -print0", "staged_file", "mapfile -d '' staged"],
     ["find release-assets -type f -name '* *' -print0", "spaced_assets_file", "done"],
     ["find release-assets -mindepth 1 -maxdepth 1 -print0", "assets_file", "mapfile -d '' assets"],
-    ["find release-candidate -maxdepth 1 -type f -print0", "assets_file", "mapfile -d '' assets"],
+    ["find publication-assets -maxdepth 1 -type f -print0", "assets_file", "mapfile -d '' assets"],
   ];
   for (const [producer, capture, consumer] of nulCaptures) {
     const producerIndex = release.indexOf(`${producer} > "$${capture}"`);
@@ -135,7 +136,8 @@ test("captures git, find, and gh producer output before consuming it", () => {
 });
 
 test("builds frontend before exposing signing secrets and protects privileged jobs", () => {
-  assert.equal(occurrences(release, /^    environment: release$/gm), 3);
+  assert.equal(occurrences(release, /^    environment: release$/gm), 2);
+  assert.equal(occurrences(release, /^    environment: release-publication$/gm), 1);
   assert.equal(occurrences(release, /pnpm build/g), 4);
   assert.equal(occurrences(release, /test -d dist|Test-Path -Path dist/g), 3);
   for (const jobName of ["linux", "windows-nsis"]) {
@@ -149,6 +151,10 @@ test("builds frontend before exposing signing secrets and protects privileged jo
 test("runs locked release-mode Rust tests in CI and the release gate", () => {
   const command = /cargo test --locked --release --manifest-path src-tauri\/Cargo\.toml/g;
   assert.equal(occurrences(`${ci}\n${release}`, command), 2);
+});
+
+test("requires the SQLite 13 migration rehearsal in CI and the release gate", () => {
+  assert.equal(occurrences(`${ci}\n${release}`, /pnpm qa:migration-v8-v13/g), 2);
 });
 
 test("verifies candidate and downloaded signatures before atomic publication", () => {
@@ -223,7 +229,7 @@ test("canonicalizes downloaded asset names before verification and publication",
   assert.ok(step.lastIndexOf("Canonical release asset target collision") < step.indexOf("mv --"));
 });
 
-test("assembles nine native assets plus latest.json in both modes", () => {
+test("assembles and records the candidate only in validate mode", () => {
   const assemble = jobSection(release, "assemble");
   assert.match(assemble, /needs: \[validate, linux, windows-nsis, windows-msi\]/);
   assert.doesNotMatch(assemble, /^    if:/m);
@@ -233,17 +239,20 @@ test("assembles nine native assets plus latest.json in both modes", () => {
   assert.match(assemble, /candidate" =~ \^v\(0\|\[1-9\]\[0-9\]\*\)/);
   assert.match(assemble, /--notes-file "\$RUNNER_TEMP\/updater-release-notes\.md"/);
   assert.match(assemble, /node scripts\/latest-json\.mjs validate/);
-  assert.match(assemble, /\[\[ "\$\{#assets\[@\]\}" -eq 10 \]\]/);
+  assert.match(assemble, /sha256sum -- \* \| sort\) > "\$hashes"[\s\S]*?mv -- "\$hashes" release-assets\/SHA256SUMS/);
+  assert.match(assemble, /candidate-provenance\.json/);
+  assert.match(assemble, /validate_run_id:\$validate_run_id/);
+  assert.match(assemble, /\[\[ "\$\{#assets\[@\]\}" -eq 12 \]\]/);
   assert.match(assemble, /find release-assets -mindepth 1 -maxdepth 1 -print0/);
   assert.match(assemble, /\[\[ -f "\$asset" && ! -L "\$asset" && -s "\$asset" \]\]/);
-  assert.match(assemble, /name: release-candidate/);
+  assert.match(assemble, /name: release-candidate-\$\{\{ needs\.validate\.outputs\.sha \}\}/);
   assert.doesNotMatch(assemble, /GH_TOKEN|gh release|contents: write|environment: release/);
 });
 
 test("keeps all release mutations in the publish-only job", () => {
   const publish = jobSection(release, "publish");
-  assert.match(publish, /if: needs\.validate\.outputs\.mode == 'publish'/);
-  assert.match(publish, /environment: release/);
+  assert.match(publish, /if: needs\.release-source\.outputs\.mode == 'publish'/);
+  assert.match(publish, /environment: release-publication/);
   assert.match(publish, /contents: write/);
   for (const command of ["create", "upload", "edit", "delete-asset"]) {
     assert.match(publish, new RegExp(`gh release ${command}`));
@@ -327,7 +336,7 @@ test("reconciles residual draft assets before clobbering the exact local set", (
   assert.match(reconcile, /\[\[ "\$local_assets" == "\$remote_assets" \]\]/);
   assert.match(reconcile, /verify-updater-signatures\.mjs --assets "\$RUNNER_TEMP\/remote-assets"/);
   assert.match(reconcile, /latest-json\.mjs validate/);
-  assert.match(reconcile, /\(cd release-candidate && sha256sum -- \* \| sort\)/);
+  assert.match(reconcile, /\(cd publication-assets && sha256sum -- \* \| sort\)/);
   assert.match(reconcile, /\(cd "\$RUNNER_TEMP\/remote-assets" && sha256sum -- \* \| sort\)/);
   assert.match(reconcile, /wc -l < "\$RUNNER_TEMP\/local-sha256"\)" -eq 10/);
   assert.match(reconcile, /diff -u "\$RUNNER_TEMP\/local-sha256" "\$RUNNER_TEMP\/remote-sha256"/);
@@ -335,8 +344,26 @@ test("reconciles residual draft assets before clobbering the exact local set", (
 
 test("scopes GH_TOKEN only to steps that invoke gh or the GitHub API", () => {
   assert.doesNotMatch(release, /^    env:\n      GH_TOKEN:/m);
-  assert.equal(occurrences(release, /GH_TOKEN: \$\{\{ github\.token \}\}/g), 3);
+  assert.equal(occurrences(release, /GH_TOKEN: \$\{\{ github\.token \}\}/g), 5);
   assert.doesNotMatch(jobSection(release, "assemble"), /GH_TOKEN/);
+});
+
+test("publish promotes a QA-approved candidate and cannot rebuild bundles", () => {
+  const publish = jobSection(release, "publish");
+  assert.match(release, /candidate_run_id:[\s\S]*?required: false/);
+  assert.match(release, /DISPATCH_CANDIDATE_RUN_ID: \$\{\{ inputs\.candidate_run_id \}\}/);
+  assert.match(release, /Manual publish requires candidate_run_id as a positive Actions run ID/);
+  assert.match(release, /Validate mode does not accept candidate_run_id/);
+  assert.match(publish, /REQUESTED_RUN_ID: \$\{\{ inputs\.candidate_run_id \}\}/);
+  assert.match(publish, /actions\/artifacts\?name=\$ARTIFACT_NAME/);
+  assert.match(publish, /\.event <<< "\$run_json"\)" == "workflow_dispatch"/);
+  assert.match(publish, /\.conclusion <<< "\$run_json"\)" == "success"/);
+  assert.match(publish, /\.head_sha <<< "\$run_json"\)" == "\$EXPECTED_SHA"/);
+  assert.match(publish, /candidate-provenance\.json/);
+  assert.match(publish, /sha256sum --check --strict SHA256SUMS/);
+  assert.match(publish, /find publication-assets -maxdepth 1 -type f -print0/);
+  assert.doesNotMatch(publish, /pnpm (?:install|build|tauri)|cargo (?:build|test|check|clippy)|tauri-apps\/tauri-action/);
+  assert.doesNotMatch(publish, /TAURI_SIGNING_PRIVATE_KEY/);
 });
 
 test("refreshes main and the tag and revalidates before every release mutation", () => {

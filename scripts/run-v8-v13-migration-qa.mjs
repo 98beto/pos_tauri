@@ -9,7 +9,7 @@ if (process.argv.length !== 2) {
   process.exit(2);
 }
 
-const artifactDir = await mkdtemp(join(tmpdir(), "pos-tauri-v8-v12-qa-"));
+const artifactDir = await mkdtemp(join(tmpdir(), "pos-tauri-v8-v13-qa-"));
 const result = spawnSync(
   "cargo",
   [
@@ -17,7 +17,7 @@ const result = spawnSync(
     "--locked",
     "--manifest-path",
     "src-tauri/Cargo.toml",
-    "db::tests::migration_qa::real_v8_to_v12_migration_qa",
+    "db::tests::migration_qa::real_v8_to_v13_migration_qa",
     "--",
     "--ignored",
     "--exact",

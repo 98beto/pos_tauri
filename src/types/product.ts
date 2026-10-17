@@ -4,7 +4,7 @@ import type {
   UpdateProductPresentationInput,
 } from "./product_presentation";
 
-export type BaseUnit = "piece" | "gram" | "milliliter";
+export type BaseUnit = "piece" | "gram" | "milliliter" | "centimeter";
 export type InventoryCostStatus = "known" | "unknown";
 
 export interface Product {
@@ -26,25 +26,12 @@ export interface Product {
   default_presentation: ProductPresentation;
 }
 
-export interface CreateProductInput {
-  name: string;
-  price: string;
-  stock: 0;
-  sku: string;
-  brand_id: number;
-  category_id: number;
-}
-
-export type UpdateProductInput = Omit<CreateProductInput, "stock">;
-
 export interface CreateProductWithPresentationsInput {
   name: string;
   sku: string;
   brand_id: number;
   category_id: number;
   base_unit: BaseUnit;
-  initial_stock: number;
-  initial_purchase_price_per_base?: string | null;
   presentations: CreateProductPresentationInput[];
 }
 
@@ -79,8 +66,10 @@ export interface ProductViewStats {
   piece_stock: number;
   gram_stock: number;
   milliliter_stock: number;
+  centimeter_stock: number;
   brand_count: number;
-  inventory_value: number;
+  inventory_value_cents: number;
+  products_without_cost: number;
 }
 
 export interface ProductView {

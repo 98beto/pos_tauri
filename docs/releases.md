@@ -6,7 +6,7 @@ Esta guia corresponde al repositorio publico `98beto/pos_tauri`, la rama `main` 
 https://github.com/98beto/pos_tauri/releases/latest/download/latest.json
 ```
 
-El workflow admite `validate` y `publish`. `validate` compila el `HEAD` de `main`, firma y verifica todos los bundles y conserva un artifact candidato durante siete dias sin crear ni modificar releases. `publish` compila el commit inmutable de un tag `vX.Y.Z`, crea o reutiliza una release en borrador y la publica automaticamente solo despues de superar todos los gates.
+El workflow admite `validate` y `publish`. `validate` compila el `HEAD` de `main`, firma y verifica todos los bundles y conserva durante siete dias un artifact candidato ligado a tag, commit y run ID, sin crear ni modificar releases. `publish` nunca recompila: descarga ese artifact ya ensamblado, verifica procedencia, hashes y firmas, crea o reutiliza una release en borrador y promueve exactamente los diez archivos que fueron aprobados.
 
 ## Prerrequisitos locales
 
@@ -15,7 +15,7 @@ El workflow admite `validate` y `publish`. `validate` compila el `HEAD` de `main
 - Node.js 24.15.0, pnpm 12.4.1 y Rust 1.98.1 con `rustfmt` y `clippy`.
 - Dependencias de sistema de Tauri 2 si se ejecutan builds nativos locales.
 - Cambios de la release ya integrados en `main` y CI verde.
-- Variable, environment protegido y secrets de firma configurados en GitHub antes de crear el tag.
+- Variable, environments protegidos y secrets de firma configurados en GitHub antes de crear el tag.
 - Ruleset inmutable para tags `v*` y GitHub immutable releases habilitados. Una release no debe comenzar sin ambas protecciones.
 
 Las versiones se fijan en `.node-version`, `package.json`, `rust-toolchain.toml` y los workflows. Una actualizacion de toolchain es un cambio independiente y debe pasar CI antes de preparar una release.
@@ -44,8 +44,9 @@ En `Settings > Secrets and variables > Actions`:
 
 En `Settings > Environments`:
 
-- Crear el environment `release`, exigir required reviewers y limitar deployments a `main` (la rama default).
+- Crear el environment `release`, configurar `Deployment branches and tags` como `Selected branches and tags` con el patron `main`, exigir required reviewers y activar `Prevent self-review` cuando el plan de GitHub lo permita.
 - Crear preferiblemente como environment secrets de `release` el secret `TAURI_SIGNING_PRIVATE_KEY` con el contenido completo de la clave privada y `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` con su contrasena. Si temporalmente son repository secrets, el environment protegido sigue siendo obligatorio.
+- Crear un environment distinto `release-publication`, configurar el mismo patron de deployment `main`, exigir required reviewers y activar `Prevent self-review` cuando este disponible. No agregarle variables ni secrets de firma: solo aprueba la promocion de bytes ya firmados. Los revisores deben cotejar el run ID solicitado con la evidencia de migracion, smoke y rollback antes de aprobar.
 
 Introducir los valores solamente en los campos protegidos de la interfaz. Evitar comandos CLI que incluyan el valor en argumentos, porque pueden quedar en el historial o la lista de procesos. La variable publica se inyecta en un overlay efimero durante la release; `src-tauri/tauri.conf.json` no contiene una clave de produccion ni un valor sustituible que pueda publicarse por accidente.
 
@@ -68,6 +69,7 @@ pnpm install --frozen-lockfile
 pnpm validate:version v1.2.3
 pnpm test
 pnpm build
+pnpm qa:migration-v8-v13
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --locked --manifest-path src-tauri/Cargo.toml
@@ -77,212 +79,81 @@ git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
 
 El ultimo comando se ejecuta despues de confirmar los cambios de version y locks; comprueba que instalaciones y pruebas no los modificaron de nuevo. `pnpm validate:version` rechaza formatos distintos de `vX.Y.Z` y discrepancias entre los tres archivos.
 
-## Runbook v0.2.0: copia cerrada de esquema 8
+## Runbook de migracion al esquema 13
 
-Este procedimiento prepara los bloques 13 y 14. No se ejecuta sobre la base activa y no autoriza una publicacion. La aplicacion usa `pos.db` dentro del directorio de datos de `com.beto98.pos-tauri`; el backup y los marcadores quedan en ese mismo directorio.
+SQLite 13 es una migracion conservadora: conserva literalmente el esquema y los datos de SQLite 12 y solo amplia a `centimeter` el dominio `base_unit` de productos, detalles de venta y movimientos. Las columnas de costo, sus valores conocidos o `NULL`, los importes comerciales, IDs, relaciones y secuencias no se recalculan ni se eliminan.
 
-### Evidencia y candidato exacto
+Se admiten solamente `8 -> 13` y `12 -> 13`. Una base nueva se crea directamente en 13; una base 13 se valida y abre sin migrar; las versiones 9, 10 y 11 se rechazan sin escritura. Nunca ejecutar el primer ensayo sobre el archivo activo de produccion.
 
-Crear fuera del repositorio un directorio de trabajo restringido, separar los datos QA de la evidencia compartible y registrar el commit candidato antes de iniciar. No guardar datos de negocio, tokens ni secretos en la evidencia:
-
-```bash
-export RELEASE_TAG=v0.2.0
-export CANDIDATE_SHA="$(git rev-parse HEAD^{commit})"
-export RELEASE_WORK_ROOT=/ruta/restringida/linea-pos-v0.2.0
-export EVIDENCE_DIR="$RELEASE_WORK_ROOT/evidence"
-export QA_SECURE_DIR="$RELEASE_WORK_ROOT/private-data"
-install -d -m 700 "$RELEASE_WORK_ROOT" "$EVIDENCE_DIR" "$QA_SECURE_DIR"
-printf '%s\n' "$CANDIDATE_SHA" > "$EVIDENCE_DIR/candidate-sha.txt"
-pnpm validate:version "$RELEASE_TAG" | tee "$EVIDENCE_DIR/version.txt"
-```
-
-El commit debe estar integrado en `main` antes de ejecutar GitHub Actions. Lanzar `Release` desde `main` con `mode=validate`, nunca con `publish`, y dejar constancia del run ID, su `headSha`, conclusion y SHA-256 del artifact `release-candidate`. `validate` no crea ni modifica releases. Descargar el artifact candidato generado por ese run, no compilar otro commit para la prueba:
+La prueba automatizada requerida por CI y release es:
 
 ```bash
-gh workflow run release.yml --ref main -f mode=validate
-gh run list --workflow release.yml --event workflow_dispatch --limit 5
-gh run watch VALIDATE_RUN_ID --exit-status
-gh run view VALIDATE_RUN_ID --json databaseId,headSha,conclusion,url \
-  > "$EVIDENCE_DIR/validate-run.json"
-test "$(jq -r .headSha "$EVIDENCE_DIR/validate-run.json")" = "$CANDIDATE_SHA"
-gh run download VALIDATE_RUN_ID -n release-candidate -D "$EVIDENCE_DIR/release-candidate"
-(cd "$EVIDENCE_DIR/release-candidate" && sha256sum -- * | sort) \
-  > "$EVIDENCE_DIR/release-candidate.sha256"
+pnpm qa:migration-v8-v13
 ```
 
-Si `headSha` no coincide, si cambia el commit o si cualquier comprobacion falla, invalidar el candidato y repetir `validate` y toda la prueba. La copia QA se migra con el candidato descargado. Produccion se migra unicamente con el artefacto final publicado, compilado desde ese mismo commit etiquetado; `publish` vuelve a compilar y no se presupone que sus hashes sean reproducibles respecto a `validate`.
+El comando valida fixtures v8 y v12, costos conocidos y desconocidos, cronologia de compra/ajustes/venta/valoracion, preservacion literal, centimetros, rechazo de unidades desconocidas y versiones intermedias, backup, marcadores, reapertura y restauracion. No sustituye la prueba externa sobre una copia cerrada de produccion, que sigue pendiente hasta su ejecucion por un operador.
 
-### Obtener una copia v8 cerrada
+### Candidato y copia cerrada
 
-1. Programar una ventana sin operaciones y cerrar Linea POS en todos los procesos del equipo origen.
-2. Confirmar que no queda ningun proceso de Linea POS. No copiar una base mientras la aplicacion siga abierta.
-3. Localizar `pos.db` en el directorio de datos de `com.beto98.pos-tauri` y definir `SOURCE_DB` sin mover ni modificar el original.
-4. Comprobar que es esquema 8, integro y sin claves foraneas invalidas.
-5. Crear una instantanea consistente con la CLI de SQLite. Aunque la aplicacion este cerrada, no usar `cp` sobre un archivo que pueda tener WAL pendiente.
+1. Registrar el commit exacto y ejecutar `Release` desde `main` con `mode=validate`.
+2. Descargar el artifact `release-candidate-<sha>` y registrar el run ID del `validate`; comprobar que `candidate-provenance.json` contiene el tag, SHA y run ID esperados y ejecutar `sha256sum --check SHA256SUMS`.
+3. Cerrar Linea POS en el equipo origen y confirmar que no quedan procesos ni operaciones activas.
+4. Confirmar `PRAGMA user_version` igual a 8 o 12, `quick_check=ok` y cero filas de `foreign_key_check`.
+5. Crear una copia consistente mediante `.backup`; no usar `cp` si puede existir WAL pendiente.
+6. Mantener copia, backups y manifiestos en almacenamiento restringido y anonimizar antes de sacarlos del entorno autorizado.
 
-```bash
-export SOURCE_DB=/ruta/absoluta/al/directorio-de-datos/pos.db
-export CLOSED_V8_COPY="$QA_SECURE_DIR/pos-v8-closed-copy.db"
-test "$(sqlite3 "$SOURCE_DB" 'PRAGMA user_version;')" = 8
-test "$(sqlite3 "$SOURCE_DB" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$SOURCE_DB" 'PRAGMA foreign_key_check;')"
-sqlite3 "$SOURCE_DB" ".timeout 5000" ".backup '$CLOSED_V8_COPY'"
-chmod 600 "$CLOSED_V8_COPY"
-test "$(sqlite3 "$CLOSED_V8_COPY" 'PRAGMA user_version;')" = 8
-test "$(sqlite3 "$CLOSED_V8_COPY" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$CLOSED_V8_COPY" 'PRAGMA foreign_key_check;')"
-```
-
-Si la copia sale del equipo autorizado, anonimizarla mediante un procedimiento aprobado o no transferirla. No adjuntar la base, el backup ni el manifiesto completo a Actions, issues o evidencia compartida.
-
-Guardar comparables previos sin valores personales. Como minimo, registrar conteos y stock por ID; conservar por separado una lista autorizada de tickets historicos a revisar:
-
-```bash
-sqlite3 -readonly -header -csv "$CLOSED_V8_COPY" \
-  'SELECT "products" AS table_name, COUNT(*) AS rows FROM products UNION ALL SELECT "sales", COUNT(*) FROM sales UNION ALL SELECT "sale_details", COUNT(*) FROM sale_details UNION ALL SELECT "inventory_movements", COUNT(*) FROM inventory_movements;' \
-  > "$EVIDENCE_DIR/v8-counts.csv"
-sqlite3 -readonly -header -csv "$CLOSED_V8_COPY" \
-  'SELECT id, stock, inventory_cost_cents FROM products ORDER BY id;' \
-  > "$EVIDENCE_DIR/v8-product-state.csv"
-```
+Antes de migrar una fuente 12, registrar en evidencia privada snapshots literales de todas las columnas de productos, presentaciones, ventas, detalles y movimientos, junto con `sqlite_sequence`. Incluir expresamente stock, costos conocidos y `NULL`, precios de compra, costos de movimiento, saldos de costo, precio de catalogo, precio aplicado, subtotales, descuentos y totales. No publicar esos datos.
 
 ### Migrar solamente la copia
 
-Usar una maquina QA sin acceso al directorio de datos real. En Linux, el AppImage puede aislarse fijando `XDG_DATA_HOME`; confirmar la ruta creada antes de abrir cualquier otro binario:
+Usar una maquina, VM o perfil QA sin acceso al directorio de datos real. Mantener el identificador Tauri `com.beto98.pos-tauri`; aislar el directorio de datos en vez de cambiar la identidad de la aplicacion.
 
-```bash
-export QA_ROOT="$QA_SECURE_DIR/runtime"
-install -d -m 700 "$QA_ROOT"
-export XDG_DATA_HOME="$QA_ROOT/data"
-export QA_APP_DATA="$XDG_DATA_HOME/com.beto98.pos-tauri"
-install -d -m 700 "$QA_APP_DATA"
-cp "$CLOSED_V8_COPY" "$QA_APP_DATA/pos.db"
-chmod 600 "$QA_APP_DATA/pos.db"
-XDG_DATA_HOME="$XDG_DATA_HOME" "$EVIDENCE_DIR/release-candidate/Linea.POS_0.2.0_amd64.AppImage"
-```
+La aplicacion crea:
 
-En Windows usar una VM o usuario QA desechable y confirmar mediante la ruta mostrada por el sistema que `pos.db` pertenece a ese perfil aislado. No cambiar el identificador Tauri para la prueba y no apuntar el candidato al perfil de produccion.
+- `pos-v8-before-v13-<attempt-id>.db` o `pos-v12-before-v13-<attempt-id>.db`.
+- `pos-schema-v13-migration-pending.json` mientras la migracion no esta cerrada durablemente.
+- `pos-schema-v13-migration-completed-<attempt-id>.json` al completar.
+- `pos-schema-v13-migration.lock` para excluir aperturas concurrentes.
+- `pos-schema-v13-restore-pending.json` durante una restauracion.
+- `pos-schema-v13-restore-completed-<restore-id>.json` al completar la restauracion.
 
-Tras el primer inicio, cerrar completamente la aplicacion y validar:
+Tras el primer inicio, comprobar `user_version=13`, `quick_check=ok`, cero violaciones de FK, exactamente un backup y un manifiesto completado, y ausencia del marcador pendiente. Leer siempre `backup_path`, `source_version` y `target_version` desde el manifiesto. Reabrir y confirmar que no se crean otro backup ni otro manifiesto.
 
-```bash
-export MIGRATED_DB="$QA_APP_DATA/pos.db"
-test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA user_version;')" = 12
-test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$MIGRATED_DB" 'PRAGMA foreign_key_check;')"
-mapfile -t V8_BACKUPS < <(find "$QA_APP_DATA" -maxdepth 1 -name 'pos-v8-before-v0.2.0-*.db' -print)
-mapfile -t COMPLETED_MANIFESTS < <(find "$QA_APP_DATA" -maxdepth 1 -name 'pos-v0.2.0-migration-completed-*.json' -print)
-test "${#V8_BACKUPS[@]}" -eq 1
-test "${#COMPLETED_MANIFESTS[@]}" -eq 1
-test ! -e "$QA_APP_DATA/pos-v0.2.0-migration-pending.json"
-```
+Para una fuente 12, comparar el snapshot completo antes y despues. La igualdad debe ser literal en todos los campos y secuencias; la unica diferencia de esquema permitida es `centimeter` en los tres `CHECK` de unidad.
 
-Debe existir exactamente un backup y un manifiesto completado para este intento, y no debe quedar `pos-v0.2.0-migration-pending.json`. Leer la ruta desde el manifiesto, no elegir el backup por fecha o nombre:
+### Smoke funcional
 
-```bash
-export MANIFEST="${COMPLETED_MANIFESTS[0]}"
-export V8_BACKUP="$(jq -er 'select(.source_version == 8 and .target_version == 12) | .backup_path' "$MANIFEST")"
-test -f "$V8_BACKUP"
-test "$(sqlite3 "$V8_BACKUP" 'PRAGMA user_version;')" = 8
-test "$(sqlite3 "$V8_BACKUP" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$V8_BACKUP" 'PRAGMA foreign_key_check;')"
-```
+1. Productos: crear una longitud con presentacion `Metro`; confirmar stock y costo acumulado cero y ausencia de movimiento inicial.
+2. Inventario: registrar una compra en centimetros con precio, proveedor y documento; comprobar stock, costo acumulado, costo promedio y valor total a costo.
+3. Inventario: registrar ajustes de entrada/salida y una valoracion; comprobar cantidades y saldos de costo.
+4. POS: vender centimetros con precio personalizado y descuento; comprobar total comercial, stock y costo retirado.
+5. Ventas: comprobar snapshots, `movement_cost_cents`, precio aplicado, subtotal, descuento y total historico.
+6. Correccion: sobre otra copia desechable, cotizar y corregir una compra con movimientos posteriores; comprobar replay de costos y que cantidades, stock historico y campos comerciales no cambian.
+7. Rollback transaccional: provocar un rechazo seguro, por ejemplo fingerprint obsoleto, y confirmar que no hay escrituras parciales.
 
-Repetir los CSV de conteos y stock sobre `MIGRATED_DB` y compararlos con los de v8. Verificar manualmente una muestra de tickets historicos, incluidos efectivo y cambio. Abrir y cerrar otra vez `v0.2.0`; confirmar que permanece en esquema 12 y que no aparece un segundo backup. En la copia migrada probar compra, venta, ajuste y valoracion, y registrar resultado, SO, arquitectura, formato del instalador y hashes. Las operaciones funcionales de prueba ocurren despues de las comparaciones historicas y nunca se esperan en el backup v8.
+### Restauracion y rollback
 
-### Ensayo de rollback durable a v0.1.0
+Ensayar el rollback antes de publicar. Cerrar completamente el candidato, conservar una copia diagnostica de SQLite 13 y tomar el backup exacto desde el manifiesto completado o el marcador pendiente. Validar que conserva el `source_version` y el snapshot de origen.
 
-Ejecutar este ensayo sobre el directorio QA anterior. No intentar abrir esquema 12 con `v0.1.0`.
+Usar el mecanismo durable del backend: marcador de restauracion, cuarentena de la base y sidecars de SQLite 13, promocion de un temporal validado y manifiesto completado. No reemplazar manualmente `pos.db` con la aplicacion abierta.
 
-1. Cerrar completamente `v0.2.0` y confirmar que no queda ningun proceso.
-2. Crear y validar una copia de diagnostico del esquema 12.
-3. Volver a leer `backup_path` del manifiesto completado o, tras un fallo, de `pos-v0.2.0-migration-pending.json`.
-4. Validar nuevamente el backup v8 antes de restaurar.
-5. Restaurar primero a un archivo temporal en el mismo directorio y persistirlo. Antes de promoverlo, mover `pos.db`, `pos.db-wal` y `pos.db-shm` existentes a nombres de cuarentena en ese mismo directorio y sincronizar el directorio. Nunca puede coexistir el v8 promovido con sidecars del v12.
-6. Si habia marcador pendiente, archivarlo como evidencia fuera del nombre activo solo despues de validar la restauracion; de lo contrario bloquearia correctamente el siguiente inicio.
-7. Conservar la base v12 y sus sidecars en cuarentena, junto con la copia diagnostica y los marcadores archivados, hasta cerrar la investigacion. No borrarlos como parte del rollback.
+Abrir y reabrir el resultado con la version compatible con el esquema 8 o 12 restaurado. Comparar productos, stock, costos, ventas, detalles, movimientos y secuencias. Toda operacion creada despues de migrar a 13 se pierde al restaurar el backup.
 
-La finalizacion de migracion y restauracion publica primero un manifiesto completado independiente: escribe y sincroniza un temporal exclusivo y lo publica durablemente con un nombre final. Solo entonces retira el marcador activo. Si un corte deja ambos archivos, el siguiente inicio solo retira el activo despues de comprobar que los manifiestos coinciden y volver a sincronizar el completado; si difieren o cualquier sincronizacion falla, bloquea la apertura.
+### Checklist
 
-```bash
-export MIGRATION_STATE="$MANIFEST"
-if test -f "$QA_APP_DATA/pos-v0.2.0-migration-pending.json"; then
-  export MIGRATION_STATE="$QA_APP_DATA/pos-v0.2.0-migration-pending.json"
-fi
-export V8_BACKUP="$(jq -er 'select(.source_version == 8 and .target_version == 12) | .backup_path' "$MIGRATION_STATE")"
-test -f "$V8_BACKUP"
-test "$(sqlite3 "$V8_BACKUP" 'PRAGMA user_version;')" = 8
-test "$(sqlite3 "$V8_BACKUP" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$V8_BACKUP" 'PRAGMA foreign_key_check;')"
-sqlite3 "$MIGRATED_DB" ".backup '$QA_APP_DATA/pos-v12-diagnostic.db'"
-test "$(sqlite3 "$QA_APP_DATA/pos-v12-diagnostic.db" 'PRAGMA user_version;')" = 12
-export RESTORE_TMP="$QA_APP_DATA/.pos-v8-restore.tmp"
-export RESTORE_ID="$(date +%s)-$$"
-export QUARANTINE_DB="$QA_APP_DATA/.pos-quarantine-$RESTORE_ID.db"
-export QUARANTINE_WAL="$QA_APP_DATA/.pos-quarantine-$RESTORE_ID-sidecar-wal"
-export QUARANTINE_SHM="$QA_APP_DATA/.pos-quarantine-$RESTORE_ID-sidecar-shm"
-rm -f -- "$RESTORE_TMP"
-sqlite3 "$V8_BACKUP" ".backup '$RESTORE_TMP'"
-test "$(sqlite3 "$RESTORE_TMP" 'PRAGMA user_version;')" = 8
-test "$(sqlite3 "$RESTORE_TMP" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$RESTORE_TMP" 'PRAGMA foreign_key_check;')"
-chmod 600 "$RESTORE_TMP"
-sync -f "$RESTORE_TMP"
-test -f "$MIGRATED_DB" && mv -- "$MIGRATED_DB" "$QUARANTINE_DB"
-test ! -f "$MIGRATED_DB-wal" || mv -- "$MIGRATED_DB-wal" "$QUARANTINE_WAL"
-test ! -f "$MIGRATED_DB-shm" || mv -- "$MIGRATED_DB-shm" "$QUARANTINE_SHM"
-sync -f "$QA_APP_DATA"
-mv -- "$RESTORE_TMP" "$MIGRATED_DB"
-sync -f "$QA_APP_DATA"
-if test -f "$QA_APP_DATA/pos-v0.2.0-migration-pending.json"; then
-  mv -- "$QA_APP_DATA/pos-v0.2.0-migration-pending.json" \
-    "$EVIDENCE_DIR/pending-marker-from-rollback-test.json"
-fi
-test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA user_version;')" = 8
-test "$(sqlite3 "$MIGRATED_DB" 'PRAGMA quick_check;')" = ok
-test -z "$(sqlite3 "$MIGRATED_DB" 'PRAGMA foreign_key_check;')"
-```
+No publicar hasta que migracion, reapertura, smoke y rollback pasen sobre los archivos del mismo run ID de `validate`. La evidencia debe registrar `SHA256SUMS`; el tag se crea despues de aprobar esos bytes y `publish` debe recibir ese run ID, no generar otro candidato.
 
-Si falla cualquier movimiento de cuarentena, no promover `RESTORE_TMP`: conservar el namespace parcial y restaurar primero todos los nombres originales. Si falla la promocion, su sincronizacion, la validacion o el archivado del marcador, aislar el v8 promovido como `.pos-restore-failed-*.db`, devolver sidecars y base v12 desde cuarentena (sidecars primero, base al final), sincronizar el directorio y conservar el archivo fallido. Si cualquiera de esos pasos de rollback falla, la recuperacion esta incompleta: no iniciar ninguna version y escalar usando backup, marcador y cuarentenas.
-
-En Windows no se acepta un procedimiento equivalente basado solo en `Move-Item`. El backend sincroniza el contenido de los temporales nuevos y publica cada movimiento critico del namespace con `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` en el mismo volumen, sin permitir copia ni reemplazo para los manifiestos nuevos. Windows no admite `FlushFileBuffers` sobre handles de directorio; por eso el manifiesto completado durable es la autoridad. Si un corte deja tambien el marcador activo, el siguiente inicio exige que ambos coincidan antes de retirarlo; si difieren o falla una publicacion write-through, la apertura queda bloqueada. Ejecutar el ensayo Windows solo en un volumen local NTFS con la aplicacion cerrada y mediante esta primitiva probada, no mediante una sustitucion manual de archivos.
-
-Instalar o ejecutar el artefacto publicado e inmutable de `v0.1.0` con ese mismo perfil QA. Verificar productos, stock, ventas y tickets previos, cerrar y reabrir. Comparar otra vez con `v8-counts.csv` y `v8-product-state.csv`. Registrar que toda operacion creada despues de migrar a `v0.2.0` se pierde al restaurar el backup; el rollback de produccion debe decidirse antes de reanudar operacion prolongada.
-
-### Despliegue controlado y publicacion
-
-No continuar hasta que `validate`, migracion, reapertura y rollback hayan pasado sobre el mismo candidato. Si cambia un byte o commit, repetir todo.
-
-1. Congelar UI, contratos, migraciones `009`-`012` y commit candidato.
-2. Confirmar CI verde, `pnpm validate:version v0.2.0` y que el SHA validado pertenece a `main`.
-3. Crear el tag anotado inmutable `v0.2.0` exactamente sobre `CANDIDATE_SHA` y verificarlo antes de enviarlo.
-4. Autorizar `mode=publish` solamente despues de la aprobacion operacional. Este modo puede publicar y no forma parte del ensayo local.
-5. Confirmar que el run de publicacion usa el SHA etiquetado; comparar los SHA-256 locales y remotos de ese mismo run y validar firmas y `latest.json`.
-6. Instalar primero el artefacto final en un equipo controlado, confirmar backup, manifiesto, esquema 12, funciones principales y reapertura; despues liberar los demas equipos.
-
-```bash
-test "$(git rev-parse HEAD^{commit})" = "$CANDIDATE_SHA"
-git tag -a v0.2.0 "$CANDIDATE_SHA" -m "Linea POS v0.2.0"
-git rev-parse 'v0.2.0^{commit}'
-git push origin v0.2.0
-# Solo con autorizacion explicita; publica una release:
-gh workflow run release.yml --ref main -f mode=publish -f tag=v0.2.0
-```
-
-### Checklist y evidencia minima
-
-- [ ] Aplicacion de origen cerrada y copia consistente con `user_version=8`, `quick_check=ok` y cero filas de `foreign_key_check`.
-- [ ] Commit SHA, validate run URL/ID, plataforma, instalador y SHA-256 registrados.
-- [ ] `headSha` de `mode=validate` igual al commit candidato.
-- [ ] Conteos, stock, costos, tickets, efectivo, cambio, IDs, fechas y tokens historicos conservados.
-- [ ] Esquema final 12 integro y reapertura sin otra migracion ni otro backup.
-- [ ] Un unico manifiesto completado apunta al backup exacto; backup v8 valido y protegido.
-- [ ] Compra, venta, ajuste y valoracion pasan solamente sobre la copia QA.
-- [ ] Rollback restaura durablemente esquema 8 y `v0.1.0` abre y reabre los datos esperados.
-- [ ] Perdida esperada de operaciones posteriores a la migracion entendida y ventana de decision acordada.
-- [ ] Sin bases, backups, manifiestos con rutas sensibles, datos personales, tokens ni secretos en evidencia compartida.
-- [ ] Cualquier cambio posterior al ensayo invalida el candidato y repite `validate`, migracion y rollback.
-- [ ] Tag y `publish` aprobados explicitamente y ejecutados solo despues de completar los puntos anteriores.
+- [ ] `pnpm qa:migration-v8-v13` termina correctamente en CI y en el candidato.
+- [ ] Copia externa cerrada y consistente de produccion creada; las pruebas del repositorio no completan este paso.
+- [ ] Fuente 8 o 12 integra, preflight aprobado y snapshot privado registrado.
+- [ ] Commit, validate run ID, plataforma, instalador y `SHA256SUMS` registrados.
+- [ ] Esquema 13 integro, reapertura idempotente y manifiesto apuntando al backup exacto.
+- [ ] Costos, campos comerciales, IDs, relaciones y secuencias preservados literalmente.
+- [ ] Smoke de productos, compras, valoracion, checkout, ventas y correccion completado con centimetros.
+- [ ] Rechazo o fallo controlado revierte sin escrituras parciales.
+- [ ] Restauracion durable devuelve el esquema 8 o 12 y la version compatible lo abre.
+- [ ] No hay bases, backups, costos, rutas sensibles, datos personales, tokens ni secretos en evidencia compartida.
+- [ ] Tag y `publish` cuentan con aprobacion explicita.
 
 Crear un commit normal mediante pull request. Cuando este en `main`, crear el tag anotado sobre el commit exacto y publicarlo:
 
@@ -291,29 +162,31 @@ git switch main
 git pull --ff-only origin main
 git tag -a v1.2.3 -m "Linea POS v1.2.3"
 git push origin v1.2.3
+# Si la ruta automatica encuentra mas de un candidato, publicar explicitamente el aprobado:
+gh workflow run release.yml --ref main -f mode=publish -f tag=v1.2.3 -f candidate_run_id=VALIDATE_RUN_ID
 ```
 
 No mover ni reutilizar un tag enviado. El workflow exige que su commit pertenezca a la historia de `origin/main` y que no exista una release ya publicada para ese tag.
 
 ## Ejecucion del workflow
 
-Un push de `v*` ejecuta primero `Release request`, que no tiene secrets ni permisos de escritura. Al terminar correctamente, `Release` se carga desde la rama default mediante `workflow_run`, obtiene exactamente un tag SemVer que apunte a `workflow_run.head_sha`, exige que el SHA pertenezca a `origin/main` y compila ese SHA.
+Un push de `v*` ejecuta primero `Release request`, que no tiene secrets ni permisos de escritura. Al terminar correctamente, `Release` se carga desde la rama default mediante `workflow_run`, obtiene exactamente un tag SemVer que apunte a `workflow_run.head_sha`, exige que el SHA pertenezca a `origin/main` y busca el candidato previo de ese SHA. No compila en esta ruta. La publicacion automatica continua solamente si existe un unico artifact valido; si hay varios, falla de forma segura y se debe usar `workflow_dispatch` indicando el run ID aprobado.
 
 `workflow_dispatch` solo puede lanzarse seleccionando `main`:
 
 - `mode=validate` usa el `HEAD` de `origin/main`, deriva el tag desde `package.json`, construye el candidato completo y deja omitido el job con `contents: write`.
-- `mode=publish` requiere un tag `vX.Y.Z` existente y sirve para recuperar o reintentar la publicacion normal.
+- `mode=publish` requiere un tag `vX.Y.Z` existente y `candidate_run_id` con el run ID de `validate` aprobado. Sirve para la publicacion normal, recuperacion o reintento y no ejecuta tests, Vite, Cargo ni Tauri.
 
-Cada job genera `dist` con `pnpm build` antes de cualquier acceso a secrets. Linux compila sin la clave privada, sanea el AppImage y expone la clave solamente al paso que firma los tres instaladores finales. NSIS tambien compila sin la clave y la expone solo al firmador posterior. MSI no recibe secretos ni configuracion del updater. El overlay efimero anula `build.beforeBuildCommand`, por lo que Vite o sus plugins no heredan credenciales de firma.
+Cada job de compilacion genera `dist` con `pnpm build` antes de cualquier acceso a secrets. Linux compila sin la clave privada, sanea el AppImage y expone la clave solamente al paso que firma los tres instaladores finales. NSIS tambien compila sin la clave y la expone solo al firmador posterior. MSI no recibe secretos ni configuracion del updater. El overlay efimero anula `build.beforeBuildCommand`, por lo que Vite o sus plugins no heredan credenciales de firma.
 
-Windows MSI, que no recibe secretos, puede compilar mientras espera la aprobacion. Tras la aprobacion de los required reviewers, se ejecutan Linux y Windows NSIS. El job `assemble`, con `contents: read`, se ejecuta en ambos modos y:
+Windows MSI, que no recibe secretos, puede compilar mientras espera la aprobacion. Tras la aprobacion de los required reviewers, se ejecutan Linux y Windows NSIS. El job `assemble`, con `contents: read`, se ejecuta solamente en `validate` y:
 
 1. Canonicaliza los nombres de assets.
 2. Verifica criptograficamente las cuatro firmas locales.
 3. Genera `latest.json` y valida version, nombres, URLs, firmas y conjunto exacto.
-4. Sube un artifact `release-candidate` con nueve assets nativos y `latest.json`.
+4. Calcula `SHA256SUMS`, escribe `candidate-provenance.json` con tag, SHA y run ID, y sube `release-candidate-<sha>` con esos dos registros y los nueve assets nativos mas `latest.json`.
 
-Solo en `publish`, un job separado con `contents: write` confirma de nuevo tag y commit, crea o reutiliza el borrador, sube el candidato, vuelve a descargarlo, compara los SHA-256 de los diez archivos y publica la release como `latest`.
+Solo en `publish`, un job separado con `contents: write` y environment `release-publication` descarga el artifact del run aprobado, confirma procedencia, tag, commit, conjunto, `SHA256SUMS` y firmas, crea o reutiliza el borrador, sube exclusivamente los diez archivos registrados, vuelve a descargarlos, compara sus SHA-256 y publica la release como `latest`. No instala dependencias ni ejecuta ningun comando de build.
 
 ## Artefactos esperados
 
@@ -333,6 +206,8 @@ latest.json
 ```
 
 Una version futura cambia solo el segmento de version. Los basenames, producto, arquitectura y locale deben coincidir exactamente. No son validos los formatos heredados `*.AppImage.tar.gz`, `*.AppImage.tar.gz.sig`, `*.nsis.zip` o `*.nsis.zip.sig`.
+
+El artifact interno de Actions contiene ademas `SHA256SUMS` y `candidate-provenance.json`. Son registros de handoff y no se publican como assets de GitHub Release; los diez archivos publicados deben coincidir byte por byte con las entradas de `SHA256SUMS`.
 
 | Plataforma | Instalacion manual | Updater |
 | --- | --- | --- |
@@ -367,7 +242,7 @@ Cancelar no revierte una release que ya alcanzo el paso final. Si fue publicada,
 
 ## Recuperacion de fallos
 
-- Antes del borrador: corregir variables, secrets, runner o incidencia transitoria y usar `Re-run failed jobs`, o `workflow_dispatch` con el mismo tag.
+- Antes del borrador: corregir variables, secrets, runner o incidencia transitoria y usar `Re-run failed jobs`, o `workflow_dispatch` con el mismo tag y el `candidate_run_id` aprobado.
 - Despues del borrador: conservarlo y reintentar. El workflow elimina assets remotos residuales, sube el conjunto local exacto y revalida.
 - Por version, tests, lockfiles o compilacion: corregir en `main`, incrementar otra vez la version y crear un tag nuevo. No retaggear.
 - Por intervencion manual que publico algo parcial: no confiar en ese canal. Retirarlo de `latest` si es imprescindible, investigar y publicar una version correctiva; clientes pueden haber descargado ya el manifiesto.
@@ -432,6 +307,7 @@ La `.sig` de Tauri autentica el artefacto para clientes que confian en la clave 
 - Habilitar immutable releases de GitHub para impedir cambios en tags y assets despues de publicar.
 - Proteger workflows y scripts de release mediante `CODEOWNERS` y revision obligatoria.
 - Mantener el environment `release` con required reviewers, deployments limitados a `main` y los secrets de firma como environment secrets siempre que sea posible.
+- Mantener `release-publication` separado, con required reviewers y deployments limitados a `main`, sin secrets de firma. Aprobar solamente el run ID cuya evidencia cerrada registra los mismos hashes.
 
 ## Diagnostico
 

@@ -29,7 +29,7 @@ import {
 import { useUpdater, type CartReportVersion } from "../updater/UpdaterContext";
 import type { Category } from "../../types/category";
 import type { Cart, CartDiscountQuote, CartDiscountType, CartLine, CashChangeQuote } from "../../types/cart";
-import type { ProductCodeMatch, ProductSelectorRow } from "../../types/product";
+import type { BaseUnit, ProductCodeMatch, ProductSelectorRow } from "../../types/product";
 import type { ProductPresentation } from "../../types/product_presentation";
 import type { PaymentMethod, SaleReceipt } from "../../types/sale";
 import type { User } from "../../types/user";
@@ -62,6 +62,13 @@ const paymentMethods: { value: PaymentMethod; label: string }[] = [
   { value: "tarjeta", label: "Tarjeta" },
   { value: "transferencia", label: "Transferencia" },
 ];
+
+const measuredQuantityLabels: Record<BaseUnit, string> = {
+  piece: "piezas",
+  gram: "gramos",
+  milliliter: "mililitros",
+  centimeter: "centimetros",
+};
 
 const clearedCart: Cart = {
   lines: [],
@@ -677,7 +684,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       </Modal>
 
       <Modal open={Boolean(quantityEditor)} onClose={() => setQuantityEditor(undefined)} closeDisabled={busy} title={quantityEditor?.currentQuantity ? "Editar cantidad" : "Capturar cantidad"} size="sm" footer={<><Button disabled={busy} onClick={() => setQuantityEditor(undefined)}>Cancelar</Button><Button variant="primary" loading={busy} onClick={() => void saveQuantity()}>Guardar cantidad</Button></>}>
-         {quantityEditor && <div><dl className="mb-4 grid gap-2 text-sm"><div className="flex justify-between gap-4"><dt className="text-muted">Producto</dt><dd className="font-semibold text-right">{quantityEditor.productName}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted">Presentacion</dt><dd className="font-semibold text-right">{quantityEditor.presentation.name}</dd></div></dl><Field data-autofocus label={quantityEditor.presentation.mode === "measured" ? (quantityEditor.baseUnit === "gram" ? "Cantidad en gramos" : "Cantidad en mililitros") : `Cantidad de ${fixedQuantityName(quantityEditor.presentation, quantityEditor.baseUnit)}`} value={quantityInput} onChange={(event) => { setQuantityInput(event.target.value); setQuantityError(""); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void saveQuantity(); } }} inputMode="numeric" pattern="[0-9]*" placeholder="0" disabled={busy} error={quantityError || undefined} required /><p className="mt-3 text-xs text-muted"><strong className="text-ink">Disponible:</strong> {availableQuantity(quantityEditor)}</p><p className="mt-2 text-xs text-muted">{presentationPriceLabel(quantityEditor.presentation, quantityEditor.baseUnit)}. Usa solo enteros positivos.</p></div>}
+         {quantityEditor && <div><dl className="mb-4 grid gap-2 text-sm"><div className="flex justify-between gap-4"><dt className="text-muted">Producto</dt><dd className="font-semibold text-right">{quantityEditor.productName}</dd></div><div className="flex justify-between gap-4"><dt className="text-muted">Presentacion</dt><dd className="font-semibold text-right">{quantityEditor.presentation.name}</dd></div></dl><Field data-autofocus label={quantityEditor.presentation.mode === "measured" ? `Cantidad en ${measuredQuantityLabels[quantityEditor.baseUnit]}` : `Cantidad de ${fixedQuantityName(quantityEditor.presentation, quantityEditor.baseUnit)}`} value={quantityInput} onChange={(event) => { setQuantityInput(event.target.value); setQuantityError(""); }} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void saveQuantity(); } }} inputMode="numeric" pattern="[0-9]*" placeholder="0" disabled={busy} error={quantityError || undefined} required /><p className="mt-3 text-xs text-muted"><strong className="text-ink">Disponible:</strong> {availableQuantity(quantityEditor)}</p><p className="mt-2 text-xs text-muted">{presentationPriceLabel(quantityEditor.presentation, quantityEditor.baseUnit)}. Usa solo enteros positivos.</p></div>}
       </Modal>
 
       <Modal open={Boolean(priceEditor)} onClose={() => setPriceEditor(undefined)} closeDisabled={busy} title="Cambiar precio" size="sm" footer={<><Button disabled={busy} onClick={() => setPriceEditor(undefined)}>Cancelar</Button><Button disabled={busy} onClick={() => void resetPrice()}>Restablecer precio de catalogo</Button><Button variant="primary" loading={busy} onClick={() => void savePrice()}>Guardar precio</Button></>}>
@@ -691,11 +698,15 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       <Modal open={Boolean(receipt)} onClose={() => setReceipt(undefined)} title="Venta completada" description={receipt ? formatDateTime(receipt.sale.sale_date) : undefined} size="sm" footer={<Button variant="primary" onClick={() => setReceipt(undefined)}>Cerrar recibo</Button>}>
         {receipt && <div><div className="rounded-card bg-brand-soft p-5 text-center"><span className="text-xs font-bold tracking-wider text-brand uppercase">Ticket POS-{String(receipt.sale.id).padStart(8, "0")}</span><strong className="mt-2 block font-heading text-3xl text-brand-dark">{formatMoney(receipt.sale.total)}</strong><span className="mt-1 block text-xs text-muted capitalize">{receipt.sale.payment_method}</span></div><div className="mt-4 divide-y divide-line">{receipt.details.map((detail) => {
           const mode = detail.presentation_mode ?? "fixed";
-          const baseUnit = detail.base_unit ?? "piece";
-          const presentationName = detail.presentation_name ?? "Unidad";
-          const enteredQuantity = detail.entered_quantity ?? detail.quantity;
+           const baseUnit = detail.base_unit ?? "piece";
+           const presentationName = detail.presentation_name ?? "Unidad";
+           const enteredQuantity = detail.entered_quantity ?? detail.quantity;
+            const hasMeasuredPriceBase = mode !== "measured" || (Number.isSafeInteger(detail.presentation_base_quantity) && detail.presentation_base_quantity! > 0);
            const priceBase = detail.presentation_base_quantity ?? detail.base_quantity ?? 1;
-           return <div key={detail.id} className="flex justify-between gap-4 py-3 text-sm"><span><strong className="block">{detail.product_name}</strong><span className="block text-xs text-muted">{presentationName} · {detail.sku}</span><span className="block text-xs text-muted">{formatEnteredQuantity(enteredQuantity, mode, presentationName, baseUnit)} · Aplicado: {presentationPriceLabel({ mode, name: presentationName, price: detail.unit_price, base_quantity: priceBase }, baseUnit)}</span>{detail.catalog_unit_price !== null && detail.catalog_unit_price !== detail.unit_price && <span className="block text-xs text-muted">Catalogo: {presentationPriceLabel({ mode, name: presentationName, price: detail.catalog_unit_price, base_quantity: priceBase }, baseUnit)}</span>}</span><strong className="shrink-0">{detail.line_total === null ? "No representable" : formatMoney(detail.line_total)}</strong></div>;
+           const priceLabel = (price: number) => hasMeasuredPriceBase
+             ? presentationPriceLabel({ mode, name: presentationName, price, base_quantity: priceBase }, baseUnit)
+             : `${formatMoney(price)} · base no disponible`;
+             return <div key={detail.id} className="flex justify-between gap-4 py-3 text-sm"><span><strong className="block">{detail.product_name}</strong><span className="block text-xs text-muted">{presentationName} · {detail.sku}</span><span className="block text-xs text-muted">{formatEnteredQuantity(enteredQuantity, mode, presentationName, baseUnit)} · Aplicado: {priceLabel(detail.unit_price)}</span>{detail.catalog_unit_price !== null && detail.catalog_unit_price !== detail.unit_price && <span className="block text-xs text-muted">Catalogo: {priceLabel(detail.catalog_unit_price)}</span>}<span className="block text-xs text-muted">Costo de inventario: {detail.movement_cost_cents === null ? "Desconocido" : formatMoney(detail.movement_cost_cents)}</span></span><strong className="shrink-0">{detail.line_total === null ? "No representable" : formatMoney(detail.line_total)}</strong></div>;
         })}</div><dl className="mt-4 grid gap-2 border-t border-line pt-4 text-sm"><div className="flex justify-between"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(receipt.sale.subtotal)}</dd></div>{receipt.sale.discount_type !== "none" && <div className="flex justify-between text-danger"><dt>{discountLabel(receipt.sale.discount_type, receipt.sale.discount_value)}</dt><dd className="font-semibold">-{formatMoney(receipt.sale.discount_amount)}</dd></div>}<div className="flex justify-between font-bold"><dt>Total</dt><dd>{formatMoney(receipt.sale.total)}</dd></div>{receipt.sale.change_amount !== null && <div className="flex justify-between border-t border-line pt-3"><dt>Cambio</dt><dd>{formatMoney(receipt.sale.change_amount)}</dd></div>}</dl></div>}
       </Modal>
 

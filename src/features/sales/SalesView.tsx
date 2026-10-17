@@ -223,28 +223,33 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
              <div className="mt-5 overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Lineas del ticket desplazables" tabIndex={0}>
                <table className="w-full min-w-[780px] text-left text-sm">
                  <caption className="sr-only">Lineas historicas del ticket {detail.ticket_number}</caption>
-                 <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-3 py-3">Producto</th><th className="border-b border-line px-3 py-3">Presentacion</th><th className="border-b border-line px-3 py-3 text-right">Cantidad</th><th className="border-b border-line px-3 py-3 text-right">Precio unitario</th><th className="border-b border-line px-3 py-3 text-right">Total de linea</th></tr></thead>
+                 <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-3 py-3">Producto</th><th className="border-b border-line px-3 py-3">Presentacion</th><th className="border-b border-line px-3 py-3 text-right">Cantidad</th><th className="border-b border-line px-3 py-3 text-right">Precio al cliente</th><th className="border-b border-line px-3 py-3 text-right">Total de linea</th><th className="border-b border-line px-3 py-3 text-right">Costo de inventario</th></tr></thead>
                  <tbody>{detail.lines.map((line, index) => {
                    const hasPresentationSnapshot = line.presentation_name !== null && line.presentation_mode !== null && line.base_unit !== null;
                    const enteredQuantity = hasPresentationSnapshot
                      ? formatEnteredQuantity(line.entered_quantity, line.presentation_mode!, line.presentation_name!, line.base_unit!)
                      : `${line.quantity} ${line.quantity === 1 ? "unidad" : "unidades"}`;
-                   const showBaseQuantity = hasPresentationSnapshot && line.presentation_mode === "fixed" && line.base_consumed !== line.entered_quantity;
-                    const unitPrice = hasPresentationSnapshot && line.presentation_mode === "measured"
-                       ? formatPricePerUnit(line.unit_price, line.base_unit!, line.presentation_base_quantity!)
-                     : line.presentation_name
-                       ? `${formatMoney(line.unit_price)} por ${line.presentation_name}`
-                       : formatMoney(line.unit_price);
+                    const showBaseQuantity = hasPresentationSnapshot && line.presentation_mode === "fixed" && line.base_consumed !== line.entered_quantity;
+                     const hasMeasuredPriceBase = Number.isSafeInteger(line.presentation_base_quantity) && line.presentation_base_quantity! > 0;
+                     const unitPrice = hasPresentationSnapshot && line.presentation_mode === "measured" && hasMeasuredPriceBase
+                        ? formatPricePerUnit(line.unit_price, line.base_unit!, line.presentation_base_quantity!)
+                      : hasPresentationSnapshot && line.presentation_mode === "measured"
+                        ? `${formatMoney(line.unit_price)} · base no disponible`
+                      : line.presentation_name
+                        ? `${formatMoney(line.unit_price)} por ${line.presentation_name}`
+                        : formatMoney(line.unit_price);
 
-                    const catalogPrice = line.catalog_unit_price !== null && line.catalog_unit_price !== line.unit_price
-                      ? hasPresentationSnapshot && line.presentation_mode === "measured"
-                        ? formatPricePerUnit(line.catalog_unit_price, line.base_unit!, line.presentation_base_quantity!)
-                        : line.presentation_name
-                          ? `${formatMoney(line.catalog_unit_price)} por ${line.presentation_name}`
-                          : formatMoney(line.catalog_unit_price)
+                     const catalogPrice = line.catalog_unit_price !== null && line.catalog_unit_price !== line.unit_price
+                       ? hasPresentationSnapshot && line.presentation_mode === "measured" && hasMeasuredPriceBase
+                         ? formatPricePerUnit(line.catalog_unit_price, line.base_unit!, line.presentation_base_quantity!)
+                         : hasPresentationSnapshot && line.presentation_mode === "measured"
+                           ? `${formatMoney(line.catalog_unit_price)} · base no disponible`
+                         : line.presentation_name
+                           ? `${formatMoney(line.catalog_unit_price)} por ${line.presentation_name}`
+                           : formatMoney(line.catalog_unit_price)
                       : null;
 
-                    return <tr key={line.presentation_id ?? `legacy-line-${index}`}><td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="text-xs text-muted">{line.sku}</span></td><td className="border-b border-line px-3 py-4"><strong className="block text-sm">{line.presentation_name ?? "Sin presentacion registrada"}</strong>{line.presentation_barcode && <span className="text-xs text-muted">{line.presentation_barcode}</span>}</td><td className="border-b border-line px-3 py-4 text-right"><span className="block font-semibold">{enteredQuantity}</span>{showBaseQuantity && <span className="text-xs text-muted">Base: {formatBaseQuantity(line.base_consumed, line.base_unit!)}</span>}</td><td className="border-b border-line px-3 py-4 text-right"><span className="block">Aplicado: {unitPrice}</span>{catalogPrice && <span className="mt-1 block text-xs text-muted">Catalogo: {catalogPrice}</span>}</td><td className="border-b border-line px-3 py-4 text-right font-bold">{line.subtotal === null ? "No representable" : formatMoney(line.subtotal)}</td></tr>;
+                     return <tr key={line.presentation_id ?? `legacy-line-${index}`}><td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="text-xs text-muted">{line.sku}</span></td><td className="border-b border-line px-3 py-4"><strong className="block text-sm">{line.presentation_name ?? "Sin presentacion registrada"}</strong>{line.presentation_barcode && <span className="text-xs text-muted">{line.presentation_barcode}</span>}</td><td className="border-b border-line px-3 py-4 text-right"><span className="block font-semibold">{enteredQuantity}</span>{showBaseQuantity && <span className="text-xs text-muted">Base: {formatBaseQuantity(line.base_consumed, line.base_unit!)}</span>}</td><td className="border-b border-line px-3 py-4 text-right"><span className="block">Aplicado: {unitPrice}</span>{catalogPrice && <span className="mt-1 block text-xs text-muted">Catalogo: {catalogPrice}</span>}</td><td className="border-b border-line px-3 py-4 text-right font-bold">{line.subtotal === null ? "No representable" : formatMoney(line.subtotal)}</td><td className="border-b border-line px-3 py-4 text-right">{line.movement_cost_cents === null ? <span className="text-warning">Desconocido</span> : formatMoney(line.movement_cost_cents)}</td></tr>;
                  })}</tbody>
                </table>
              </div>

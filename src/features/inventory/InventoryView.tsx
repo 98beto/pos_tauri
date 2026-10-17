@@ -7,7 +7,7 @@ import type { InventoryMovement, InventoryMovementPresentation, InventoryMovemen
 import type { BaseUnit, InventoryCostStatus } from "../../types/product";
 import type { User } from "../../types/user";
 import { ProductInventoryDetail } from "./ProductInventoryDetail";
-import { clearPendingManualMovement, manualMovementInput, readPendingManualMovement, replacePendingManualMovement, savePendingManualMovement, type PendingManualMovement, type PendingManualMovementV2 } from "./manual-movement-intent";
+import { clearPendingManualMovement, manualMovementInput, readPendingManualMovement, replacePendingManualMovement, savePendingManualMovement, type PendingManualMovement, type PendingManualMovementV4 } from "./manual-movement-intent";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
 type Props = { user: User; onNotice: (notice: Notice) => void; onSessionRequired: () => void };
@@ -22,12 +22,14 @@ const operations: Record<Operation, { reason: "compra" | "ajuste" | "valoracion"
   valuation: { reason: "valoracion", type: "valoracion" },
 };
 const selectClass = "h-11 w-full rounded-control border border-line-strong bg-surface px-3 text-sm text-ink outline-none transition focus:border-brand focus:ring-3 focus:ring-brand/12 disabled:bg-surface-soft";
-const unitLabels: Record<BaseUnit, string> = { piece: "Piezas", gram: "Gramos", milliliter: "Mililitros" };
-const directQuantityLabels: Record<BaseUnit, string> = { piece: "Cantidad en piezas", gram: "Cantidad en gramos", milliliter: "Cantidad en mililitros" };
+const unitLabels: Record<BaseUnit, string> = { piece: "Piezas", gram: "Gramos", milliliter: "Mililitros", centimeter: "Centimetros" };
+const directQuantityLabels: Record<BaseUnit, string> = { piece: "Cantidad en piezas", gram: "Cantidad en gramos", milliliter: "Cantidad en mililitros", centimeter: "Cantidad en centimetros" };
+const directCaptureTitles: Record<BaseUnit, string> = { piece: "Piezas individuales", gram: "Captura directa en gramos", milliliter: "Captura directa en mililitros", centimeter: "Captura directa en centimetros" };
+const directCaptureDescriptions: Record<BaseUnit, string> = { piece: "La cantidad se registra directamente en piezas.", gram: "Captura directamente los gramos.", milliliter: "Captura directamente los mililitros.", centimeter: "Captura directamente los centimetros." };
 const reasonLabels: Record<InventoryMovement["reason"], string> = { compra: "Compra", venta: "Venta", ajuste: "Ajuste", valoracion: "Valoracion" };
 const movementRequests = new Map<string, Promise<InventoryMovement>>();
 
-function submitMovementOnce(intent: PendingManualMovement) {
+function submitMovementOnce(intent: PendingManualMovementV4) {
   const key = `${intent.userId}:${intent.operationToken}`;
   const active = movementRequests.get(key);
   if (active) return active;
@@ -123,7 +125,14 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
         type: (movementType || undefined) as InventoryMovement["type"] | undefined,
       });
       if (viewRequest.current !== request) return "stale";
-      setView(next);
+      setView({
+        ...next,
+        movements: next.movements.map((movement) => ({
+          ...movement,
+          product_name: movement.product_name_snapshot,
+          sku: movement.sku_snapshot,
+        })),
+      });
       return "success";
     } catch (value: unknown) {
       if (viewRequest.current !== request) return "stale";
@@ -245,7 +254,7 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
   function openMovement() { resetMovementForm(); setMovementOpen(true); }
   function closeMovement() { if (saveInFlight.current) return; setMovementOpen(false); resetMovementForm(); }
 
-  async function submitIntent(intent: PendingManualMovement, legacyPresentationId: number | null = null) {
+  async function submitIntent(intent: PendingManualMovementV4) {
     if (saveInFlight.current || intent.userId !== user.id) return;
     const requestLifetime = lifetime.current;
     saveInFlight.current = true; setSaving(true); setMovementError(""); setQuantityError(""); setUnitPriceError(""); setIntentCanBeDiscarded(false);
@@ -264,35 +273,7 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
       if (isSessionRequired(value)) { setMovementOpen(false); onSessionRequired(); }
       else {
         const message = errorMessage(value, "No se pudo confirmar el movimiento. El registro pendiente se conservo para reintentar.");
-        if (intent.version === 1 && isAppError(value) && value.code === "INVENTORY_LEGACY_REQUOTE_REQUIRED") {
-          setDraftOperationToken(intent.operationToken);
-          invalidateQuote();
-          if (intent.type === "entrada") {
-            setMovementError("Completa el precio de compra y revisa el importe antes de confirmar.");
-            window.requestAnimationFrame(() => unitPriceRef.current?.focus());
-            return;
-          }
-          try {
-            const next = await quoteInventoryMovement({
-              product_id: intent.productId,
-              presentation_id: legacyPresentationId,
-              reason: intent.reason,
-              type: intent.type,
-              quantity: intent.quantity,
-              unit_price: null,
-            });
-            if (mounted.current && lifetime.current === requestLifetime) {
-              setQuote(next);
-              setMovementError("Revisa el importe actualizado y confirma el movimiento.");
-            }
-          } catch (quoteError: unknown) {
-            if (mounted.current && lifetime.current === requestLifetime) {
-              setMovementError(errorMessage(quoteError, "Calcula nuevamente el importe antes de confirmar."));
-            }
-          }
-          return;
-        }
-        if (intent.version === 2 && isAppError(value) && ["QUOTE_CHANGED", "INVENTORY_QUOTE_REQUIRED"].includes(value.code)) {
+        if (isAppError(value) && ["QUOTE_CHANGED", "INVENTORY_QUOTE_REQUIRED"].includes(value.code)) {
           setDraftOperationToken(intent.operationToken);
           invalidateQuote();
           try {
@@ -303,6 +284,9 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
               type: intent.type,
               quantity: intent.quantity,
               unit_price: intent.unitPrice,
+              supplier: intent.supplier,
+              document_reference: intent.documentReference,
+              note: intent.note,
             });
             if (mounted.current && lifetime.current === requestLifetime) {
               setQuote(next);
@@ -336,7 +320,7 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
     }
     if (!result || !mounted.current) return;
     setMovementOpen(false); resetMovementForm();
-    const confirmed = result.movement_cost_cents === null ? "" : ` Importe confirmado: ${formatMoney(result.movement_cost_cents)}.`;
+    const confirmed = result.movement_cost_cents == null ? "" : ` Costo del movimiento: ${formatMoney(result.movement_cost_cents)}.`;
     onNotice({ tone: "success", message: `Movimiento de inventario registrado.${confirmed}` });
     if (await loadView() === "error") onNotice({ tone: "info", message: "El movimiento se guardo, pero no se pudo recargar el inventario; usa Reintentar." });
   }
@@ -344,10 +328,11 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
   async function recoverIntent(intent: PendingManualMovement) {
     const requestLifetime = lifetime.current;
     const request = ++productsRequest.current;
-    setProductId(String(intent.productId)); setPresentationId(intent.version === 2 && intent.presentationId ? String(intent.presentationId) : "");
+    setProductId(String(intent.productId)); setPresentationId(intent.version !== 1 && intent.presentationId ? String(intent.presentationId) : "");
     setOperation(operationFor(intent)); setQuantity(intent.quantity);
-    setUnitPrice(intent.version === 2 ? intent.unitPrice ?? "" : ""); setSupplier(intent.version === 2 ? intent.supplier ?? "" : "");
-    setDocumentReference(intent.version === 2 ? intent.documentReference ?? "" : ""); setNote(intent.version === 2 ? intent.note ?? "" : "");
+    setUnitPrice(intent.version === 2 || intent.version === 4 ? intent.unitPrice ?? "" : "");
+    setSupplier(intent.version !== 1 ? intent.supplier ?? "" : "");
+    setDocumentReference(intent.version !== 1 ? intent.documentReference ?? "" : ""); setNote(intent.version !== 1 ? intent.note ?? "" : "");
     setQuote(undefined); setMovementError(""); setQuantityError(""); setUnitPriceError(""); setMovementOpen(true); setProductsLoading(true);
     try {
       let page = 1;
@@ -364,11 +349,43 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
         return;
       }
       const recoveredPresentationId = intent.version === 1
-        ? recoveredProduct.presentations.find((presentation) => presentation.is_active && presentation.mode === "fixed" && presentation.base_quantity === 1)?.id ?? null
-        : intent.presentationId;
+        ? recoveredProduct.base_unit === "piece"
+          ? recoveredProduct.presentations.find((presentation) => presentation.is_active && presentation.mode === "fixed" && presentation.base_quantity === 1)?.id ?? null
+          : null
+        : intent.version === 2 && intent.presentationId !== null
+          ? recoveredProduct.presentations.some((presentation) =>
+              presentation.id === intent.presentationId && presentation.is_active &&
+              (recoveredProduct.base_unit === "piece" || presentation.mode === "measured"),
+            ) ? intent.presentationId : null
+          : intent.presentationId;
       setProducts([recoveredProduct]);
       setPresentationId(recoveredPresentationId === null ? "" : String(recoveredPresentationId));
-      await submitIntent(intent, recoveredPresentationId);
+      if (intent.version === 4) {
+        await submitIntent(intent);
+        return;
+      }
+      const recoveredUnitPrice = intent.version === 2 ? intent.unitPrice : null;
+      if (intent.type === "entrada" && !recoveredUnitPrice) {
+        setDraftOperationToken(intent.operationToken);
+        setMovementError("Revisa el contexto y captura nuevamente el precio de compra antes de cotizar.");
+        window.requestAnimationFrame(() => unitPriceRef.current?.focus());
+        return;
+      }
+      const next = await quoteInventoryMovement({
+        product_id: intent.productId,
+        presentation_id: intent.type === "valoracion" ? null : recoveredPresentationId,
+        reason: intent.reason,
+        type: intent.type,
+        quantity: intent.quantity,
+        unit_price: intent.type === "salida" ? null : recoveredUnitPrice,
+        supplier: intent.version === 1 ? null : intent.supplier,
+        document_reference: intent.version === 1 ? null : intent.documentReference,
+        note: intent.version === 1 ? null : intent.note,
+      });
+      if (lifetime.current !== requestLifetime || productsRequest.current !== request) return;
+      setDraftOperationToken(intent.operationToken);
+      setQuote(next);
+      setMovementError("El movimiento pendiente se recupero como contexto. Revisa la cotizacion y confirma nuevamente.");
     } catch (value: unknown) {
       if (lifetime.current !== requestLifetime || productsRequest.current !== request) return;
       if (isSessionRequired(value)) { setMovementOpen(false); onSessionRequired(); }
@@ -390,7 +407,7 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
     event.preventDefault();
     if (saveInFlight.current) return;
     if (cleanupRequired) { await retryCleanup(); return; }
-    if (pendingIntent && !draftOperationToken) { await submitIntent(pendingIntent); return; }
+    if (pendingIntent?.version === 4 && !draftOperationToken) { await submitIntent(pendingIntent); return; }
     if (!productId) { setMovementError("Selecciona un producto."); return; }
     const kind = operations[operation];
     if (!quote) {
@@ -400,7 +417,8 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
         const next = await quoteInventoryMovement({
           product_id: Number(productId), presentation_id: operation === "valuation" || !presentationId ? null : Number(presentationId),
           ...kind, quantity: operation === "valuation" ? "0" : quantity,
-          unit_price: operation === "adjustment-out" ? null : unitPrice,
+          unit_price: operation === "adjustment-out" ? null : unitPrice, supplier: supplier || null,
+          document_reference: documentReference || null, note: note || null,
         });
         if (quoteRequest.current === request) setQuote(next);
       } catch (value: unknown) {
@@ -409,16 +427,17 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
         else {
           const message = errorMessage(value, "No se pudo calcular el movimiento.");
           if (isAppError(value) && value.field === "quantity") setQuantityError(message);
-          else if (isAppError(value) && value.field === "unit_price") setUnitPriceError(message);
+          else if (isAppError(value) && value.field === "unit_price") { setUnitPriceError(message); window.requestAnimationFrame(() => unitPriceRef.current?.focus()); }
           else setMovementError(message);
         }
       } finally { if (quoteRequest.current === request) setQuoteLoading(false); }
       return;
     }
-    const intent: PendingManualMovementV2 = {
-      version: 2, userId: user.id, operationToken: draftOperationToken ?? crypto.randomUUID(), productId: Number(productId),
+    const intent: PendingManualMovementV4 = {
+      version: 4, userId: user.id, operationToken: draftOperationToken ?? crypto.randomUUID(), productId: Number(productId),
       presentationId: operation === "valuation" || !presentationId ? null : Number(presentationId), ...kind,
-      quantity: operation === "valuation" ? "0" : quantity, unitPrice: operation === "adjustment-out" ? null : unitPrice,
+      quantity: operation === "valuation" ? "0" : quantity,
+      unitPrice: operation === "adjustment-out" ? null : unitPrice,
       supplier: supplier || null, documentReference: documentReference || null, note: note || null,
       quoteFingerprint: quote.quote_fingerprint,
     };
@@ -439,45 +458,45 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
   }
 
   const selectedProduct = products.find((product) => product.id === Number(productId));
-  const activePresentations = selectedProduct?.presentations.filter((presentation) => presentation.is_active) ?? [];
+  const activePresentations = selectedProduct?.presentations.filter((presentation) =>
+    presentation.is_active && (selectedProduct.base_unit === "piece" || presentation.mode === "measured"),
+  ) ?? [];
   const needsCost = operation !== "adjustment-out";
   const isValuation = operation === "valuation";
   const pageSize = view?.page_size ?? 20;
   const selectedPresentation = activePresentations.find((presentation) => presentation.id === Number(presentationId));
-  const selectedIsDirectCapture = Boolean(selectedProduct) && (!selectedPresentation || selectedPresentation.mode === "measured" || (
-    selectedPresentation.mode === "fixed" && selectedPresentation.base_quantity === 1 && selectedProduct?.base_unit !== "piece"
-  ));
-  const directCaptureIsDuplicated = activePresentations.some((presentation) => presentation.mode === "fixed" && presentation.base_quantity === 1);
+  const selectedIsDirectCapture = Boolean(selectedProduct) && (!selectedPresentation || selectedPresentation.mode === "measured");
+  const directCaptureIsDuplicated = selectedProduct?.base_unit === "piece" && activePresentations.some((presentation) => presentation.mode === "fixed" && presentation.base_quantity === 1);
   const captureOptions: Array<{ key: string; presentation: InventoryMovementPresentation | null; title: string; description: string }> = [];
   if (selectedProduct && !directCaptureIsDuplicated) {
     captureOptions.push({
       key: "base",
       presentation: null,
-      title: selectedProduct.base_unit === "piece" ? "Piezas individuales" : selectedProduct.base_unit === "gram" ? "Captura directa en gramos" : "Captura directa en mililitros",
-      description: selectedProduct.base_unit === "piece" ? "La cantidad se registra directamente en piezas." : selectedProduct.base_unit === "gram" ? "Captura directamente los gramos." : "Captura directamente los mililitros.",
+      title: directCaptureTitles[selectedProduct.base_unit],
+      description: directCaptureDescriptions[selectedProduct.base_unit],
     });
   }
   let includedEquivalentBase = false;
   for (const presentation of activePresentations) {
-    const equivalentBase = presentation.mode === "fixed" && presentation.base_quantity === 1;
+    const equivalentBase = selectedProduct?.base_unit === "piece" && presentation.mode === "fixed" && presentation.base_quantity === 1;
     if (equivalentBase && includedEquivalentBase) continue;
     if (equivalentBase) includedEquivalentBase = true;
     captureOptions.push({
       key: String(presentation.id),
       presentation,
-      title: equivalentBase ? selectedProduct?.base_unit === "piece" ? "Piezas individuales" : selectedProduct?.base_unit === "gram" ? "Captura directa en gramos" : "Captura directa en mililitros" : presentation.name,
+      title: equivalentBase ? directCaptureTitles[selectedProduct!.base_unit] : presentation.name,
       description: equivalentBase
-        ? selectedProduct?.base_unit === "piece" ? "La cantidad se registra directamente en piezas." : selectedProduct?.base_unit === "gram" ? "Captura directamente los gramos." : "Captura directamente los mililitros."
+        ? directCaptureDescriptions[selectedProduct!.base_unit]
         : presentation.mode === "fixed"
           ? `Cada ${presentation.name} agrega o retira ${formatBaseQuantity(presentation.base_quantity, selectedProduct!.base_unit)}.`
-          : selectedProduct?.base_unit === "gram"
-            ? `Captura directamente los gramos. El precio corresponde a ${formatBaseQuantity(presentation.base_quantity, "gram")}.`
-            : `Captura directamente los mililitros. El precio corresponde a ${formatBaseQuantity(presentation.base_quantity, "milliliter")}.`,
+          : `${directCaptureDescriptions[selectedProduct!.base_unit]} El precio corresponde a ${formatBaseQuantity(presentation.base_quantity, selectedProduct!.base_unit)}.`,
     });
   }
 
   function selectProduct(product: InventoryMovementProduct) {
-    const equivalentBase = product.presentations.find((presentation) => presentation.is_active && presentation.mode === "fixed" && presentation.base_quantity === 1);
+    const equivalentBase = product.base_unit === "piece"
+      ? product.presentations.find((presentation) => presentation.is_active && presentation.mode === "fixed" && presentation.base_quantity === 1)
+      : undefined;
     setProductId(String(product.id)); setPresentationId(equivalentBase ? String(equivalentBase.id) : ""); setSelectorOpen(false); setMovementError(""); invalidateQuote();
   }
 
@@ -527,30 +546,28 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
     : selectedPresentation
       ? selectedPresentation.base_quantity === 1 && selectedProduct?.base_unit === "piece" ? "Cantidad de piezas" : "Cantidad de paquetes"
       : `Cantidad en ${selectedProduct ? unitLabels[selectedProduct.base_unit].toLowerCase() : "unidad base"}`;
-  const purchasePriceLabel = selectedIsDirectCapture
-    ? selectedPresentation?.mode === "measured"
-      ? `Precio de compra por ${selectedPresentation.base_quantity} ${selectedProduct?.base_unit === "gram" ? "gramos" : "mililitros"}`
-      : `Precio de compra por ${selectedProduct?.base_unit === "gram" ? "gramo" : selectedProduct?.base_unit === "milliliter" ? "mililitro" : "pieza"}`
-    : selectedPresentation
-      ? selectedPresentation.base_quantity === 1 && selectedProduct?.base_unit === "piece" ? "Precio de compra por pieza" : "Precio de compra por paquete"
-      : `Precio de compra por ${selectedProduct?.base_unit === "gram" ? "gramo" : selectedProduct?.base_unit === "milliliter" ? "mililitro" : "pieza"}`;
-
+  const purchasePriceLabel = selectedPresentation?.mode === "fixed"
+    ? `Precio de compra por ${selectedPresentation.name}`
+    : selectedPresentation?.mode === "measured" && selectedProduct
+      ? `Precio de compra por ${formatBaseQuantity(selectedPresentation.base_quantity, selectedProduct.base_unit)}`
+      : `Precio de compra por ${selectedProduct ? unitLabels[selectedProduct.base_unit].toLowerCase().replace(/s$/, "") : "unidad base"}`;
   return (
     <main id="main-content" tabIndex={-1} className="p-4 outline-none sm:p-6 min-[900px]:p-8">
       {selectedProductId ? <ProductInventoryDetail productId={selectedProductId} onBack={backFromDetail} onSessionRequired={onSessionRequired} /> : <>
-        {pendingIntent && <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-warning/30 bg-warning-soft p-4" role="status"><div><strong className="text-sm text-ink">{cleanupRequired ? "Movimiento confirmado con recuperacion pendiente" : "Movimiento pendiente"}</strong><p className="mt-1 text-xs text-muted">{cleanupRequired ? "El movimiento no se repetira; solo falta retirar el registro local." : "Puedes revisar los datos o reintentar el envio de forma segura."}</p></div><div className="flex flex-wrap gap-2">{cleanupRequired ? <Button disabled={saving} onClick={() => void retryCleanup()}>Reintentar limpieza</Button> : <Button disabled={saving || productsLoading} onClick={() => void recoverIntent(pendingIntent)}>{pendingIntent.version === 1 && pendingIntent.type === "entrada" ? "Revisar y completar" : "Reintentar envio"}</Button>}{intentCanBeDiscarded && !cleanupRequired && <Button variant="ghost" disabled={saving} onClick={() => { setMovementOpen(false); setDiscardOpen(true); }}>Descartar pendiente</Button>}</div></section>}
+        {pendingIntent && <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-warning/30 bg-warning-soft p-4" role="status"><div><strong className="text-sm text-ink">{cleanupRequired ? "Movimiento confirmado con recuperacion pendiente" : "Movimiento pendiente"}</strong><p className="mt-1 text-xs text-muted">{cleanupRequired ? "El movimiento no se repetira; solo falta retirar el registro local." : pendingIntent.version === 4 ? "Puedes revisar los datos o reintentar el envio de forma segura." : "Se recuperara solo como contexto y debera revisarse y cotizarse de nuevo."}</p></div><div className="flex flex-wrap gap-2">{cleanupRequired ? <Button disabled={saving} onClick={() => void retryCleanup()}>Reintentar limpieza</Button> : <Button disabled={saving || productsLoading} onClick={() => void recoverIntent(pendingIntent)}>{pendingIntent.version === 4 ? "Reintentar envio" : "Revisar y completar"}</Button>}{intentCanBeDiscarded && !cleanupRequired && <Button variant="ghost" disabled={saving} onClick={() => { setMovementOpen(false); setDiscardOpen(true); }}>Descartar pendiente</Button>}</div></section>}
 
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-busy={loading}>
           <StatCard label="Productos" value={view?.stats.product_count ?? "-"} />
           <StatCard label="Existencia en piezas" value={view ? formatBaseQuantity(view.stats.piece_stock, "piece") : "-"} />
           <StatCard label="Existencia por peso" value={view ? formatBaseQuantity(view.stats.gram_stock, "gram") : "-"} />
           <StatCard label="Existencia por volumen" value={view ? formatBaseQuantity(view.stats.milliliter_stock, "milliliter") : "-"} />
-          <StatCard label="Valor total a costo" value={view ? formatMoney(view.stats.inventory_value_cents) : "-"} detail="No incluye productos sin costo" />
-          <StatCard label="Sin costo registrado" value={view?.stats.products_without_cost ?? "-"} detail="Productos fuera del valor total" />
+          <StatCard label="Existencia por longitud" value={view ? formatBaseQuantity(view.stats.centimeter_stock, "centimeter") : "-"} />
+          <StatCard label="Valor total a costo" value={view ? formatMoney(view.stats.inventory_value_cents) : "-"} detail="No incluye productos con costo desconocido." />
+          <StatCard label="Costo desconocido" value={view?.stats.products_without_cost ?? "-"} detail="Productos fuera del valor total." />
         </div>
 
         <section className="mt-5 overflow-hidden rounded-card border border-line bg-surface">
-          <div className="flex flex-wrap items-end justify-between gap-3 border-b border-line p-4 sm:p-5"><div><h1 className="font-heading text-2xl font-bold">Inventario</h1><p className="mt-1 text-xs text-muted">Existencias, costos y movimientos por producto.</p></div><Button variant="primary" onClick={openMovement} disabled={Boolean(pendingIntent)}>Registrar movimiento</Button></div>
+          <div className="flex flex-wrap items-end justify-between gap-3 border-b border-line p-4 sm:p-5"><div><h1 className="font-heading text-2xl font-bold">Inventario</h1><p className="mt-1 text-xs text-muted">Existencias y costos acumulados por producto.</p></div><Button variant="primary" onClick={openMovement} disabled={Boolean(pendingIntent)}>Registrar movimiento</Button></div>
           <div className="border-b border-line px-4 pt-3" role="tablist" aria-label="Secciones de inventario"><button id="inventory-products-tab" role="tab" aria-selected={tab === "products"} aria-controls="inventory-products-panel" tabIndex={tab === "products" ? 0 : -1} className={`mr-2 border-b-2 px-4 py-3 text-sm font-bold ${tab === "products" ? "border-brand text-brand" : "border-transparent text-muted"}`} onClick={() => setTab("products")} onKeyDown={handleTabKeyDown}>Productos</button><button id="inventory-movements-tab" role="tab" aria-selected={tab === "movements"} aria-controls="inventory-movements-panel" tabIndex={tab === "movements" ? 0 : -1} className={`border-b-2 px-4 py-3 text-sm font-bold ${tab === "movements" ? "border-brand text-brand" : "border-transparent text-muted"}`} onClick={() => setTab("movements")} onKeyDown={handleTabKeyDown}>Movimientos</button></div>
 
           {error && <div className="m-4 flex flex-wrap items-center justify-between gap-3 rounded-control border border-danger/25 bg-danger-soft px-4 py-3 text-sm text-danger" role="alert"><span>{error}</span><Button size="sm" onClick={() => void loadView()} disabled={loading}>Reintentar</Button></div>}
@@ -558,14 +575,14 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
           {loading && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Actualizando; se muestran temporalmente los resultados anteriores.</p>}
 
           <div id="inventory-products-panel" role="tabpanel" aria-labelledby="inventory-products-tab" hidden={tab !== "products"}>
-            <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3"><Field label="Buscar producto" value={productSearch} onChange={(event) => updateProductFilter(setProductSearch, event.target.value)} placeholder="Nombre o SKU" /><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Unidad base<select className={selectClass} value={productUnit} onChange={(event) => updateProductFilter(setProductUnit, event.target.value)}><option value="">Todas</option><option value="piece">Pieza</option><option value="gram">Gramo</option><option value="milliliter">Mililitro</option></select></label><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Estado de costo<select className={selectClass} value={costStatus} onChange={(event) => updateProductFilter(setCostStatus, event.target.value)}><option value="">Todos</option><option value="known">Con costo</option><option value="unknown">Sin costo registrado</option></select></label></div>
-            <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Productos de inventario desplazables" aria-busy={loading} tabIndex={0}>{!view && loading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.products.length ? <table className="w-full min-w-[760px] text-left text-sm"><caption className="sr-only">Productos en inventario</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Unidad</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3 text-right">Valor a costo</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{view.products.map((product) => <tr key={product.id} className="hover:bg-surface-soft/60"><td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="font-mono text-xs text-muted">{product.sku}</span></td><td className="border-b border-line px-5 py-4">{unitLabels[product.base_unit]}</td><td className="border-b border-line px-5 py-4 text-right font-bold">{formatBaseQuantity(product.stock, product.base_unit)}</td><td className="border-b border-line px-5 py-4 text-right">{product.inventory_cost_cents === null ? <span className="text-warning">Sin costo registrado</span> : formatMoney(product.inventory_cost_cents)}</td><td className="border-b border-line px-5 py-4 text-right"><Button size="sm" aria-label={`Ver inventario de ${product.name}`} data-inventory-product={product.id} onClick={() => showDetail(product.id, String(product.id))}>Ver inventario</Button></td></tr>)}</tbody></table> : !loading && !error ? <EmptyState title="No hay productos con estos filtros" description="Cambia la busqueda o los filtros para ampliar los resultados." icon="□" /> : null}</div>
+            <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3"><Field label="Buscar producto" value={productSearch} onChange={(event) => updateProductFilter(setProductSearch, event.target.value)} placeholder="Nombre o SKU" /><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Unidad base<select className={selectClass} value={productUnit} onChange={(event) => updateProductFilter(setProductUnit, event.target.value)}><option value="">Todas</option><option value="piece">Pieza</option><option value="gram">Gramo</option><option value="milliliter">Mililitro</option><option value="centimeter">Centimetro</option></select></label><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Estado de costo<select className={selectClass} value={costStatus} onChange={(event) => updateProductFilter(setCostStatus, event.target.value)}><option value="">Todos</option><option value="known">Con costo conocido</option><option value="unknown">Costo desconocido</option></select></label></div>
+            <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Productos de inventario desplazables" aria-busy={loading} tabIndex={0}>{!view && loading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.products.length ? <table className="w-full min-w-[760px] text-left text-sm"><caption className="sr-only">Productos en inventario</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Unidad</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3 text-right">Costo promedio</th><th className="border-b border-line px-5 py-3 text-right">Valor a costo</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{view.products.map((product) => <tr key={product.id} className="hover:bg-surface-soft/60"><td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="font-mono text-xs text-muted">{product.sku}</span></td><td className="border-b border-line px-5 py-4">{unitLabels[product.base_unit]}</td><td className="border-b border-line px-5 py-4 text-right font-bold">{formatBaseQuantity(product.stock, product.base_unit)}</td><td className="border-b border-line px-5 py-4 text-right">{product.average_cost_cents === null ? <span className="text-warning">Desconocido</span> : formatMoney(product.average_cost_cents)}</td><td className="border-b border-line px-5 py-4 text-right">{product.inventory_cost_cents === null ? <span className="text-warning">Desconocido</span> : formatMoney(product.inventory_cost_cents)}</td><td className="border-b border-line px-5 py-4 text-right"><Button size="sm" aria-label={`Ver inventario de ${product.name}`} data-inventory-product={product.id} onClick={() => showDetail(product.id, String(product.id))}>Ver inventario</Button></td></tr>)}</tbody></table> : !loading && !error ? <EmptyState title="No hay productos con estos filtros" description="Cambia la busqueda o los filtros para ampliar los resultados." icon="□" /> : null}</div>
             {view && <Pagination label="Paginacion de productos" page={productPage} total={view.product_total} pageSize={pageSize} onPage={setProductPage} />}
           </div>
 
           <div id="inventory-movements-panel" role="tabpanel" aria-labelledby="inventory-movements-tab" hidden={tab !== "movements"}>
-            <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3"><Field label="Buscar movimiento" value={movementSearch} onChange={(event) => updateMovementFilter(setMovementSearch, event.target.value)} placeholder="Producto, proveedor, documento o ticket" /><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Motivo<select className={selectClass} value={reason} onChange={(event) => updateMovementFilter(setReason, event.target.value)}><option value="">Todos</option><option value="compra">Compra</option><option value="venta">Venta</option><option value="ajuste">Ajuste</option><option value="valoracion">Valoracion</option></select></label><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Tipo<select className={selectClass} value={movementType} onChange={(event) => updateMovementFilter(setMovementType, event.target.value)}><option value="">Todos</option><option value="entrada">Entrada</option><option value="salida">Salida</option><option value="valoracion">Valoracion</option></select></label></div>
-            <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Movimientos de inventario desplazables" aria-busy={loading} tabIndex={0}>{!view && loading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.movements.length ? <table className="w-full min-w-[850px] text-left text-sm"><caption className="sr-only">Movimientos historicos de inventario</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Movimiento</th><th className="border-b border-line px-5 py-3 text-right">Cantidad base</th><th className="border-b border-line px-5 py-3 text-right">Importe</th><th className="border-b border-line px-5 py-3">Referencia</th><th className="border-b border-line px-5 py-3">Fecha</th></tr></thead><tbody>{view.movements.map((movement) => <tr key={movement.id} className="hover:bg-surface-soft/60"><td className="border-b border-line px-5 py-4"><strong className="block">{movement.product_name}</strong><span className="text-xs text-muted">{movement.sku}</span></td><td className="border-b border-line px-5 py-4"><strong>{movement.type === "entrada" ? "Entrada" : movement.type === "salida" ? "Salida" : "Valoracion"}</strong><span className="ml-2 text-xs text-muted">{reasonLabels[movement.reason]}</span></td><td className="border-b border-line px-5 py-4 text-right font-bold">{movement.base_quantity !== null && movement.base_unit ? formatBaseQuantity(movement.base_quantity, movement.base_unit) : movement.quantity}</td><td className="border-b border-line px-5 py-4 text-right">{movement.movement_cost_cents === null ? "Sin costo" : formatMoney(movement.movement_cost_cents)}</td><td className="border-b border-line px-5 py-4">{movement.ticket_reference ?? movement.document_reference ?? "-"}</td><td className="border-b border-line px-5 py-4 text-xs whitespace-nowrap text-muted">{formatDateTime(movement.created_at)}</td></tr>)}</tbody></table> : !loading && !error ? <EmptyState title="No hay movimientos con estos filtros" description="Cambia la busqueda o los filtros para ampliar los resultados." icon="↕" /> : null}</div>
+            <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3"><Field label="Buscar movimiento" value={movementSearch} onChange={(event) => updateMovementFilter(setMovementSearch, event.target.value)} placeholder="Producto, proveedor, documento o ticket" /><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Motivo<select className={selectClass} value={reason} onChange={(event) => updateMovementFilter(setReason, event.target.value)}><option value="">Todos</option><option value="compra">Compra</option><option value="venta">Venta</option><option value="ajuste">Ajuste</option><option value="valoracion">Valoracion historica</option></select></label><label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Tipo<select className={selectClass} value={movementType} onChange={(event) => updateMovementFilter(setMovementType, event.target.value)}><option value="">Todos</option><option value="entrada">Entrada</option><option value="salida">Salida</option><option value="valoracion">Valoracion historica</option></select></label></div>
+            <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Movimientos de inventario desplazables" aria-busy={loading} tabIndex={0}>{!view && loading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.movements.length ? <table className="w-full min-w-[850px] text-left text-sm"><caption className="sr-only">Movimientos historicos de inventario</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Movimiento</th><th className="border-b border-line px-5 py-3 text-right">Cantidad base</th><th className="border-b border-line px-5 py-3 text-right">Costo del movimiento</th><th className="border-b border-line px-5 py-3">Referencia</th><th className="border-b border-line px-5 py-3">Fecha</th></tr></thead><tbody>{view.movements.map((movement) => <tr key={movement.id} className="hover:bg-surface-soft/60"><td className="border-b border-line px-5 py-4"><strong className="block">{movement.product_name}</strong><span className="text-xs text-muted">{movement.sku}</span></td><td className="border-b border-line px-5 py-4"><strong>{movement.type === "entrada" ? "Entrada" : movement.type === "salida" ? "Salida" : "Valoracion"}</strong><span className="ml-2 text-xs text-muted">{reasonLabels[movement.reason]}</span></td><td className="border-b border-line px-5 py-4 text-right font-bold">{movement.type === "valoracion" ? "Sin cambio" : movement.base_quantity !== null && movement.base_unit ? formatBaseQuantity(movement.base_quantity, movement.base_unit) : movement.quantity}</td><td className="border-b border-line px-5 py-4 text-right">{movement.movement_cost_cents == null ? <span className="text-warning">Desconocido</span> : formatMoney(movement.movement_cost_cents)}</td><td className="border-b border-line px-5 py-4">{movement.ticket_reference ?? movement.document_reference ?? "-"}</td><td className="border-b border-line px-5 py-4 text-xs whitespace-nowrap text-muted">{formatDateTime(movement.created_at)}</td></tr>)}</tbody></table> : !loading && !error ? <EmptyState title="No hay movimientos con estos filtros" description="Cambia la busqueda o los filtros para ampliar los resultados." icon="↕" /> : null}</div>
             {view && <Pagination label="Paginacion de movimientos" page={movementPage} total={view.movement_total} pageSize={pageSize} onPage={setMovementPage} />}
           </div>
         </section>
@@ -622,12 +639,12 @@ export function InventoryView({ user, onNotice, onSessionRequired }: Props) {
             const selected = presentationId === value;
             return <button key={option.key} id={`inventory-capture-option-${option.key}`} type="button" role="radio" aria-checked={selected} tabIndex={selected || (!presentationId && index === 0) ? 0 : -1} className={`rounded-control border p-3 text-left outline-none transition focus:ring-3 focus:ring-brand/20 ${selected ? "border-brand bg-brand/5" : "border-line-strong bg-surface hover:border-brand/50"}`} onClick={() => selectCaptureOption(index)} onKeyDown={(event) => handleCaptureKeyDown(event, index)} disabled={saving}><strong className="block text-sm text-ink">{option.title}</strong><span className="mt-1 block text-xs leading-5 text-muted">{option.description}</span></button>;
           })}</div></fieldset>}
-          <label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Operacion <span className="sr-only">obligatorio</span><select className={selectClass} value={operation} onChange={(event) => { setOperation(event.target.value as Operation); invalidateQuote(); setQuantityError(""); setUnitPriceError(""); }} required disabled={saving}><option value="purchase">Compra</option><option value="adjustment-in">Ajuste de entrada</option><option value="adjustment-out">Ajuste de salida</option><option value="valuation">Establecer costo actual</option></select></label>
-          {!isValuation && <Field ref={quantityRef} label={quantityLabel} value={quantity} onChange={(event) => { setQuantity(event.target.value); invalidateQuote(); setQuantityError(""); }} inputMode="numeric" pattern="[0-9]+" required disabled={saving} hint={selectedIsDirectCapture && selectedProduct?.base_unit !== "piece" ? "Captura directa en la unidad indicada." : "Indica cuantas piezas o paquetes recibiste."} error={quantityError || undefined} />}
-          {needsCost && <Field ref={unitPriceRef} label={isValuation ? "Nuevo valor total del inventario" : purchasePriceLabel} value={unitPrice} onChange={(event) => { setUnitPrice(event.target.value); invalidateQuote(); setUnitPriceError(""); }} inputMode="decimal" required disabled={saving} placeholder="0.00" hint={isValuation ? "Costo acumulado actual, sin cambiar el stock." : "Se mostrara el importe total antes de confirmar."} error={unitPriceError || undefined} />}
-          {quote && <div className="grid gap-1 rounded-control border border-brand/25 bg-brand/5 px-4 py-3 text-sm" role="status"><strong className="mb-1 block text-ink">Resumen por confirmar</strong><span className="text-muted">Producto: <b className="text-ink">{quote.product_name}</b> <span className="font-mono">({quote.product_sku})</span></span>{quote.type !== "valoracion" && <><span className="text-muted">Forma de captura: <b className="text-ink">{quote.capture_name}</b></span><span className="text-muted">Cantidad capturada: <b className="text-ink">{quote.entered_quantity_description}</b></span><span className="text-muted">Movimiento al inventario: <b className="text-ink">{quote.base_quantity_description}</b></span></>}{quote.unit_price_cents !== null && <span className="text-muted">Precio aplicado: <b className="text-ink">{formatMoney(quote.unit_price_cents)} {quote.unit_price_description}</b></span>}<span className="text-muted">Importe total: <b className="text-ink">{quote.total_cost_cents === null ? "Sin costo registrado" : formatMoney(quote.total_cost_cents)}</b></span></div>}
-          <div className="grid gap-4 sm:grid-cols-2"><Field label="Proveedor" value={supplier} onChange={(event) => setSupplier(event.target.value)} disabled={saving} maxLength={200} /><Field label="Factura o referencia" value={documentReference} onChange={(event) => setDocumentReference(event.target.value)} disabled={saving} maxLength={200} /></div>
-          <label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Nota<textarea className="min-h-24 w-full rounded-control border border-line-strong bg-surface px-3 py-2 text-sm font-normal tracking-normal text-ink normal-case outline-none focus:border-brand focus:ring-3 focus:ring-brand/12 disabled:bg-surface-soft" value={note} onChange={(event) => setNote(event.target.value)} disabled={saving} maxLength={1000} /></label>
+          <label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Operacion <span className="sr-only">obligatorio</span><select className={selectClass} value={operation} onChange={(event) => { setOperation(event.target.value as Operation); invalidateQuote(); setQuantityError(""); setUnitPriceError(""); }} required disabled={saving}><option value="purchase">Compra</option><option value="adjustment-in">Ajuste de entrada</option><option value="adjustment-out">Ajuste de salida</option><option value="valuation">Establecer costo acumulado</option></select></label>
+          {!isValuation && <Field ref={quantityRef} label={quantityLabel} value={quantity} onChange={(event) => { setQuantity(event.target.value); invalidateQuote(); setQuantityError(""); }} inputMode="numeric" pattern="[0-9]+" required disabled={saving} hint={selectedIsDirectCapture && selectedProduct?.base_unit !== "piece" ? "Captura directa en la unidad indicada." : "Indica cuantas piezas o paquetes registras."} error={quantityError || undefined} />}
+          {needsCost && <Field ref={unitPriceRef} label={isValuation ? "Nuevo costo acumulado del inventario" : purchasePriceLabel} value={unitPrice} onChange={(event) => { setUnitPrice(event.target.value); invalidateQuote(); setUnitPriceError(""); }} inputMode="decimal" required disabled={saving} placeholder="0.00" hint={isValuation ? "Cambia el costo acumulado sin modificar el stock." : "Precio de compra, no precio al cliente."} error={unitPriceError || undefined} />}
+          {quote && <div className="grid gap-1 rounded-control border border-brand/25 bg-brand/5 px-4 py-3 text-sm" role="status"><strong className="mb-1 block text-ink">Resumen por confirmar</strong><span className="text-muted">Producto: <b className="text-ink">{quote.product_name}</b> <span className="font-mono">({quote.product_sku})</span></span>{quote.type !== "valoracion" && <><span className="text-muted">Forma de captura: <b className="text-ink">{quote.capture_name}</b></span><span className="text-muted">Cantidad capturada: <b className="text-ink">{quote.entered_quantity_description}</b></span><span className="text-muted">Movimiento al inventario: <b className="text-ink">{quote.base_quantity_description}</b></span></>}{quote.unit_price_cents !== null && <span className="text-muted">{quote.type === "salida" ? "Costo promedio aplicado" : quote.type === "valoracion" ? "Nuevo costo acumulado" : "Precio de compra"}: <b className="text-ink">{formatMoney(quote.unit_price_cents)} {quote.unit_price_description}</b></span>}<span className="text-muted">Costo del movimiento: <b className="text-ink">{quote.total_cost_cents === null ? "Desconocido" : formatMoney(quote.total_cost_cents)}</b></span></div>}
+          <div className="grid gap-4 sm:grid-cols-2"><Field label="Proveedor" value={supplier} onChange={(event) => { setSupplier(event.target.value); invalidateQuote(); }} disabled={saving} maxLength={200} /><Field label="Factura o referencia" value={documentReference} onChange={(event) => { setDocumentReference(event.target.value); invalidateQuote(); }} disabled={saving} maxLength={200} /></div>
+          <label className="grid gap-2 text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Nota<textarea className="min-h-24 w-full rounded-control border border-line-strong bg-surface px-3 py-2 text-sm font-normal tracking-normal text-ink normal-case outline-none focus:border-brand focus:ring-3 focus:ring-brand/12 disabled:bg-surface-soft" value={note} onChange={(event) => { setNote(event.target.value); invalidateQuote(); }} disabled={saving} maxLength={1000} /></label>
         </form>
       </Modal>
       <Modal open={discardOpen} onClose={() => setDiscardOpen(false)} title="Descartar movimiento pendiente" description="Descarta solo si revisaste el error definitivo. El inventario se recargara antes de permitir otra operacion." size="sm" footer={<><Button onClick={() => setDiscardOpen(false)}>Conservar</Button><Button variant="danger" onClick={() => void discardIntent()}>Descartar y recargar</Button></>}>

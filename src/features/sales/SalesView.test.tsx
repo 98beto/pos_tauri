@@ -80,7 +80,7 @@ function detailWithPresentations(): SaleHistoryDetail {
         entered_quantity: 2,
         base_consumed: 500,
         unit_price: 4500,
-        movement_cost_cents: 2000,
+        movement_cost_cents: 1800,
         subtotal: 9000,
       },
       {
@@ -98,7 +98,7 @@ function detailWithPresentations(): SaleHistoryDetail {
         entered_quantity: 250,
         base_consumed: 250,
         unit_price: 12000,
-        movement_cost_cents: 1000,
+        movement_cost_cents: 600,
         subtotal: 3000,
       },
       {
@@ -120,6 +120,36 @@ function detailWithPresentations(): SaleHistoryDetail {
         subtotal: null,
       },
     ],
+  };
+}
+
+function lengthDetail(): SaleHistoryDetail {
+  return {
+    ...detail(1),
+    line_count: 1,
+    subtotal: 1_500,
+    discount_type: "fixed",
+    discount_value: 150,
+    discount_amount: 150,
+    total: 1_350,
+    lines: [{
+      product_id: 40,
+      presentation_id: 401,
+      product_name: "Cable electrico",
+      sku: "CABLE-1",
+      presentation_name: "Metro",
+      presentation_barcode: "7500000000401",
+      base_unit: "centimeter",
+      presentation_mode: "measured",
+      presentation_base_quantity: 100,
+      quantity: 75,
+      catalog_unit_price: 2_500,
+      unit_price: 2_000,
+      entered_quantity: 75,
+      base_consumed: 75,
+      movement_cost_cents: 600,
+      subtotal: 1_500,
+    }],
   };
 }
 
@@ -250,6 +280,9 @@ describe("SalesView", () => {
     expect(dialog.textContent).toContain("$120.00 por 500 g");
     expect(dialog.textContent).toContain("Aplicado: $45.00 por Bolsa 250 g");
     expect(dialog.textContent).toContain("Catalogo: $50.00 por Bolsa 250 g");
+    expect(dialog.textContent).toContain("Costo de inventario");
+    expect(dialog.textContent).toContain("$18.00");
+    expect(dialog.textContent).toContain("Desconocido");
     expect(dialog.textContent).toContain("Sin presentacion registrada");
     expect(dialog.textContent).toContain("No representable");
     expect(dialog.textContent).toContain("Subtotal$125.00");
@@ -258,6 +291,83 @@ describe("SalesView", () => {
     expect(dialog.textContent).toContain("las lineas legadas no permiten verificar su suma");
     expect(dialog.textContent).toContain("Cafe historico");
     expect(dialog.textContent).not.toContain("Articulos");
+  });
+
+  it("shows centimeter snapshots, custom price, line total, and global discount independently", async () => {
+    vi.useFakeTimers();
+    mockedGetSalesView.mockResolvedValue(salesView());
+    mockedGetSaleHistoryDetail.mockResolvedValue(lengthDetail());
+    render(<SalesView onSessionRequired={vi.fn()} />);
+
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Ver detalle de POS-00000001" }));
+    await act(async () => undefined);
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toContain("75 cm");
+    expect(dialog.textContent).toContain("Aplicado: $20.00 por metro");
+    expect(dialog.textContent).toContain("Catalogo: $25.00 por metro");
+    expect(dialog.textContent).toContain("Costo de inventario");
+    expect(dialog.textContent).toContain("$6.00");
+    expect(dialog.textContent).toContain("$15.00");
+    expect(dialog.textContent).toContain("Subtotal$15.00");
+    expect(dialog.textContent).toContain("Descuento fijo-$1.50");
+    expect(dialog.textContent).toContain("Total$13.50");
+  });
+
+  it.each([
+    ["null", null],
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["unsafe integer", Number.MAX_SAFE_INTEGER + 1],
+  ])("labels measured history prices whose presentation base is %s as unavailable", async (_case, presentationBaseQuantity) => {
+    vi.useFakeTimers();
+    const saleDetail = lengthDetail();
+    saleDetail.lines[0] = {
+      ...saleDetail.lines[0],
+      presentation_base_quantity: presentationBaseQuantity,
+    };
+    mockedGetSalesView.mockResolvedValue(salesView());
+    mockedGetSaleHistoryDetail.mockResolvedValue(saleDetail);
+    render(<SalesView onSessionRequired={vi.fn()} />);
+
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Ver detalle de POS-00000001" }));
+    await act(async () => undefined);
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.textContent).toContain("Aplicado: $20.00 · base no disponible");
+    expect(dialog.textContent).toContain("Catalogo: $25.00 · base no disponible");
+    expect(dialog.textContent).toContain("Costo de inventario");
+    expect(dialog.textContent).toContain("$6.00");
+    expect(dialog.textContent).toContain("$15.00");
+    expect(dialog.textContent).not.toContain("por 0");
+  });
+
+  it.each([
+    [1, "1 cm"],
+    [75, "75 cm"],
+    [100, "1 m"],
+    [125, "1.25 m"],
+  ])("formats a historical length of %i centimeters as %s", async (centimeters, formatted) => {
+    vi.useFakeTimers();
+    const saleDetail = lengthDetail();
+    saleDetail.lines[0] = {
+      ...saleDetail.lines[0],
+      quantity: centimeters,
+      entered_quantity: centimeters,
+      base_consumed: centimeters,
+    };
+    mockedGetSalesView.mockResolvedValue(salesView());
+    mockedGetSaleHistoryDetail.mockResolvedValue(saleDetail);
+    render(<SalesView onSessionRequired={vi.fn()} />);
+
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Ver detalle de POS-00000001" }));
+    await act(async () => undefined);
+
+    expect(screen.getByRole("dialog").textContent).toContain(formatted);
   });
 
   it("ignores out-of-order list responses and completion after unmount", async () => {

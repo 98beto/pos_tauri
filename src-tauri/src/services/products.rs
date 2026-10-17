@@ -4,10 +4,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 
 use crate::models::{
     product::{
-        BaseUnit, CreateProductInput, CreateProductWithPresentationsInput, Product,
-        ProductCodeMatch, ProductCodeMatchKind, ProductSelectorFilters, ProductSelectorRow,
-        ProductView, ProductViewFilters, ProductViewRow, ProductViewStats, UpdateProductInput,
-        UpdateProductWithPresentationsInput,
+        BaseUnit, CreateProductWithPresentationsInput, Product, ProductCodeMatch,
+        ProductCodeMatchKind, ProductSelectorFilters, ProductSelectorRow, ProductView,
+        ProductViewFilters, ProductViewRow, ProductViewStats, UpdateProductWithPresentationsInput,
     },
     product_presentation::{
         CreateProductPresentationInput, PresentationMode, ProductPresentation,
@@ -16,9 +15,9 @@ use crate::models::{
 };
 
 use super::{
-    checked_multiply, checked_total, normalize_persisted, normalize_search, normalize_uppercase,
-    parse_money_text, parse_money_text_allow_zero, presentation_base_quantity, search_key,
-    validate_id, ServiceError, ServiceResult, JS_MAX_SAFE_INTEGER,
+    checked_total, normalize_persisted, normalize_search, normalize_uppercase, parse_money_text,
+    presentation_base_quantity, search_key, validate_id, validate_presentation_mode, ServiceError,
+    ServiceResult, JS_MAX_SAFE_INTEGER,
 };
 
 const NAME_MAX_LENGTH: usize = 200;
@@ -84,6 +83,25 @@ fn validate_presentations(
         ),
     >,
 ) -> ServiceResult<Vec<ValidPresentation>> {
+    validate_presentations_for_update(base_unit, inputs, &BTreeMap::new())
+}
+
+fn validate_presentations_for_update(
+    base_unit: BaseUnit,
+    inputs: impl IntoIterator<
+        Item = (
+            Option<i64>,
+            String,
+            PresentationMode,
+            i64,
+            String,
+            Option<String>,
+            bool,
+            bool,
+        ),
+    >,
+    persisted_conversions: &BTreeMap<i64, (PresentationMode, i64)>,
+) -> ServiceResult<Vec<ValidPresentation>> {
     let mut values = Vec::new();
     let mut default_count = 0;
     let mut active_count = 0;
@@ -109,11 +127,10 @@ fn validate_presentations(
                 "La cantidad base debe ser positiva",
             ));
         }
-        if base_unit == BaseUnit::Piece && mode == PresentationMode::Measured {
-            return Err(ServiceError::validation(
-                "MEASURED_PRESENTATION_REQUIRES_MEASURABLE_UNIT",
-                "La venta por cantidad capturada solo esta disponible para peso o volumen",
-            ));
+        let preserves_persisted_conversion =
+            id.is_some_and(|id| persisted_conversions.get(&id) == Some(&(mode, base_quantity)));
+        if !preserves_persisted_conversion {
+            validate_presentation_mode(base_unit, mode)?;
         }
         let price = parse_money_text(&price)?;
         let barcode = barcode
@@ -210,8 +227,18 @@ fn create_inputs(
 fn update_inputs(
     base_unit: BaseUnit,
     inputs: Vec<UpdateProductPresentationInput>,
+    existing: &[ProductPresentation],
 ) -> ServiceResult<Vec<ValidPresentation>> {
-    validate_presentations(
+    let persisted_conversions = existing
+        .iter()
+        .map(|presentation| {
+            (
+                presentation.id,
+                (presentation.mode, presentation.base_quantity),
+            )
+        })
+        .collect();
+    validate_presentations_for_update(
         base_unit,
         inputs.into_iter().map(|input| {
             (
@@ -225,6 +252,7 @@ fn update_inputs(
                 input.is_active,
             )
         }),
+        &persisted_conversions,
     )
 }
 
@@ -298,14 +326,21 @@ fn load_product(
                 "El producto no tiene presentacion predeterminada",
             )
         })?;
-    let average_cost_cents = data.10.and_then(|cost| {
-        if data.3 > 0 {
-            super::divide_half_up_positive(i128::from(cost), i128::from(data.3), "COST_OVERFLOW")
-                .ok()
-        } else {
-            None
+    let average_cost_cents = match (data.10, data.3) {
+        (Some(cost), stock) if stock > 0 => Some(super::divide_half_up_positive(
+            i128::from(cost),
+            i128::from(stock),
+            "AVERAGE_COST_OVERFLOW",
+        )?),
+        (Some(_), 0) => Some(0),
+        (None, _) => None,
+        _ => {
+            return Err(ServiceError::internal(
+                "INVALID_STOCK",
+                "El stock guardado no es valido",
+            ))
         }
-    });
+    };
     Ok(Product {
         id: data.0,
         name: data.1,
@@ -515,94 +550,19 @@ pub fn create_with_presentations(
 ) -> ServiceResult<Product> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (name, sku) = validate_product(&input.name, &input.sku)?;
-    if !(0..=JS_MAX_SAFE_INTEGER).contains(&input.initial_stock) {
-        return Err(ServiceError::validation(
-            "INVALID_INITIAL_STOCK",
-            "El stock inicial esta fuera del rango permitido",
-        ));
-    }
     let values = create_inputs(input.base_unit, input.presentations)?;
     ensure_catalog_references(&transaction, input.brand_id, input.category_id)?;
     ensure_codes(&transaction, &sku, None, &values)?;
-    let parsed_unit_cost = input
-        .initial_purchase_price_per_base
-        .as_deref()
-        .map(|value| parse_money_text_allow_zero(value, true))
-        .transpose()?;
-    let inventory_cost = if input.initial_stock == 0 {
-        if parsed_unit_cost.is_some_and(|value| value != 0) {
-            return Err(ServiceError::validation(
-                "INITIAL_COST_WITHOUT_STOCK",
-                "No se admite costo inicial sin stock",
-            ));
-        }
-        Some(0)
-    } else {
-        match parsed_unit_cost {
-            Some(0) => {
-                return Err(ServiceError::validation(
-                    "INITIAL_PURCHASE_PRICE_MUST_BE_POSITIVE",
-                    "El precio de compra por unidad base debe ser mayor que cero",
-                ));
-            }
-            Some(unit_cost) => Some(checked_multiply(
-                input.initial_stock,
-                unit_cost,
-                "INITIAL_COST_OVERFLOW",
-            )?),
-            None => None,
-        }
-    };
     let default_price = values.iter().find(|value| value.is_default).unwrap().price;
     let changed = transaction.execute(
-        "INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![name, search_key(&name), default_price, input.initial_stock, sku, search_key(&sku), input.brand_id, input.category_id, input.base_unit.as_str(), inventory_cost],
+        "INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES (?1,?2,?3,0,?4,?5,?6,?7,?8,0)",
+        params![name, search_key(&name), default_price, sku, search_key(&sku), input.brand_id, input.category_id, input.base_unit.as_str()],
     )?;
     require_one_row(changed)?;
     let product_id = transaction.last_insert_rowid();
     for value in &values {
         insert_presentation(&transaction, product_id, value)?;
     }
-    if input.initial_stock > 0 {
-        let inventory_cost_before = inventory_cost.map(|_| 0);
-        let changed = transaction.execute(
-            "INSERT INTO inventory_movements (product_id,product_name,sku,product_search_key,sku_search_key,record_version,origin,reason,type,quantity,entered_quantity,base_quantity,unit_price_cents,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents) VALUES (?1,?2,?3,?4,?5,2,'initial_stock','ajuste','entrada',?6,?6,?6,?7,0,?6,?8,?9,?8)",
-            params![product_id, name, sku, search_key(&name), search_key(&sku), input.initial_stock, parsed_unit_cost, inventory_cost, inventory_cost_before],
-        )?;
-        require_one_row(changed)?;
-    }
-    let product = load_product(&transaction, product_id, false)?;
-    transaction.commit()?;
-    Ok(product)
-}
-
-pub fn create(connection: &mut Connection, input: CreateProductInput) -> ServiceResult<Product> {
-    if input.stock != 0 {
-        return Err(ServiceError::validation(
-            "LEGACY_CREATE_REQUIRES_ZERO_STOCK",
-            "El flujo anterior solo permite crear productos con stock cero; usa el flujo de presentaciones para registrar stock y costo inicial",
-        ));
-    }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let price = parse_money_text(&input.price)?;
-    let (name, sku) = validate_product(&input.name, &input.sku)?;
-    ensure_catalog_references(&transaction, input.brand_id, input.category_id)?;
-    let values = vec![ValidPresentation {
-        id: None,
-        name: "Pieza".into(),
-        mode: PresentationMode::Fixed,
-        base_quantity: 1,
-        price,
-        barcode: None,
-        barcode_key: None,
-        is_default: true,
-        is_active: true,
-    }];
-    ensure_codes(&transaction, &sku, None, &values)?;
-    let changed = transaction.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES (?1,?2,?3,0,?4,?5,?6,?7,'piece',0)", params![name,search_key(&name),price,sku,search_key(&sku),input.brand_id,input.category_id])?;
-    require_one_row(changed)?;
-    let product_id = transaction.last_insert_rowid();
-    insert_presentation(&transaction, product_id, &values[0])?;
     let product = load_product(&transaction, product_id, false)?;
     transaction.commit()?;
     Ok(product)
@@ -639,13 +599,29 @@ pub fn update_with_presentations(
     let stored_unit = BaseUnit::try_from(stored_unit.as_str()).map_err(|_| {
         ServiceError::internal("INVALID_BASE_UNIT", "La unidad base guardada no es valida")
     })?;
-    let values = update_inputs(stored_unit, input.presentations)?;
+    let existing = presentations(&transaction, id, false)?;
+    for input_presentation in &input.presentations {
+        if let Some(old) = input_presentation
+            .id
+            .and_then(|presentation_id| existing.iter().find(|item| item.id == presentation_id))
+        {
+            if old.is_conversion_locked
+                && (old.mode != input_presentation.mode
+                    || old.base_quantity != input_presentation.base_quantity)
+            {
+                return Err(ServiceError::validation(
+                    "USED_PRESENTATION_CONVERSION_IMMUTABLE",
+                    "No se puede cambiar el modo ni la cantidad base de una presentacion usada",
+                ));
+            }
+        }
+    }
+    let values = update_inputs(stored_unit, input.presentations, &existing)?;
     ensure_catalog_references(&transaction, input.brand_id, input.category_id)?;
     ensure_codes(&transaction, &sku, Some(id), &values)?;
-    let existing = presentations(&transaction, id, false)?;
     for value in &values {
         if let Some(presentation_id) = value.id {
-            let old = existing
+            existing
                 .iter()
                 .find(|item| item.id == presentation_id)
                 .ok_or_else(|| {
@@ -654,14 +630,6 @@ pub fn update_with_presentations(
                         "La presentacion no pertenece al producto",
                     )
                 })?;
-            if presentation_used(&transaction, presentation_id)?
-                && (old.mode != value.mode || old.base_quantity != value.base_quantity)
-            {
-                return Err(ServiceError::validation(
-                    "USED_PRESENTATION_CONVERSION_IMMUTABLE",
-                    "No se puede cambiar el modo ni la cantidad base de una presentacion usada",
-                ));
-            }
         }
     }
     let supplied: BTreeSet<i64> = values.iter().filter_map(|item| item.id).collect();
@@ -691,32 +659,6 @@ pub fn update_with_presentations(
         }
     }
     let changed = transaction.execute("UPDATE products SET name=?1,name_search_key=?2,price=?3,sku=?4,sku_search_key=?5,brand_id=?6,category_id=?7,updated_at=CURRENT_TIMESTAMP WHERE id=?8", params![name,search_key(&name),default_price,sku,search_key(&sku),input.brand_id,input.category_id,id])?;
-    require_one_row(changed)?;
-    let product = load_product(&transaction, id, false)?;
-    transaction.commit()?;
-    Ok(product)
-}
-
-pub fn update(
-    connection: &Connection,
-    id: i64,
-    input: UpdateProductInput,
-) -> ServiceResult<Product> {
-    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-    validate_id(id)?;
-    let (name, sku) = validate_product(&input.name, &input.sku)?;
-    let price = parse_money_text(&input.price)?;
-    ensure_catalog_references(&transaction, input.brand_id, input.category_id)?;
-    ensure_codes(&transaction, &sku, Some(id), &[])?;
-    let changed = transaction.execute("UPDATE products SET name=?1,name_search_key=?2,price=?3,sku=?4,sku_search_key=?5,brand_id=?6,category_id=?7,updated_at=CURRENT_TIMESTAMP WHERE id=?8", params![name,search_key(&name),price,sku,search_key(&sku),input.brand_id,input.category_id,id])?;
-    if changed == 0 {
-        return Err(ServiceError::not_found(
-            "PRODUCT_NOT_FOUND",
-            "Producto no encontrado",
-        ));
-    }
-    require_one_row(changed)?;
-    let changed = transaction.execute("UPDATE product_presentations SET price=?1,updated_at=CURRENT_TIMESTAMP WHERE product_id=?2 AND is_default=1", params![price,id])?;
     require_one_row(changed)?;
     let product = load_product(&transaction, id, false)?;
     transaction.commit()?;
@@ -792,17 +734,27 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
     let mut piece_stock = 0;
     let mut gram_stock = 0;
     let mut milliliter_stock = 0;
-    let mut inventory_value = 0;
+    let mut centimeter_stock = 0;
+    let mut inventory_value_cents = 0;
+    let mut products_without_cost = 0;
     let mut brands = BTreeSet::new();
     for item in &items {
         let target = match item.base_unit {
             BaseUnit::Piece => &mut piece_stock,
             BaseUnit::Gram => &mut gram_stock,
             BaseUnit::Milliliter => &mut milliliter_stock,
+            BaseUnit::Centimeter => &mut centimeter_stock,
         };
         *target = checked_total(*target, item.stock, "PRODUCT_STATS_OVERFLOW")?;
-        if let Some(cost) = item.inventory_cost_cents {
-            inventory_value = checked_total(inventory_value, cost, "PRODUCT_STATS_OVERFLOW")?;
+        match item.inventory_cost_cents {
+            Some(cost) => {
+                inventory_value_cents =
+                    checked_total(inventory_value_cents, cost, "PRODUCT_STATS_OVERFLOW")?
+            }
+            None => {
+                products_without_cost =
+                    checked_total(products_without_cost, 1, "PRODUCT_STATS_OVERFLOW")?
+            }
         }
         brands.insert(item.brand_id);
     }
@@ -812,8 +764,10 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
             piece_stock,
             gram_stock,
             milliliter_stock,
+            centimeter_stock,
             brand_count: i64::try_from(brands.len()).unwrap_or(JS_MAX_SAFE_INTEGER),
-            inventory_value,
+            inventory_value_cents,
+            products_without_cost,
         },
         items,
     })
@@ -920,8 +874,8 @@ mod tests {
         db::migrations,
         models::{
             product::{
-                BaseUnit, CreateProductInput, CreateProductWithPresentationsInput,
-                ProductCodeMatchKind, UpdateProductInput, UpdateProductWithPresentationsInput,
+                BaseUnit, CreateProductWithPresentationsInput, ProductCodeMatchKind,
+                UpdateProductWithPresentationsInput,
             },
             product_presentation::{
                 CreateProductPresentationInput, PresentationMode, UpdateProductPresentationInput,
@@ -967,8 +921,6 @@ mod tests {
             brand_id: 1,
             category_id: 1,
             base_unit: BaseUnit::Piece,
-            initial_stock: 0,
-            initial_purchase_price_per_base: None,
             presentations: presentations(),
         }
     }
@@ -1029,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_piece_and_bag_atomically_with_cost_and_movement() {
+    fn creates_product_with_zero_stock_without_an_initial_movement() {
         let mut c = db();
         let p = super::create_with_presentations(
             &mut c,
@@ -1039,127 +991,72 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 250,
-                initial_purchase_price_per_base: Some("0.25".into()),
                 presentations: presentations(),
             },
         )
         .unwrap();
-        assert_eq!(
-            (
-                p.stock_base,
-                p.inventory_cost_cents,
-                p.price,
-                p.presentations.len()
-            ),
-            (250, Some(6250), 100, 2)
-        );
-        let movement:(i64,i64,i64)=c.query_row("SELECT stock_after,movement_cost_cents,inventory_cost_after_cents FROM inventory_movements WHERE product_id=?1",[p.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        assert_eq!(movement, (250, 6250, 6250));
+        assert_eq!((p.stock_base, p.price, p.presentations.len()), (0, 100, 2));
+        assert_eq!(p.inventory_cost_cents, Some(0));
+        let counts: (i64, i64) = c
+            .query_row(
+                "SELECT stock, (SELECT COUNT(*) FROM inventory_movements WHERE product_id=?1)
+                 FROM products WHERE id=?1",
+                [p.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0));
     }
+
     #[test]
-    fn initial_stock_without_cost_is_recorded_as_unknown() {
+    fn zero_cost_is_preserved_when_stock_is_changed_outside_product_creation() {
         let mut c = db();
-        let product = super::create_with_presentations(
-            &mut c,
-            CreateProductWithPresentationsInput {
-                name: "Tornillo".into(),
-                sku: "TOR".into(),
-                brand_id: 1,
-                category_id: 1,
-                base_unit: BaseUnit::Piece,
-                initial_stock: 1,
-                initial_purchase_price_per_base: None,
-                presentations: presentations(),
-            },
+        let product =
+            super::create_with_presentations(&mut c, product_input("RETAIL-VALUE")).unwrap();
+        c.execute("UPDATE products SET stock=250 WHERE id=?1", [product.id])
+            .unwrap();
+        let loaded = super::load_product(&c, product.id, false).unwrap();
+        assert_eq!(loaded.inventory_cost_cents, Some(0));
+
+        let view = super::view(&c, Default::default()).unwrap();
+        assert_eq!(view.items[0].inventory_cost_cents, Some(0));
+        assert_eq!(view.stats.inventory_value_cents, 0);
+        assert_eq!(view.stats.centimeter_stock, 0);
+    }
+
+    #[test]
+    fn historical_unknown_cost_stays_unknown_in_reads_and_stats() {
+        let mut c = db();
+        let product =
+            super::create_with_presentations(&mut c, product_input("UNKNOWN-COST")).unwrap();
+        c.execute(
+            "UPDATE products SET stock=3,inventory_cost_cents=NULL WHERE id=?1",
+            [product.id],
         )
         .unwrap();
-        assert_eq!(product.stock, 1);
-        assert_eq!(product.inventory_cost_cents, None);
-        let movement_costs: (Option<i64>, Option<i64>, Option<i64>) = c
-            .query_row(
-                "SELECT movement_cost_cents, inventory_cost_before_cents, inventory_cost_after_cents FROM inventory_movements WHERE product_id=?1",
-                [product.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(movement_costs, (None, None, None));
 
-        let mut input = product_input("TOR-ZERO-COST");
-        input.initial_stock = 1;
-        input.initial_purchase_price_per_base = Some("0.00".into());
-        input.presentations[1].barcode = Some("TOR-ZERO-COST-BARCODE".into());
-        let error = super::create_with_presentations(&mut c, input).unwrap_err();
-        assert_eq!(error.code, "INITIAL_PURCHASE_PRICE_MUST_BE_POSITIVE");
-        let counts: (i64, i64, i64) = c
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM products),
-                        (SELECT COUNT(*) FROM product_presentations),
-                        (SELECT COUNT(*) FROM inventory_movements)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(counts, (1, 2, 1));
+        let loaded = super::load_product(&c, product.id, false).unwrap();
+        assert_eq!(loaded.inventory_cost_cents, None);
+        assert_eq!(loaded.inventory_cost_status, "unknown");
+        assert_eq!(loaded.average_cost_cents, None);
+
+        let view = super::view(&c, Default::default()).unwrap();
+        assert_eq!(view.stats.inventory_value_cents, 0);
+        assert_eq!(view.stats.products_without_cost, 1);
     }
 
     #[test]
-    fn legacy_create_rejects_nonzero_stock_without_writes() {
-        let mut connection = db();
-        let error = super::create(
-            &mut connection,
-            CreateProductInput {
-                name: "Producto legacy".into(),
-                price: "10.00".into(),
-                stock: 1,
-                sku: "LEGACY-STOCK".into(),
-                brand_id: 1,
-                category_id: 1,
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(error.code, "LEGACY_CREATE_REQUIRES_ZERO_STOCK");
-        assert!(error.message.contains("stock cero"));
-        let counts: (i64, i64, i64) = connection
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM products),
-                        (SELECT COUNT(*) FROM product_presentations),
-                        (SELECT COUNT(*) FROM inventory_movements)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(counts, (0, 0, 0));
-    }
-
-    #[test]
-    fn zero_stock_cost_is_always_parsed_before_business_rules() {
-        let mut c = db();
-        let mut input = product_input("SKU-ZERO");
-        input.initial_purchase_price_per_base = Some("not-money".into());
-        assert_eq!(
-            super::create_with_presentations(&mut c, input)
-                .unwrap_err()
-                .code,
-            "INVALID_MONEY"
-        );
-
-        let mut input = product_input("SKU-NONZERO");
-        input.initial_purchase_price_per_base = Some("0.01".into());
-        assert_eq!(
-            super::create_with_presentations(&mut c, input)
-                .unwrap_err()
-                .code,
-            "INITIAL_COST_WITHOUT_STOCK"
-        );
-
-        for (index, value) in ["0", "0.0", "0.00", " 0.00 "].into_iter().enumerate() {
-            let mut input = product_input(&format!("SKU-VALID-ZERO-{index}"));
-            input.presentations[1].barcode = Some(format!("ZERO-BARCODE-{index}"));
-            input.initial_purchase_price_per_base = Some(value.into());
-            assert!(super::create_with_presentations(&mut c, input).is_ok());
-        }
+    fn create_payload_rejects_retired_initial_inventory_fields() {
+        let payload = serde_json::json!({
+            "name": "Producto",
+            "sku": "SKU",
+            "brand_id": 1,
+            "category_id": 1,
+            "base_unit": "piece",
+            "initial_stock": 1,
+            "presentations": []
+        });
+        assert!(serde_json::from_value::<CreateProductWithPresentationsInput>(payload).is_err());
     }
 
     #[test]
@@ -1193,8 +1090,6 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 0,
-                initial_purchase_price_per_base: None,
                 presentations: presentations(),
             },
         )
@@ -1209,8 +1104,6 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 0,
-                initial_purchase_price_per_base: None,
                 presentations: p,
             },
         )
@@ -1224,34 +1117,11 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 0,
-                initial_purchase_price_per_base: None,
                 presentations: presentations(),
             },
         )
         .unwrap_err();
         assert_eq!(e.code, "SKU_ALREADY_EXISTS");
-    }
-
-    #[test]
-    fn sku_cannot_collide_with_a_barcode_owned_by_the_same_product() {
-        let mut c = db();
-        let product = super::create_with_presentations(&mut c, product_input("ORIGINAL")).unwrap();
-
-        let error = super::update(
-            &c,
-            product.id,
-            UpdateProductInput {
-                name: product.name,
-                price: "1.00".into(),
-                sku: "bolsa-100".into(),
-                brand_id: 1,
-                category_id: 1,
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(error.code, "SKU_ALREADY_EXISTS");
     }
 
     #[test]
@@ -1305,8 +1175,6 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 0,
-                initial_purchase_price_per_base: None,
                 presentations: presentations(),
             },
         )
@@ -1343,69 +1211,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.code, "BASE_UNIT_IMMUTABLE");
-    }
-
-    #[test]
-    fn legacy_update_is_atomic_and_keeps_default_price_synchronized() {
-        let mut c = db();
-        let product = super::create(
-            &mut c,
-            CreateProductInput {
-                name: "Anterior".into(),
-                price: "1.00".into(),
-                stock: 0,
-                sku: "LEGACY".into(),
-                brand_id: 1,
-                category_id: 1,
-            },
-        )
-        .unwrap();
-        c.execute_batch(
-            "CREATE TRIGGER fail_default_price_update BEFORE UPDATE ON product_presentations
-             BEGIN SELECT RAISE(ABORT, 'forced rollback'); END;",
-        )
-        .unwrap();
-
-        assert!(super::update(
-            &c,
-            product.id,
-            UpdateProductInput {
-                name: "Nuevo".into(),
-                price: "2.00".into(),
-                sku: "LEGACY-NEW".into(),
-                brand_id: 1,
-                category_id: 1,
-            },
-        )
-        .is_err());
-        let unchanged: (String, String, i64, i64) = c
-            .query_row(
-                "SELECT products.name, products.sku, products.price, product_presentations.price
-                 FROM products JOIN product_presentations
-                   ON product_presentations.product_id = products.id
-                 WHERE products.id = ?1 AND product_presentations.is_default = 1",
-                [product.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(unchanged, ("Anterior".into(), "LEGACY".into(), 100, 100));
-
-        c.execute_batch("DROP TRIGGER fail_default_price_update")
-            .unwrap();
-        let updated = super::update(
-            &c,
-            product.id,
-            UpdateProductInput {
-                name: "Nuevo".into(),
-                price: "2.00".into(),
-                sku: "LEGACY-NEW".into(),
-                brand_id: 1,
-                category_id: 1,
-            },
-        )
-        .unwrap();
-        assert_eq!(updated.price, 200);
-        assert_eq!(updated.default_presentation.price, 200);
     }
 
     #[test]
@@ -1505,8 +1310,6 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 0,
-                initial_purchase_price_per_base: None,
                 presentations: presentations(),
             },
         )
@@ -1646,8 +1449,6 @@ mod tests {
                 brand_id: 1,
                 category_id: 1,
                 base_unit: BaseUnit::Piece,
-                initial_stock: 0,
-                initial_purchase_price_per_base: None,
                 presentations: presentations(),
             },
         )
@@ -1696,6 +1497,133 @@ mod tests {
                 .unwrap()
                 .is_conversion_locked
         );
+    }
+
+    #[test]
+    fn legacy_fixed_measured_unit_preserves_conversion_on_metadata_update() {
+        let mut c = db();
+        let product = super::create_with_presentations(
+            &mut c,
+            CreateProductWithPresentationsInput {
+                name: "Cafe".into(),
+                sku: "LEGACY-GRAM".into(),
+                brand_id: 1,
+                category_id: 1,
+                base_unit: BaseUnit::Gram,
+                presentations: vec![CreateProductPresentationInput {
+                    name: "Bolsa 250 g".into(),
+                    mode: PresentationMode::Measured,
+                    base_quantity: 250,
+                    price: "12.50".into(),
+                    barcode: None,
+                    is_default: true,
+                    is_active: true,
+                }],
+            },
+        )
+        .unwrap();
+        let presentation_id = product.presentations[0].id;
+        c.execute(
+            "UPDATE product_presentations SET mode='fixed' WHERE id=?1",
+            [presentation_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,origin,reason,type,quantity) VALUES(?1,'Cafe','LEGACY-GRAM','cafe','legacy-gram',1,?2,'initial_stock','ajuste','entrada',250)",
+            params![product.id, presentation_id],
+        )
+        .unwrap();
+
+        let updated = super::update_with_presentations(
+            &mut c,
+            product.id,
+            UpdateProductWithPresentationsInput {
+                name: "Cafe editado".into(),
+                sku: product.sku.clone(),
+                brand_id: 1,
+                category_id: 1,
+                base_unit: BaseUnit::Gram,
+                presentations: vec![UpdateProductPresentationInput {
+                    id: Some(presentation_id),
+                    name: "Bolsa historica".into(),
+                    mode: PresentationMode::Fixed,
+                    base_quantity: 250,
+                    price: "13.00".into(),
+                    barcode: None,
+                    is_default: true,
+                    is_active: true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.name, "Cafe editado");
+        assert_eq!(updated.presentations[0].mode, PresentationMode::Fixed);
+        assert_eq!(updated.presentations[0].base_quantity, 250);
+
+        for (mode, base_quantity) in [
+            (PresentationMode::Measured, 250),
+            (PresentationMode::Fixed, 500),
+        ] {
+            let error = super::update_with_presentations(
+                &mut c,
+                product.id,
+                UpdateProductWithPresentationsInput {
+                    name: updated.name.clone(),
+                    sku: updated.sku.clone(),
+                    brand_id: 1,
+                    category_id: 1,
+                    base_unit: BaseUnit::Gram,
+                    presentations: vec![UpdateProductPresentationInput {
+                        id: Some(presentation_id),
+                        name: "Bolsa historica".into(),
+                        mode,
+                        base_quantity,
+                        price: "13.00".into(),
+                        barcode: None,
+                        is_default: true,
+                        is_active: true,
+                    }],
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "USED_PRESENTATION_CONVERSION_IMMUTABLE");
+        }
+
+        let error = super::update_with_presentations(
+            &mut c,
+            product.id,
+            UpdateProductWithPresentationsInput {
+                name: updated.name,
+                sku: updated.sku,
+                brand_id: 1,
+                category_id: 1,
+                base_unit: BaseUnit::Gram,
+                presentations: vec![
+                    UpdateProductPresentationInput {
+                        id: Some(presentation_id),
+                        name: "Bolsa historica".into(),
+                        mode: PresentationMode::Fixed,
+                        base_quantity: 250,
+                        price: "13.00".into(),
+                        barcode: None,
+                        is_default: true,
+                        is_active: true,
+                    },
+                    UpdateProductPresentationInput {
+                        id: None,
+                        name: "Nueva bolsa fija".into(),
+                        mode: PresentationMode::Fixed,
+                        base_quantity: 100,
+                        price: "6.00".into(),
+                        barcode: None,
+                        is_default: false,
+                        is_active: true,
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "INVALID_PRESENTATION_MODE_FOR_BASE_UNIT");
     }
 
     #[test]
@@ -1756,48 +1684,87 @@ mod tests {
     }
 
     #[test]
+    fn custom_bases_must_be_positive_and_javascript_safe() {
+        for base_quantity in [0, super::JS_MAX_SAFE_INTEGER + 1] {
+            let error = super::validate_presentations(
+                BaseUnit::Gram,
+                vec![(
+                    None,
+                    "Otra medida".into(),
+                    PresentationMode::Measured,
+                    base_quantity,
+                    "1.00".into(),
+                    None,
+                    true,
+                    true,
+                )],
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "INVALID_BASE_QUANTITY");
+        }
+        assert!(super::validate_presentations(
+            BaseUnit::Centimeter,
+            vec![(
+                None,
+                "Otra medida".into(),
+                PresentationMode::Measured,
+                super::JS_MAX_SAFE_INTEGER,
+                "1.00".into(),
+                None,
+                true,
+                true,
+            )],
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn selector_aggregates_base_demand_from_presentation_indexed_cart() {
         let mut c = db();
         super::create_with_presentations(&mut c, product_input("OTHER")).unwrap();
         let mut input = product_input("TARGET");
         input.base_unit = BaseUnit::Gram;
-        input.initial_stock = 500;
-        input.initial_purchase_price_per_base = Some("0.01".into());
-        input.presentations.push(CreateProductPresentationInput {
-            name: "Por cantidad".into(),
-            mode: PresentationMode::Measured,
-            base_quantity: 100,
-            price: "10.00".into(),
-            barcode: Some("MEASURED-TARGET".into()),
-            is_default: false,
-            is_active: true,
-        });
-        input.presentations[1].barcode = Some("BAG-TARGET".into());
+        input.presentations = vec![
+            CreateProductPresentationInput {
+                name: "Kilogramo".into(),
+                mode: PresentationMode::Measured,
+                base_quantity: 1_000,
+                price: "40.00".into(),
+                barcode: Some("KILO-TARGET".into()),
+                is_default: true,
+                is_active: true,
+            },
+            CreateProductPresentationInput {
+                name: "Por cantidad".into(),
+                mode: PresentationMode::Measured,
+                base_quantity: 100,
+                price: "10.00".into(),
+                barcode: Some("MEASURED-TARGET".into()),
+                is_default: false,
+                is_active: true,
+            },
+        ];
         let product = super::create_with_presentations(&mut c, input).unwrap();
-        let unit = product
-            .presentations
-            .iter()
-            .find(|presentation| presentation.name == "Pieza")
+        c.execute("UPDATE products SET stock=500 WHERE id=?1", [product.id])
             .unwrap();
-        let bag = product
+        let kilogram = product
             .presentations
             .iter()
-            .find(|presentation| presentation.name == "Bolsa 100")
+            .find(|presentation| presentation.name == "Kilogramo")
             .unwrap();
         let measured = product
             .presentations
             .iter()
             .find(|presentation| presentation.name == "Por cantidad")
             .unwrap();
-        assert_ne!(product.id, unit.id);
-        assert_ne!(product.id, bag.id);
+        assert_ne!(product.id, kilogram.id);
         assert_ne!(product.id, measured.id);
 
-        let cart = BTreeMap::from([(unit.id, 3), (bag.id, 2), (measured.id, 25)]);
+        let cart = BTreeMap::from([(kilogram.id, 3), (measured.id, 25)]);
         let rows = super::selector(&c, &cart, Default::default()).unwrap();
         let row = rows.iter().find(|row| row.id == product.id).unwrap();
-        assert_eq!(row.cart_quantity, 228);
-        assert_eq!(row.available_stock, 272);
+        assert_eq!(row.cart_quantity, 28);
+        assert_eq!(row.available_stock, 472);
     }
 
     #[test]
@@ -1809,7 +1776,7 @@ mod tests {
             super::create_with_presentations(&mut c, create_input)
                 .unwrap_err()
                 .code,
-            "MEASURED_PRESENTATION_REQUIRES_MEASURABLE_UNIT"
+            "INVALID_PRESENTATION_MODE_FOR_BASE_UNIT"
         );
 
         let product =
@@ -1850,6 +1817,6 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(error.code, "MEASURED_PRESENTATION_REQUIRES_MEASURABLE_UNIT");
+        assert_eq!(error.code, "INVALID_PRESENTATION_MODE_FOR_BASE_UNIT");
     }
 }

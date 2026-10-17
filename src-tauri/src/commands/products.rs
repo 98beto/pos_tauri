@@ -4,9 +4,8 @@ use crate::{
     db::Database,
     error::AppError,
     models::product::{
-        CreateProductInput, CreateProductWithPresentationsInput, Product, ProductCodeMatch,
-        ProductSelectorFilters, ProductSelectorRow, ProductView, ProductViewFilters,
-        UpdateProductInput, UpdateProductWithPresentationsInput,
+        CreateProductWithPresentationsInput, Product, ProductCodeMatch, ProductSelectorFilters,
+        ProductSelectorRow, ProductView, ProductViewFilters, UpdateProductWithPresentationsInput,
     },
     services::products,
 };
@@ -77,17 +76,6 @@ pub fn find_product_by_code(
 }
 
 #[tauri::command]
-pub fn create_product(
-    database: State<'_, Database>,
-    session: State<'_, AuthSession>,
-    input: CreateProductInput,
-) -> Result<Product, AppError> {
-    with_authenticated_connection(&database, &session, |connection, _| {
-        products::create(connection, input)
-    })
-}
-
-#[tauri::command]
 pub fn create_product_with_presentations(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,
@@ -95,18 +83,6 @@ pub fn create_product_with_presentations(
 ) -> Result<Product, AppError> {
     with_authenticated_connection(&database, &session, |connection, _| {
         products::create_with_presentations(connection, input)
-    })
-}
-
-#[tauri::command]
-pub fn update_product(
-    database: State<'_, Database>,
-    session: State<'_, AuthSession>,
-    id: i64,
-    input: UpdateProductInput,
-) -> Result<Product, AppError> {
-    with_authenticated_connection(&database, &session, |connection, _| {
-        products::update(connection, id, input)
     })
 }
 

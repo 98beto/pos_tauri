@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateInventoryMovementInput,
+  ConfirmPurchaseCostCorrectionInput,
   InventoryMovement,
   InventoryMovementQuote,
   InventoryProductSearchResult,
@@ -8,6 +9,8 @@ import type {
   InventoryViewFilters,
   ProductInventoryDetail,
   ProductInventoryDetailFilters,
+  PurchaseCostCorrectionQuote,
+  QuotePurchaseCostCorrectionInput,
   QuoteInventoryMovementInput,
 } from "../types/inventory_movement";
 
@@ -51,4 +54,16 @@ export function getProductInventoryDetail(
 
 export function listInventoryMovements(): Promise<InventoryMovement[]> {
   return invoke<InventoryMovement[]>("list_inventory_movements");
+}
+
+export function quotePurchaseCostCorrection(
+  input: QuotePurchaseCostCorrectionInput,
+): Promise<PurchaseCostCorrectionQuote> {
+  return invoke<PurchaseCostCorrectionQuote>("quote_purchase_cost_correction", { input });
+}
+
+export function confirmPurchaseCostCorrection(
+  input: ConfirmPurchaseCostCorrectionInput,
+): Promise<PurchaseCostCorrectionQuote> {
+  return invoke<PurchaseCostCorrectionQuote>("confirm_purchase_cost_correction", { input });
 }

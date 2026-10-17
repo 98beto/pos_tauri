@@ -4,6 +4,7 @@ import { Button, EmptyState, Field, Spinner, StatCard } from "../../components/u
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
 import { formatBaseQuantity, formatDateTime, formatEnteredQuantity, formatMoney } from "../../lib/format";
 import type { InventoryMovement, InventoryMovementReason, InventoryMovementType, ProductInventoryDetail as DetailData } from "../../types/inventory_movement";
+import { PurchaseCostCorrection } from "./PurchaseCostCorrection";
 
 type Props = {
   productId: number;
@@ -14,8 +15,8 @@ type Props = {
 const selectClass = "h-11 w-full rounded-control border border-line-strong bg-surface px-3 text-sm text-ink outline-none focus:border-brand focus:ring-3 focus:ring-brand/12";
 const reasons: Record<InventoryMovementReason, string> = { compra: "Compra", venta: "Venta", ajuste: "Ajuste", valoracion: "Valoracion" };
 const types: Record<InventoryMovementType, string> = { entrada: "Entrada", salida: "Salida", valoracion: "Valoracion" };
-const units = { piece: "Pieza", gram: "Gramo", milliliter: "Mililitro" } as const;
-const unitPriceUnits = { piece: "pieza", gram: "gramo", milliliter: "mililitro" } as const;
+const units = { piece: "Pieza", gram: "Gramo", milliliter: "Mililitro", centimeter: "Centimetro" } as const;
+const unitPriceUnits = { piece: "pieza", gram: "gramo", milliliter: "mililitro", centimeter: "centimetro" } as const;
 
 function movementQuantity(movement: InventoryMovement) {
   if (movement.type === "valoracion") return "Sin cambio de stock";
@@ -31,13 +32,11 @@ function movementQuantity(movement: InventoryMovement) {
 function movementUnitPrice(movement: InventoryMovement) {
   if (movement.unit_price_cents === null) return "-";
   const price = formatMoney(movement.unit_price_cents);
-  if (movement.reason === "ajuste" && movement.type === "salida" && movement.base_unit) {
-    return `${price} por ${unitPriceUnits[movement.base_unit]}`;
+  const hasPresentationSnapshot = movement.presentation_mode !== null && movement.presentation_base_quantity !== null;
+  if (hasPresentationSnapshot && movement.presentation_mode === "fixed") {
+    return `${price} por ${movement.presentation_name ?? "presentacion"}`;
   }
-  if (movement.presentation_name && movement.presentation_mode === "fixed") {
-    return `${price} por ${movement.presentation_name}`;
-  }
-  if (movement.presentation_mode === "measured" && movement.presentation_base_quantity && movement.base_unit) {
+  if (movement.presentation_mode === "measured" && movement.presentation_base_quantity !== null && movement.base_unit) {
     return `${price} por ${formatBaseQuantity(movement.presentation_base_quantity, movement.base_unit)}`;
   }
   return movement.base_unit ? `${price} por ${unitPriceUnits[movement.base_unit]}` : price;
@@ -110,10 +109,11 @@ export function ProductInventoryDetail({ productId, onBack, onSessionRequired }:
         <p className="text-xs font-bold tracking-wider text-brand uppercase">Detalle de inventario</p>
         <h1 ref={titleRef} id="product-inventory-title" tabIndex={-1} className="mt-1 font-heading text-2xl font-bold outline-none">{product?.name ?? "Cargando producto"}</h1>
         <p className="mt-1 font-mono text-xs text-muted">{product?.sku ?? ""}</p>
-        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-busy={loading}>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-busy={loading}>
           <StatCard label="Unidad base" value={product ? units[product.base_unit] : "-"} />
           <StatCard label="Stock actual" value={product ? formatBaseQuantity(product.stock, product.base_unit) : "-"} />
-          <StatCard label="Valor a costo" value={product ? product.inventory_cost_cents === null ? "Sin costo registrado" : formatMoney(product.inventory_cost_cents) : "-"} detail={product?.inventory_cost_cents === null ? "No incluido en el valor total" : undefined} />
+          <StatCard label="Costo promedio" value={product?.average_cost_cents == null ? "Desconocido" : formatMoney(product.average_cost_cents)} />
+          <StatCard label="Valor a costo" value={product?.inventory_cost_cents == null ? "Desconocido" : formatMoney(product.inventory_cost_cents)} detail="Costo acumulado del inventario actual." />
           <StatCard label="Ultimo movimiento" value={detail ? detail.last_movement_at ? formatDateTime(detail.last_movement_at) : "Sin movimientos" : "-"} />
         </div>
       </header>
@@ -132,8 +132,8 @@ export function ProductInventoryDetail({ productId, onBack, onSessionRequired }:
         {loading && detail && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Actualizando; se muestran temporalmente los resultados anteriores.</p>}
         <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Movimientos del producto desplazables" aria-busy={loading} tabIndex={0}>
           {!detail && loading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : detail?.movements.length ? (
-            <table className="w-full min-w-[1100px] text-left text-sm"><caption className="sr-only">Movimientos del inventario del producto</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-4 py-3">Fecha</th><th className="border-b border-line px-4 py-3">Tipo y motivo</th><th className="border-b border-line px-4 py-3">Presentacion</th><th className="border-b border-line px-4 py-3">Cantidad</th><th className="border-b border-line px-4 py-3 text-right">Precio aplicado</th><th className="border-b border-line px-4 py-3 text-right">Importe</th><th className="border-b border-line px-4 py-3">Proveedor / documento</th><th className="border-b border-line px-4 py-3">Ticket / nota</th></tr></thead>
-              <tbody>{detail.movements.map((movement) => <tr key={movement.id} className="align-top hover:bg-surface-soft/60"><td className="border-b border-line px-4 py-4 text-xs whitespace-nowrap text-muted">{formatDateTime(movement.created_at)}</td><td className="border-b border-line px-4 py-4"><strong>{types[movement.type]}</strong><span className="block text-xs text-muted">{reasons[movement.reason]}</span></td><td className="border-b border-line px-4 py-4">{movement.presentation_name ?? "Unidad base"}</td><td className="border-b border-line px-4 py-4">{movementQuantity(movement)}</td><td className="border-b border-line px-4 py-4 text-right">{movementUnitPrice(movement)}</td><td className="border-b border-line px-4 py-4 text-right font-bold">{movement.movement_cost_cents === null ? "Sin costo" : formatMoney(movement.movement_cost_cents)}</td><td className="border-b border-line px-4 py-4">{movement.supplier || movement.document_reference ? <>{movement.supplier ?? "Sin proveedor"}<span className="block text-xs text-muted">{movement.document_reference ?? "Sin documento"}</span></> : "-"}</td><td className="border-b border-line px-4 py-4">{movement.ticket_reference || movement.note ? <>{movement.ticket_reference ?? "Sin ticket"}<span className="block text-xs text-muted">{movement.note ?? "Sin nota"}</span></> : "-"}</td></tr>)}</tbody></table>
+             <table className="w-full min-w-[1350px] text-left text-sm"><caption className="sr-only">Movimientos del inventario del producto</caption><thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-4 py-3">Fecha</th><th className="border-b border-line px-4 py-3">Tipo y motivo</th><th className="border-b border-line px-4 py-3">Presentacion</th><th className="border-b border-line px-4 py-3">Cantidad</th><th className="border-b border-line px-4 py-3 text-right">Precio / costo unitario</th><th className="border-b border-line px-4 py-3 text-right">Costo movimiento</th><th className="border-b border-line px-4 py-3 text-right">Costo acumulado</th><th className="border-b border-line px-4 py-3">Proveedor / documento</th><th className="border-b border-line px-4 py-3">Ticket / nota</th><th className="border-b border-line px-4 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
+              <tbody>{detail.movements.map((movement) => <tr key={movement.id} className="align-top hover:bg-surface-soft/60"><td className="border-b border-line px-4 py-4 text-xs whitespace-nowrap text-muted">{formatDateTime(movement.created_at)}</td><td className="border-b border-line px-4 py-4"><strong>{types[movement.type]}</strong><span className="block text-xs text-muted">{reasons[movement.reason]}</span></td><td className="border-b border-line px-4 py-4">{movement.presentation_name ?? "Unidad base"}</td><td className="border-b border-line px-4 py-4">{movementQuantity(movement)}</td><td className="border-b border-line px-4 py-4 text-right">{movementUnitPrice(movement)}</td><td className="border-b border-line px-4 py-4 text-right font-bold">{movement.movement_cost_cents == null ? <span className="text-warning">Desconocido</span> : formatMoney(movement.movement_cost_cents)}</td><td className="border-b border-line px-4 py-4 text-right">{movement.inventory_cost_after_cents == null ? <span className="text-warning">Desconocido</span> : formatMoney(movement.inventory_cost_after_cents)}</td><td className="border-b border-line px-4 py-4">{movement.supplier || movement.document_reference ? <>{movement.supplier ?? "Sin proveedor"}<span className="block text-xs text-muted">{movement.document_reference ?? "Sin documento"}</span></> : "-"}</td><td className="border-b border-line px-4 py-4">{movement.ticket_reference || movement.note ? <>{movement.ticket_reference ?? "Sin ticket"}<span className="block text-xs text-muted">{movement.note ?? "Sin nota"}</span></> : "-"}</td><td className="border-b border-line px-4 py-4"><PurchaseCostCorrection movement={movement} onApplied={load} onSessionRequired={onSessionRequired} /></td></tr>)}</tbody></table>
           ) : !loading && !error ? <EmptyState title={hasFilters ? "No hay movimientos con estos filtros" : "Este producto aun no tiene movimientos"} description={hasFilters ? "Cambia los filtros para ampliar los resultados." : "Puedes registrar una compra o ajuste desde Inventario."} icon="↕" /> : null}
         </div>
         {detail && <PageControls page={page} total={detail.total} pageSize={detail.page_size} onPage={setPage} />}

@@ -2,6 +2,8 @@
 
 **Estado:** implementacion local hasta el bloque 12 preparada para `v0.2.0`. El bloque 11 y la documentacion operativa de los bloques 13-14 estan completados; siguen pendientes la validacion con una copia cerrada real, `mode=validate`, la prueba de artefactos y rollback, el tag y `mode=publish`. No se ha migrado produccion ni publicado esta version.
 
+**Evolucion:** las decisiones de costo y valoracion siguen siendo la base funcional. El runbook de migracion al esquema 12 es historico y fue reemplazado por [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md) y por el runbook vigente de [`../releases.md`](../releases.md).
+
 ## Objetivo
 
 Simplificar el registro manual de inventario y preparar una actualizacion segura desde la version actualmente publicada en `main` hacia la funcionalidad de presentaciones e inventario medido.
@@ -989,11 +991,11 @@ La copia usada para la prueba no debe contener datos personales si se comparte f
 ### Despliegue
 
 1. Congelar UI, contratos, migraciones y commit candidato.
-2. Ejecutar el workflow de release en modo `validate` para ese commit exacto.
-3. Probar los artefactos candidatos sobre una copia v8 y ejecutar el rollback completo.
+2. Ejecutar el workflow de release en modo `validate` para ese commit exacto y registrar su run ID y `SHA256SUMS`.
+3. Probar los artefactos de ese run exacto sobre una copia v8 y ejecutar el rollback completo.
 4. Corregir cualquier defecto antes de etiquetar; si cambia el commit, repetir validacion y prueba.
 5. Crear la etiqueta inmutable `v0.2.0` sobre el commit validado.
-6. Ejecutar el modo `publish` y verificar firmas y artefactos finales.
+6. Ejecutar el modo `publish` indicando el run ID validado; verificar que promueve esos mismos hashes sin recompilar.
 7. Instalar primero el artefacto final publicado en un equipo controlado.
 8. Confirmar la creacion y validez del backup.
 9. Confirmar que la base quedo en version 12.

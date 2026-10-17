@@ -17,11 +17,14 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-const CURRENT_SCHEMA_VERSION: i64 = 12;
-const MIGRATION_SOURCE_VERSION: i64 = 8;
-const PENDING_MARKER_NAME: &str = "pos-v0.2.0-migration-pending.json";
-const MIGRATION_LOCK_NAME: &str = "pos-v0.2.0-migration.lock";
-const RESTORE_MARKER_NAME: &str = "pos-v0.2.0-restore-pending.json";
+const CURRENT_SCHEMA_VERSION: i64 = 13;
+const LEGACY_MIGRATION_SOURCE_VERSION: i64 = 8;
+const DIRECT_MIGRATION_SOURCE_VERSION: i64 = 12;
+const PENDING_MARKER_NAME: &str = "pos-schema-v13-migration-pending.json";
+const LEGACY_PENDING_MARKER_NAME: &str = "pos-v0.2.0-migration-pending.json";
+const MIGRATION_LOCK_NAME: &str = "pos-schema-v13-migration.lock";
+const RESTORE_MARKER_NAME: &str = "pos-schema-v13-restore-pending.json";
+const LEGACY_RESTORE_MARKER_NAME: &str = "pos-v0.2.0-restore-pending.json";
 const V8_REQUIRED_TABLES: &[&str] = &[
     "users",
     "brands",
@@ -31,7 +34,7 @@ const V8_REQUIRED_TABLES: &[&str] = &[
     "sale_details",
     "inventory_movements",
 ];
-const V12_REQUIRED_TABLES: &[&str] = &[
+const V12_AND_V13_REQUIRED_TABLES: &[&str] = &[
     "users",
     "brands",
     "categories",
@@ -108,6 +111,21 @@ struct RestoreManifest {
     failed_database: PathBuf,
 }
 
+type SnapshotRows = Vec<Vec<String>>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct MigrationSnapshot {
+    users: SnapshotRows,
+    brands: SnapshotRows,
+    categories: SnapshotRows,
+    products: SnapshotRows,
+    presentations: SnapshotRows,
+    sales: SnapshotRows,
+    sale_details: SnapshotRows,
+    movements: SnapshotRows,
+    sequences: SnapshotRows,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestoreStage {
     MarkerPersisted,
@@ -169,36 +187,55 @@ fn open_database_path_with_hook<F>(
 where
     F: FnOnce(&Connection) -> OpenResult<()>,
 {
-    prepare_directory(directory)
-        .map_err(|_| safe_error("No se pudo preparar el directorio de datos", directory))?;
-    let _migration_lock = acquire_migration_lock(directory)?;
-
-    let restore_marker = directory.join(RESTORE_MARKER_NAME);
-    reconcile_restore_completion(directory, &restore_marker)?;
-    if restore_marker.try_exists().map_err(|_| {
-        safe_error(
-            "No se pudo comprobar el estado de restauracion",
-            &restore_marker,
-        )
-    })? {
-        return Err(pending_restore_error(&restore_marker));
-    }
-
-    let pending_path = directory.join(PENDING_MARKER_NAME);
-    reconcile_migration_completion(directory, &pending_path)?;
-    if pending_path
-        .try_exists()
-        .map_err(|_| safe_error("No se pudo comprobar el estado de migracion", &pending_path))?
-    {
-        return Err(pending_migration_error(&pending_path));
-    }
-
     let existed = database_path
         .try_exists()
         .map_err(|_| safe_error("No se pudo comprobar la base de datos", database_path))?;
+    if existed {
+        // The first look at an installed database must not create a lock, change
+        // permissions, recover SQLite, or reconcile migration artifacts.
+        preflight_installed_database(database_path)?;
+    }
+
+    prepare_directory(directory)
+        .map_err(|_| safe_error("No se pudo preparar el directorio de datos", directory))?;
+    let _migration_lock = acquire_migration_lock(directory)?;
+    if existed {
+        // Repeat under the process lock so the approved source cannot race migration.
+        preflight_installed_database(database_path)?;
+    }
+
+    for marker_name in [RESTORE_MARKER_NAME, LEGACY_RESTORE_MARKER_NAME] {
+        let restore_marker = directory.join(marker_name);
+        reconcile_restore_completion(directory, &restore_marker)?;
+        if restore_marker.try_exists().map_err(|_| {
+            safe_error(
+                "No se pudo comprobar el estado de restauracion",
+                &restore_marker,
+            )
+        })? {
+            return Err(pending_restore_error(&restore_marker));
+        }
+    }
+
+    for marker_name in [PENDING_MARKER_NAME, LEGACY_PENDING_MARKER_NAME] {
+        let marker = directory.join(marker_name);
+        reconcile_migration_completion(directory, &marker)?;
+        if marker
+            .try_exists()
+            .map_err(|_| safe_error("No se pudo comprobar el estado de migracion", &marker))?
+        {
+            return Err(pending_migration_error(&marker));
+        }
+    }
+    let pending_path = directory.join(PENDING_MARKER_NAME);
+
     if !existed {
         create_database_file(database_path)
             .map_err(|_| safe_error("No se pudo crear la base de datos", database_path))?;
+    } else {
+        // Restore reconciliation can replace the installed file. Approve that source too
+        // before SQLite is allowed to open it read-write.
+        preflight_installed_database(database_path)?;
     }
 
     let mut connection = Connection::open_with_flags(
@@ -223,9 +260,10 @@ where
             })?;
             validate_database(&connection, CURRENT_SCHEMA_VERSION, true, database_path)?;
         }
-        MIGRATION_SOURCE_VERSION => {
-            validate_database(&connection, MIGRATION_SOURCE_VERSION, true, database_path)?;
-            let manifest = create_validated_backup(&connection, directory)?;
+        LEGACY_MIGRATION_SOURCE_VERSION | DIRECT_MIGRATION_SOURCE_VERSION => {
+            validate_database(&connection, version, true, database_path)?;
+            let before = migration_snapshot(&connection, database_path, version)?;
+            let manifest = create_validated_backup(&connection, directory, version)?;
             write_pending_marker(&pending_path, &manifest)?;
 
             migrations::run(&mut connection).map_err(|_| {
@@ -234,6 +272,13 @@ where
                     &manifest.backup_path,
                 )
             })?;
+            let after = migration_snapshot(&connection, database_path, version)?;
+            if after != before {
+                return Err(recovery_error(
+                    "La migracion altero identidades, relaciones, stock o totales historicos; restaure el backup",
+                    &manifest.backup_path,
+                ));
+            }
             after_migration(&connection)?;
             validate_database(&connection, CURRENT_SCHEMA_VERSION, true, database_path).map_err(
                 |_| {
@@ -277,6 +322,37 @@ where
         .map_err(|_| safe_error("No se pudieron proteger los archivos SQLite", database_path))?;
 
     Ok(connection)
+}
+
+fn preflight_installed_database(database_path: &Path) -> OpenResult<()> {
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| {
+        safe_error(
+            "No se pudo abrir la base de datos en solo lectura",
+            database_path,
+        )
+    })?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|_| safe_error("No se pudo configurar la base de datos", database_path))?;
+    let version = schema_version(&connection, database_path)?;
+    let is_new = version == 0 && database_has_no_user_schema(&connection, database_path)?;
+    match version {
+        0 if is_new => validate_database(&connection, 0, false, database_path),
+        LEGACY_MIGRATION_SOURCE_VERSION
+        | DIRECT_MIGRATION_SOURCE_VERSION
+        | CURRENT_SCHEMA_VERSION => validate_database(&connection, version, true, database_path),
+        _ => {
+            validate_database(&connection, version, false, database_path)?;
+            Err(safe_error(
+                "La version de la base de datos es incompatible",
+                database_path,
+            ))
+        }
+    }
 }
 
 fn safe_error(message: &str, path: &Path) -> DatabaseOpenError {
@@ -357,7 +433,7 @@ fn validate_database(
     }
 
     let mut quick_check = connection
-        .prepare("PRAGMA quick_check")
+        .prepare("PRAGMA integrity_check")
         .map_err(|_| safe_error("No se pudo comprobar la integridad SQLite", path))?;
     let mut rows = quick_check
         .query([])
@@ -392,8 +468,8 @@ fn validate_database(
 
     if require_tables {
         let required_tables = match expected_version {
-            MIGRATION_SOURCE_VERSION => V8_REQUIRED_TABLES,
-            CURRENT_SCHEMA_VERSION => V12_REQUIRED_TABLES,
+            LEGACY_MIGRATION_SOURCE_VERSION => V8_REQUIRED_TABLES,
+            DIRECT_MIGRATION_SOURCE_VERSION | CURRENT_SCHEMA_VERSION => V12_AND_V13_REQUIRED_TABLES,
             _ => &[],
         };
         for table in required_tables {
@@ -413,16 +489,305 @@ fn validate_database(
         }
     }
 
+    validate_schema_shape(connection, expected_version, path)?;
+
     Ok(())
 }
 
-fn create_validated_backup(source: &Connection, directory: &Path) -> OpenResult<MigrationManifest> {
-    create_validated_backup_with(source, directory, copy_sqlite_database)
+fn validate_schema_shape(connection: &Connection, version: i64, path: &Path) -> OpenResult<()> {
+    if version == DIRECT_MIGRATION_SOURCE_VERSION {
+        validate_v12_structure(connection, path)?;
+    } else if version == CURRENT_SCHEMA_VERSION {
+        validate_v13_structure(connection, path)?;
+    }
+    let column_exists = |table: &str, column: &str| -> rusqlite::Result<bool> {
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            rusqlite::params![table, column],
+            |row| row.get(0),
+        )
+    };
+    let valid = match version {
+        LEGACY_MIGRATION_SOURCE_VERSION => true,
+        DIRECT_MIGRATION_SOURCE_VERSION => column_exists("products", "inventory_cost_cents")
+            .and_then(|product_cost| {
+                column_exists("sale_details", "movement_cost_cents")
+                    .map(|detail_cost| product_cost && detail_cost)
+            })
+            .and_then(|valid| {
+                column_exists("inventory_movements", "movement_cost_cents")
+                    .map(|movement_cost| valid && movement_cost)
+            })
+            .unwrap_or(false),
+        CURRENT_SCHEMA_VERSION => {
+            let required = [
+                ("products", "inventory_cost_cents"),
+                ("sale_details", "movement_cost_cents"),
+                ("inventory_movements", "unit_price_cents"),
+                ("inventory_movements", "movement_cost_cents"),
+                ("inventory_movements", "inventory_cost_before_cents"),
+                ("inventory_movements", "inventory_cost_after_cents"),
+            ];
+            required
+                .iter()
+                .all(|(table, column)| column_exists(table, column).unwrap_or(false))
+        }
+        _ => true,
+    };
+    if !valid {
+        return Err(safe_error(
+            "La estructura de la base no corresponde a su version",
+            path,
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    let characters = sql.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if character.is_whitespace() {
+            index += 1;
+        } else if matches!(character, '\'' | '"' | '`' | '[') {
+            let closing = if character == '[' { ']' } else { character };
+            let mut token = String::from(character);
+            index += 1;
+            while index < characters.len() {
+                let current = characters[index];
+                token.push(if character == '\'' {
+                    current
+                } else {
+                    current.to_ascii_lowercase()
+                });
+                index += 1;
+                if current == closing {
+                    if index < characters.len() && characters[index] == closing {
+                        token.push(characters[index]);
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            tokens.push(token);
+        } else if character.is_alphanumeric() || matches!(character, '_' | '$') {
+            let start = index;
+            index += 1;
+            while index < characters.len()
+                && (characters[index].is_alphanumeric() || matches!(characters[index], '_' | '$'))
+            {
+                index += 1;
+            }
+            tokens.push(
+                characters[start..index]
+                    .iter()
+                    .map(|value| value.to_ascii_lowercase())
+                    .collect(),
+            );
+        } else {
+            let mut token = String::from(character);
+            index += 1;
+            if index < characters.len()
+                && matches!(
+                    (character, characters[index]),
+                    ('|', '|')
+                        | ('<', '<' | '=' | '>')
+                        | ('>', '>' | '=')
+                        | ('!', '=')
+                        | ('=', '=')
+                        | ('-', '>')
+                )
+            {
+                token.push(characters[index]);
+                index += 1;
+                if token == "->" && index < characters.len() && characters[index] == '>' {
+                    token.push('>');
+                    index += 1;
+                }
+            }
+            tokens.push(token);
+        }
+    }
+    tokens.join("\u{1f}")
+}
+
+fn canonical_schema_objects(
+    connection: &Connection,
+) -> rusqlite::Result<Vec<(String, String, String, String)>> {
+    connection
+        .prepare(
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema
+             WHERE name NOT GLOB 'sqlite_*'
+               AND NOT (type='index' AND sql IS NULL)
+             ORDER BY type,name",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                normalize_schema_sql(&row.get::<_, String>(3)?),
+            ))
+        })?
+        .collect()
+}
+
+fn validate_v12_structure(connection: &Connection, path: &Path) -> OpenResult<()> {
+    let mut reference = Connection::open_in_memory()
+        .map_err(|_| safe_error("No se pudo crear la referencia del esquema v12", path))?;
+    migrations::run_to_v12(&mut reference)
+        .map_err(|_| safe_error("No se pudo construir la referencia del esquema v12", path))?;
+
+    // Autoindexes have NULL SQL and unstable generated names. Their UNIQUE constraints
+    // remain covered by comparing the complete CREATE TABLE statements. Every other
+    // non-internal schema object is compared, including triggers and views.
+    let expected = canonical_schema_objects(&reference)
+        .map_err(|_| safe_error("No se pudo leer la referencia del esquema v12", path))?;
+    let actual = canonical_schema_objects(connection)
+        .map_err(|_| safe_error("No se pudo leer el esquema v12 instalado", path))?;
+    if actual != expected {
+        return Err(safe_error("El esquema v12 no es canonico", path));
+    }
+
+    Ok(())
+}
+
+fn validate_v13_structure(connection: &Connection, path: &Path) -> OpenResult<()> {
+    let mut reference = Connection::open_in_memory()
+        .map_err(|_| safe_error("No se pudo crear la referencia del esquema v12", path))?;
+    migrations::run_to_v12(&mut reference)
+        .map_err(|_| safe_error("No se pudo construir la referencia del esquema v12", path))?;
+
+    let mut expected = canonical_schema_objects(&reference)
+        .map_err(|_| safe_error("No se pudo leer la referencia del esquema v12", path))?;
+    let v12_units = normalize_schema_sql("base_unit IN ('piece', 'gram', 'milliliter')");
+    let v13_units =
+        normalize_schema_sql("base_unit IN ('piece', 'gram', 'milliliter', 'centimeter')");
+    for (object_type, name, _, sql) in &mut expected {
+        if object_type == "table"
+            && matches!(
+                name.as_str(),
+                "products" | "sale_details" | "inventory_movements"
+            )
+        {
+            let replaced = sql.replacen(&v12_units, &v13_units, 1);
+            if replaced == *sql {
+                return Err(safe_error(
+                    "La referencia v12 no contiene la restriccion de unidad esperada",
+                    path,
+                ));
+            }
+            *sql = replaced;
+        }
+    }
+    let actual = canonical_schema_objects(connection)
+        .map_err(|_| safe_error("No se pudo leer el esquema v13 instalado", path))?;
+    if actual != expected {
+        return Err(safe_error("El esquema v13 no es canonico", path));
+    }
+
+    Ok(())
+}
+
+fn migration_snapshot(
+    connection: &Connection,
+    path: &Path,
+    source_version: i64,
+) -> OpenResult<MigrationSnapshot> {
+    fn quoted_rows(connection: &Connection, sql: &str) -> rusqlite::Result<SnapshotRows> {
+        let mut statement = connection.prepare(sql)?;
+        let column_count = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..column_count).map(|column| row.get(column)).collect()
+            })?
+            .collect();
+        rows
+    }
+
+    let result = (|| -> rusqlite::Result<MigrationSnapshot> {
+        let is_v8_source = source_version == LEGACY_MIGRATION_SOURCE_VERSION;
+        Ok(MigrationSnapshot {
+            users: quoted_rows(
+                connection,
+                "SELECT quote(id),quote(first_name),quote(last_name),quote(email),quote(password_hash),quote(created_at),quote(updated_at) FROM users ORDER BY id",
+            )?,
+            brands: quoted_rows(
+                connection,
+                "SELECT quote(id),quote(name),quote(name_search_key),quote(created_at),quote(updated_at) FROM brands ORDER BY id",
+            )?,
+            categories: quoted_rows(
+                connection,
+                "SELECT quote(id),quote(name),quote(name_search_key),quote(created_at),quote(updated_at) FROM categories ORDER BY id",
+            )?,
+            products: quoted_rows(
+                connection,
+                if is_v8_source {
+                    "SELECT quote(id),quote(name),quote(name_search_key),quote(price),quote(stock),quote(sku),quote(sku_search_key),quote(brand_id),quote(category_id),quote(created_at),quote(updated_at) FROM products ORDER BY id"
+                } else {
+                    "SELECT quote(id),quote(name),quote(name_search_key),quote(price),quote(stock),quote(sku),quote(sku_search_key),quote(brand_id),quote(category_id),quote(created_at),quote(updated_at),quote(base_unit),quote(inventory_cost_cents) FROM products ORDER BY id"
+                },
+            )?,
+            presentations: if is_v8_source {
+                Vec::new()
+            } else {
+                quoted_rows(
+                    connection,
+                    "SELECT quote(id),quote(product_id),quote(name),quote(mode),quote(base_quantity),quote(price),quote(barcode),quote(barcode_search_key),quote(is_default),quote(is_active),quote(created_at),quote(updated_at) FROM product_presentations ORDER BY id",
+                )?
+            },
+            sales: quoted_rows(
+                connection,
+                if is_v8_source {
+                    "SELECT quote(id),quote(user_id),quote(cashier_name),quote(cashier_email),quote(checkout_token),quote(cart_fingerprint),quote(sale_date),quote(total),quote(payment_method),quote(cash_received),quote(change_amount),quote(created_at),quote(updated_at) FROM sales ORDER BY id"
+                } else {
+                    "SELECT quote(id),quote(user_id),quote(cashier_name),quote(cashier_email),quote(checkout_token),quote(cart_fingerprint),quote(sale_date),quote(subtotal),quote(discount_type),quote(discount_value),quote(discount_amount),quote(total),quote(payment_method),quote(cash_received),quote(change_amount),quote(created_at),quote(updated_at) FROM sales ORDER BY id"
+                },
+            )?,
+            sale_details: quoted_rows(
+                connection,
+                if is_v8_source {
+                    "SELECT quote(id),quote(product_id),quote(sale_id),quote(product_name),quote(sku),quote(quantity),quote(unit_price),quote(created_at),quote(updated_at) FROM sale_details ORDER BY id"
+                } else {
+                    "SELECT quote(id),quote(product_id),quote(sale_id),quote(record_version),quote(presentation_id),quote(product_name),quote(sku),quote(presentation_name),quote(presentation_barcode),quote(base_unit),quote(presentation_mode),quote(presentation_base_quantity),quote(quantity),quote(catalog_unit_price),quote(unit_price),quote(entered_quantity),quote(base_quantity),quote(line_total),quote(movement_cost_cents),quote(created_at),quote(updated_at) FROM sale_details ORDER BY id"
+                },
+            )?,
+            movements: quoted_rows(
+                connection,
+                if is_v8_source {
+                    "SELECT quote(id),quote(product_id),quote(product_name),quote(sku),quote(product_search_key),quote(sku_search_key),quote(sale_id),quote(origin),quote(reason),quote(type),quote(quantity),quote(operation_token),quote(intent_fingerprint),quote(created_at),quote(updated_at) FROM inventory_movements ORDER BY id"
+                } else {
+                    "SELECT quote(id),quote(product_id),quote(product_name),quote(sku),quote(product_search_key),quote(sku_search_key),quote(sale_id),quote(record_version),quote(presentation_id),quote(sale_detail_id),quote(presentation_name),quote(presentation_barcode),quote(base_unit),quote(presentation_mode),quote(presentation_base_quantity),quote(unit_price_cents),quote(origin),quote(reason),quote(type),quote(quantity),quote(entered_quantity),quote(base_quantity),quote(stock_before),quote(stock_after),quote(movement_cost_cents),quote(inventory_cost_before_cents),quote(inventory_cost_after_cents),quote(supplier),quote(provider_search_key),quote(document_reference),quote(document_reference_search_key),quote(note),quote(note_search_key),quote(operation_token),quote(intent_fingerprint),quote(created_at),quote(updated_at) FROM inventory_movements ORDER BY id"
+                },
+            )?,
+            sequences: quoted_rows(
+                connection,
+                if is_v8_source {
+                    "WITH names(name) AS (VALUES('users'),('brands'),('categories'),('products'),('sales'),('sale_details'),('inventory_movements')) SELECT quote(names.name),quote(coalesce(sqlite_sequence.seq,0)) FROM names LEFT JOIN sqlite_sequence USING(name) ORDER BY names.name"
+                } else {
+                    "SELECT quote(name),quote(seq) FROM sqlite_sequence ORDER BY name"
+                },
+            )?,
+        })
+    })();
+    result.map_err(|_| safe_error("No se pudo comparar la integridad historica", path))
+}
+
+fn create_validated_backup(
+    source: &Connection,
+    directory: &Path,
+    source_version: i64,
+) -> OpenResult<MigrationManifest> {
+    create_validated_backup_with(source, directory, source_version, copy_sqlite_database)
 }
 
 fn create_validated_backup_with<F>(
     source: &Connection,
     directory: &Path,
+    source_version: i64,
     copy_database: F,
 ) -> OpenResult<MigrationManifest>
 where
@@ -432,7 +797,7 @@ where
         .duration_since(UNIX_EPOCH)
         .map_err(|_| safe_error("El reloj del sistema no permite crear el backup", directory))?;
     let attempt_id = format!("{}-{}", now.as_nanos(), std::process::id());
-    let backup_path = directory.join(format!("pos-v8-before-v0.2.0-{attempt_id}.db"));
+    let backup_path = directory.join(format!("pos-v{source_version}-before-v13-{attempt_id}.db"));
 
     create_database_file_new(&backup_path)
         .map_err(|_| safe_error("No se pudo crear un backup nuevo", &backup_path))?;
@@ -444,7 +809,7 @@ where
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| safe_error("No se pudo reabrir el backup", &backup_path))?;
-        validate_database(&validation, MIGRATION_SOURCE_VERSION, true, &backup_path)?;
+        validate_database(&validation, source_version, true, &backup_path)?;
         secure_file(&backup_path).map_err(|_| {
             safe_error(
                 "No se pudieron proteger los permisos del backup",
@@ -461,7 +826,7 @@ where
 
     Ok(MigrationManifest {
         attempt_id,
-        source_version: MIGRATION_SOURCE_VERSION,
+        source_version,
         target_version: CURRENT_SCHEMA_VERSION,
         created_at_unix_seconds: now.as_secs(),
         backup_path,
@@ -487,23 +852,23 @@ fn copy_sqlite_database(source: &Connection, destination_path: &Path) -> OpenRes
 
 // Deliberately kept as a backend maintenance primitive, not a Tauri command.
 #[allow(dead_code)]
-pub fn restore_v8_backup(
+pub fn restore_migration_backup(
     directory: &Path,
     database_path: &Path,
     backup_path: &Path,
 ) -> Result<Connection, Box<dyn Error>> {
-    restore_v8_backup_inner(directory, database_path, backup_path).map_err(Into::into)
+    restore_migration_backup_inner(directory, database_path, backup_path).map_err(Into::into)
 }
 
-fn restore_v8_backup_inner(
+fn restore_migration_backup_inner(
     directory: &Path,
     database_path: &Path,
     backup_path: &Path,
 ) -> OpenResult<Connection> {
-    restore_v8_backup_inner_with_hook(directory, database_path, backup_path, |_| Ok(()))
+    restore_migration_backup_inner_with_hook(directory, database_path, backup_path, |_| Ok(()))
 }
 
-fn restore_v8_backup_inner_with_hook<F>(
+fn restore_migration_backup_inner_with_hook<F>(
     directory: &Path,
     database_path: &Path,
     backup_path: &Path,
@@ -519,7 +884,18 @@ where
         )
     })?;
     let _migration_lock = acquire_migration_lock(directory)?;
-    let pending_path = directory.join(PENDING_MARKER_NAME);
+    let current_pending_path = directory.join(PENDING_MARKER_NAME);
+    let legacy_pending_path = directory.join(LEGACY_PENDING_MARKER_NAME);
+    let pending_path = if current_pending_path.try_exists().map_err(|_| {
+        safe_error(
+            "No se pudo comprobar el marcador pendiente",
+            &current_pending_path,
+        )
+    })? {
+        current_pending_path
+    } else {
+        legacy_pending_path
+    };
     let pending_manifest = pending_manifest_for_restore(&pending_path, backup_path)?;
     let restore_marker = directory.join(RESTORE_MARKER_NAME);
     reconcile_restore_completion(directory, &restore_marker)?;
@@ -536,7 +912,20 @@ where
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| safe_error("No se pudo abrir el backup para restaurarlo", backup_path))?;
-    validate_database(&source, MIGRATION_SOURCE_VERSION, true, backup_path)?;
+    let source_version = schema_version(&source, backup_path)?;
+    if !matches!(
+        source_version,
+        LEGACY_MIGRATION_SOURCE_VERSION | DIRECT_MIGRATION_SOURCE_VERSION
+    ) || pending_manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.source_version != source_version)
+    {
+        return Err(safe_error(
+            "El backup no corresponde a una fuente de migracion admitida",
+            backup_path,
+        ));
+    }
+    validate_database(&source, source_version, true, backup_path)?;
 
     let database_directory = database_path.parent().unwrap_or(directory);
     prepare_directory(database_directory).map_err(|_| {
@@ -581,7 +970,7 @@ where
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| safe_error("No se pudo abrir la restauracion temporal", &temporary_path))?;
-        validate_database(&validation, MIGRATION_SOURCE_VERSION, true, &temporary_path)?;
+        validate_database(&validation, source_version, true, &temporary_path)?;
         secure_file(&temporary_path).map_err(|_| {
             safe_error(
                 "No se pudo proteger la restauracion temporal",
@@ -739,7 +1128,7 @@ where
             ));
         }
     };
-    if validate_database(&restored, MIGRATION_SOURCE_VERSION, true, database_path).is_err() {
+    if validate_database(&restored, source_version, true, database_path).is_err() {
         drop(restored);
         return Err(rollback_or_recovery_error(
             "La base restaurada no es valida; conserve el backup",
@@ -773,10 +1162,15 @@ where
     }
 
     if let Some(manifest) = pending_manifest {
-        let archived_path = directory.join(format!(
-            "pos-v0.2.0-migration-restored-{}.json",
-            manifest.attempt_id
-        ));
+        let archive_prefix = if pending_path.file_name().and_then(|name| name.to_str())
+            == Some(LEGACY_PENDING_MARKER_NAME)
+        {
+            "pos-v0.2.0-migration-restored"
+        } else {
+            "pos-schema-v13-migration-restored"
+        };
+        let archived_path =
+            directory.join(format!("{archive_prefix}-{}.json", manifest.attempt_id));
         let archive_result = archived_path
             .try_exists()
             .ok()
@@ -815,8 +1209,9 @@ where
         }
     }
 
-    let completed_restore =
-        directory.join(format!("pos-v0.2.0-restore-completed-{restore_id}.json"));
+    let completed_restore = directory.join(format!(
+        "pos-schema-v13-restore-completed-{restore_id}.json"
+    ));
     finalize_marker_with_hook(
         directory,
         &restore_marker,
@@ -874,12 +1269,17 @@ fn pending_manifest_for_restore(
             .map_err(|_| safe_error("No se pudo leer el marcador pendiente", pending_path))?,
     )
     .map_err(|_| safe_error("El marcador pendiente no es valido", pending_path))?;
-    if manifest.source_version != MIGRATION_SOURCE_VERSION
-        || manifest.target_version != CURRENT_SCHEMA_VERSION
-        || manifest.backup_path != backup_path
-    {
+    let legacy_manifest = pending_path.file_name().and_then(|name| name.to_str())
+        == Some(LEGACY_PENDING_MARKER_NAME)
+        && manifest.source_version == LEGACY_MIGRATION_SOURCE_VERSION
+        && manifest.target_version == DIRECT_MIGRATION_SOURCE_VERSION;
+    let current_manifest = matches!(
+        manifest.source_version,
+        LEGACY_MIGRATION_SOURCE_VERSION | DIRECT_MIGRATION_SOURCE_VERSION
+    ) && manifest.target_version == CURRENT_SCHEMA_VERSION;
+    if (!legacy_manifest && !current_manifest) || manifest.backup_path != backup_path {
         return Err(recovery_error(
-            "El marcador pendiente no corresponde al backup v8 indicado",
+            "El marcador pendiente no corresponde al backup indicado",
             &manifest.backup_path,
         ));
     }
@@ -1054,7 +1454,7 @@ fn complete_marker(
     manifest: &MigrationManifest,
 ) -> OpenResult<()> {
     let completed_path = directory.join(format!(
-        "pos-v0.2.0-migration-completed-{}.json",
+        "pos-schema-v13-migration-completed-{}.json",
         manifest.attempt_id
     ));
     finalize_marker_with_hook(
@@ -1144,10 +1544,14 @@ fn reconcile_migration_completion(directory: &Path, active_path: &Path) -> OpenR
         return Ok(());
     }
     let manifest: MigrationManifest = read_marker(active_path, "migracion")?;
-    let completed_path = directory.join(format!(
-        "pos-v0.2.0-migration-completed-{}.json",
-        manifest.attempt_id
-    ));
+    let prefix = if active_path.file_name().and_then(|name| name.to_str())
+        == Some(LEGACY_PENDING_MARKER_NAME)
+    {
+        "pos-v0.2.0-migration-completed"
+    } else {
+        "pos-schema-v13-migration-completed"
+    };
+    let completed_path = directory.join(format!("{prefix}-{}.json", manifest.attempt_id));
     reconcile_completed_pair(directory, active_path, &completed_path, &manifest)
 }
 
@@ -1161,10 +1565,14 @@ fn reconcile_restore_completion(directory: &Path, active_path: &Path) -> OpenRes
         return Ok(());
     }
     let manifest: RestoreManifest = read_marker(active_path, "restauracion")?;
-    let completed_path = directory.join(format!(
-        "pos-v0.2.0-restore-completed-{}.json",
-        manifest.restore_id
-    ));
+    let prefix = if active_path.file_name().and_then(|name| name.to_str())
+        == Some(LEGACY_RESTORE_MARKER_NAME)
+    {
+        "pos-v0.2.0-restore-completed"
+    } else {
+        "pos-schema-v13-restore-completed"
+    };
+    let completed_path = directory.join(format!("{prefix}-{}.json", manifest.restore_id));
     reconcile_completed_pair(directory, active_path, &completed_path, &manifest)
 }
 
@@ -1390,6 +1798,53 @@ mod tests {
             .unwrap();
     }
 
+    fn create_v12_database(path: &Path) {
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        migrations::run_to_version(&mut connection, 12).unwrap();
+        connection.execute_batch(
+            "INSERT INTO users(id,first_name,last_name,email,password_hash,created_at,updated_at)
+             VALUES(1,'Ada','Lovelace','ada@pos.local','hash','2025-01-01 08:00:00','2025-01-01 08:00:01');
+             INSERT INTO brands(id,name,name_search_key,created_at,updated_at)
+             VALUES(1,'Marca','marca','2025-01-01 08:01:00','2025-01-01 08:01:01');
+             INSERT INTO categories(id,name,name_search_key,created_at,updated_at)
+             VALUES(1,'Categoria','categoria','2025-01-01 08:02:00','2025-01-01 08:02:01');
+             INSERT INTO products(id,name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents)
+             VALUES(1,'Producto','producto',100,10,'SKU-1','sku-1',1,1,'piece',1000);
+             INSERT INTO product_presentations(id,product_id,name,mode,base_quantity,price,is_default)
+             VALUES(1,1,'Pieza','fixed',1,100,1);
+             INSERT INTO sales(id,user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method,created_at,updated_at)
+             VALUES(1,1,'Ada Lovelace','ada@pos.local','checkout','cart-v5:test','2025-01-03 10:00:00',360,'fixed',60,60,300,'tarjeta','2025-01-03 10:00:01','2025-01-03 10:00:02');
+             INSERT INTO sale_details(id,product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,catalog_unit_price,unit_price,entered_quantity,base_quantity,line_total,movement_cost_cents)
+             VALUES(1,1,1,3,1,'Producto historico','SKU-HIST','Pieza','piece','fixed',1,3,150,120,3,3,360,320);
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents,supplier,provider_search_key,document_reference,document_reference_search_key,note,note_search_key,operation_token,intent_fingerprint,created_at,updated_at)
+             VALUES(1,1,'Producto compra','SKU-COMPRA','producto compra','sku-compra',2,1,'Pieza','piece','fixed',1,100,'manual','compra','entrada',10,10,10,0,10,1000,0,1000,'Proveedor Uno','proveedor uno','FAC-001','fac-001','Compra corregible','compra corregible','purchase-token','purchase-fingerprint','2025-01-01 09:00:00','2025-01-01 09:00:01');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents,operation_token,intent_fingerprint,created_at,updated_at)
+             VALUES(2,1,'Producto ajuste','SKU-AJUSTE','producto ajuste','sku-ajuste',2,1,'Pieza','piece','fixed',1,120,'manual','ajuste','entrada',5,5,5,10,15,600,1000,1600,'adjust-in-token','adjust-in-fingerprint','2025-01-02 09:00:00','2025-01-02 09:00:01');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents,created_at,updated_at)
+             VALUES(3,1,'Producto historico','SKU-HIST','producto historico','sku-hist',1,2,1,1,'Pieza','piece','fixed',1,120,'sale','venta','salida',3,3,3,15,12,320,1600,1280,'2025-01-03 10:00:03','2025-01-03 10:00:04');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents,operation_token,intent_fingerprint,created_at,updated_at)
+             VALUES(4,1,'Producto salida','SKU-SALIDA','producto salida','sku-salida',2,1,'Pieza','piece','fixed',1,107,'manual','ajuste','salida',2,2,2,12,10,214,1280,1066,'adjust-out-token','adjust-out-fingerprint','2025-01-04 09:00:00','2025-01-04 09:00:01');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents,operation_token,intent_fingerprint,note,note_search_key,created_at,updated_at)
+             VALUES(5,1,'Producto valorado','SKU-VAL','producto valorado','sku-val',2,'manual','valoracion','valoracion',0,0,0,10,10,1000,1066,1000,'valuation-token','valuation-fingerprint','Frontera de valoracion','frontera de valoracion','2025-01-05 09:00:00','2025-01-05 09:00:01');
+             INSERT INTO products(id,name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents)
+             VALUES(2,'Sin costo','sin costo',250,5,'SKU-2','sku-2',1,1,'piece',NULL);
+             INSERT INTO product_presentations(id,product_id,name,mode,base_quantity,price,is_default)
+             VALUES(2,2,'Pieza','fixed',1,250,1);
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,created_at,updated_at)
+             VALUES(6,2,'Sin costo inicial','SKU-2-HIST','sin costo inicial','sku-2-hist',2,2,'Pieza','piece','fixed',1,'initial_stock','ajuste','entrada',5,5,5,0,5,'2025-01-01 11:00:00','2025-01-01 11:00:01');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint,created_at,updated_at)
+             VALUES(7,2,'Sin costo salida','SKU-2-HIST','sin costo salida','sku-2-hist',2,2,'Pieza','piece','fixed',1,'manual','ajuste','salida',1,1,1,5,4,'unknown-out-token','unknown-out-fingerprint','2025-01-02 11:00:00','2025-01-02 11:00:01');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,operation_token,intent_fingerprint,created_at,updated_at)
+             VALUES(8,2,'Sin costo compra','SKU-2-HIST','sin costo compra','sku-2-hist',2,2,'Pieza','piece','fixed',1,175,'manual','compra','entrada',1,1,1,4,5,175,'unknown-buy-token','unknown-buy-fingerprint','2025-01-03 11:00:00','2025-01-03 11:00:01');
+             INSERT INTO inventory_movements(id,product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents,operation_token,intent_fingerprint)
+             VALUES(30,1,'Secuencia eliminada','SEQ','secuencia eliminada','seq',2,1,'Pieza','piece','fixed',1,1,'manual','ajuste','entrada',1,1,1,10,11,1,1000,1001,'deleted-sequence-token','deleted-sequence-fingerprint');
+             DELETE FROM inventory_movements WHERE id=30;",
+        ).unwrap();
+    }
+
     fn version(path: &Path) -> i64 {
         Connection::open(path)
             .unwrap()
@@ -1429,7 +1884,7 @@ mod tests {
 
         let v12_path = temp.path().join("v12.db");
         let mut v12 = Connection::open(&v12_path).unwrap();
-        migrations::run(&mut v12).unwrap();
+        migrations::run_to_version(&mut v12, 12).unwrap();
         validate_database(&v12, 12, true, &v12_path).unwrap();
         v12.pragma_update(None, "foreign_keys", false).unwrap();
         v12.execute("DROP TABLE product_presentations", []).unwrap();
@@ -1437,13 +1892,86 @@ mod tests {
     }
 
     #[test]
-    fn new_database_goes_directly_to_v12_without_backup() {
+    fn canonical_v12_schema_passes_complete_comparison() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrations::run_to_v12(&mut connection).unwrap();
+
+        validate_database(&connection, 12, true, Path::new("canonical-v12.db")).unwrap();
+    }
+
+    #[test]
+    fn canonical_v13_schema_passes_complete_comparison() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrations::run_to_v13(&mut connection).unwrap();
+
+        validate_database(&connection, 13, true, Path::new("canonical-v13.db")).unwrap();
+    }
+
+    #[test]
+    fn v13_with_extra_or_missing_index_or_constraint_is_rejected() {
+        for alteration in [
+            "CREATE INDEX unexpected_v13_index ON products(price)",
+            "DROP INDEX idx_inventory_movements_sale_detail_id",
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master SET sql=replace(sql,
+               'price INTEGER NOT NULL CHECK (typeof(price) = ''integer'' AND price BETWEEN 1 AND 9007199254740991),',
+               'price INTEGER NOT NULL,')
+             WHERE type='table' AND name='products';
+             PRAGMA schema_version=101;
+             PRAGMA writable_schema=OFF",
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master SET sql=replace(sql,
+               'stock INTEGER NOT NULL CHECK (typeof(stock) = ''integer'' AND stock BETWEEN 0 AND 9007199254740991),',
+               'stock INTEGER NOT NULL CHECK (typeof(stock) = ''integer'' AND stock BETWEEN 0 AND 9007199254740991) CHECK (stock>=0),')
+             WHERE type='table' AND name='products';
+             PRAGMA schema_version=102;
+             PRAGMA writable_schema=OFF",
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            migrations::run_to_v13(&mut connection).unwrap();
+            connection.execute_batch(alteration).unwrap();
+
+            let error = validate_database(&connection, 13, true, Path::new("altered-v13.db"))
+                .unwrap_err();
+
+            assert!(error.to_string().contains("no es canonico"), "{alteration}");
+        }
+    }
+
+    #[test]
+    fn v12_with_extra_trigger_or_view_is_rejected_before_backup_marker_or_lock() {
+        for extra_object in [
+            "CREATE TRIGGER unexpected_product_trigger AFTER INSERT ON products BEGIN SELECT NEW.id; END",
+            "CREATE VIEW unexpected_product_view AS SELECT id,name FROM products",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("pos.db");
+            create_v12_database(&path);
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(extra_object).unwrap();
+            drop(connection);
+
+            let error = open_database_path(temp.path(), &path).unwrap_err();
+
+            assert!(error.to_string().contains("no es canonico"), "{extra_object}");
+            assert_eq!(version(&path), 12, "{extra_object}");
+            assert!(
+                matching_files(temp.path(), "pos-v12-before-v13-").is_empty(),
+                "{extra_object}"
+            );
+            assert!(!temp.path().join(PENDING_MARKER_NAME).exists(), "{extra_object}");
+            assert!(!temp.path().join(MIGRATION_LOCK_NAME).exists(), "{extra_object}");
+        }
+    }
+
+    #[test]
+    fn new_database_goes_directly_to_v13_without_backup() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
 
         let connection = open_database_path(temp.path(), &path).unwrap();
 
-        assert_eq!(schema_version(&connection, &path).unwrap(), 12);
+        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
         assert_eq!(
             connection
                 .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
@@ -1451,7 +1979,241 @@ mod tests {
                 .to_lowercase(),
             "wal"
         );
-        assert!(matching_files(temp.path(), "pos-v8-before-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+    }
+
+    #[test]
+    fn migrates_v12_to_v13_with_validated_backup_and_literal_cost_history() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pos.db");
+        create_v12_database(&path);
+
+        let connection = open_database_path(temp.path(), &path).unwrap();
+
+        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
+        validate_database(&connection, 13, true, &path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT subtotal,total FROM sales WHERE id=1", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (360, 300)
+        );
+        assert_eq!(
+            connection
+                .prepare("SELECT id,stock FROM products ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![(1, 10), (2, 5)]
+        );
+        for (table, column) in [
+            ("products", "inventory_cost_cents"),
+            ("sale_details", "movement_cost_cents"),
+            ("inventory_movements", "unit_price_cents"),
+            ("inventory_movements", "movement_cost_cents"),
+            ("inventory_movements", "inventory_cost_before_cents"),
+            ("inventory_movements", "inventory_cost_after_cents"),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                        params![table, column],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT inventory_cost_cents FROM products WHERE id=1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            Some(1000)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT unit_price_cents,movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents FROM inventory_movements WHERE id=3",
+                    [],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<i64>>(3)?)),
+                )
+                .unwrap(),
+            (Some(120), Some(320), Some(1600), Some(1280))
+        );
+        let backups = matching_files(temp.path(), "pos-v12-before-v13-");
+        assert_eq!(backups.len(), 1);
+        let backup =
+            Connection::open_with_flags(&backups[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        validate_database(&backup, 12, true, &backups[0]).unwrap();
+        let manifest_path = &matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0];
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!((manifest.source_version, manifest.target_version), (12, 13));
+    }
+
+    #[test]
+    fn v12_snapshot_covers_every_retained_field_and_sequence() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pos.db");
+        create_v12_database(&path);
+        let mut connection = Connection::open(&path).unwrap();
+        let before = migration_snapshot(&connection, &path, 12).unwrap();
+
+        assert!(before.users.iter().all(|row| row.len() == 7));
+        assert!(before.brands.iter().all(|row| row.len() == 5));
+        assert!(before.categories.iter().all(|row| row.len() == 5));
+        assert!(before.products.iter().all(|row| row.len() == 13));
+        assert!(before.presentations.iter().all(|row| row.len() == 12));
+        assert!(before.sales.iter().all(|row| row.len() == 17));
+        assert!(before.sale_details.iter().all(|row| row.len() == 21));
+        assert!(before.movements.iter().all(|row| row.len() == 37));
+        assert_eq!(before.sequences.len(), 8);
+        assert!(before
+            .movements
+            .iter()
+            .flatten()
+            .any(|value| value == "NULL"));
+
+        migrations::run_to_version(&mut connection, 13).unwrap();
+        assert_eq!(migration_snapshot(&connection, &path, 12).unwrap(), before);
+    }
+
+    #[test]
+    fn historical_v12_presentation_combinations_do_not_block_migration() {
+        for (base_unit, mode) in [("gram", "fixed"), ("piece", "measured")] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("pos.db");
+            create_v12_database(&path);
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("UPDATE products SET base_unit=?1 WHERE id=1", [base_unit])
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE product_presentations SET mode=?1 WHERE id=1",
+                    [mode],
+                )
+                .unwrap();
+            drop(connection);
+            let migrated = open_database_path(temp.path(), &path).unwrap();
+            assert_eq!(version(&path), 13, "{base_unit}+{mode}");
+            assert_eq!(
+                migrated
+                    .query_row(
+                        "SELECT mode FROM product_presentations WHERE id=1",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn adulterated_v12_schema_is_rejected_without_backup_or_marker() {
+        for alteration in [
+            "DROP INDEX idx_inventory_movements_sale_detail_id",
+            "DROP INDEX idx_products_sku_search_key;
+             CREATE INDEX idx_products_sku_search_key ON products(sku_search_key)",
+            "DROP INDEX idx_sale_details_line_identity;
+             CREATE INDEX idx_sale_details_line_identity ON sale_details(id)",
+            "ALTER TABLE products RENAME COLUMN inventory_cost_cents TO retired_cost",
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master
+                SET sql=replace(sql, 'inventory_cost_cents INTEGER', 'inventory_cost_cents TEXT')
+              WHERE type='table' AND name='products';
+             PRAGMA schema_version=98;
+             PRAGMA writable_schema=OFF",
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master
+                SET sql=replace(sql, 'REFERENCES users(id) ON DELETE RESTRICT', 'REFERENCES users(id) ON DELETE CASCADE')
+              WHERE type='table' AND name='sales';
+             PRAGMA schema_version=97;
+             PRAGMA writable_schema=OFF",
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master
+                SET sql=replace(sql, 'CHECK (base_unit IN (''piece'', ''gram'', ''milliliter''))', '')
+              WHERE type='table' AND name='products';
+             PRAGMA schema_version=99;
+             PRAGMA writable_schema=OFF",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("pos.db");
+            create_v12_database(&path);
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(alteration).unwrap();
+            drop(connection);
+
+            assert!(
+                open_database_path(temp.path(), &path).is_err(),
+                "{alteration}"
+            );
+            assert_eq!(version(&path), 12);
+            assert!(matching_files(temp.path(), "pos-v12-before-v13-").is_empty());
+            assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
+            assert!(!temp.path().join(MIGRATION_LOCK_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn adulterated_v12_sales_discount_coherence_is_rejected_before_backup() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pos.db");
+        create_v12_database(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_master
+                    SET sql=replace(sql,
+                        'discount_type = ''fixed'' AND discount_value > 0 AND discount_amount = discount_value',
+                        'discount_type = ''fixed'' AND discount_value > 0 AND discount_amount >= 0')
+                  WHERE type='table' AND name='sales';
+                 PRAGMA schema_version=101;
+                 PRAGMA writable_schema=OFF",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(open_database_path(temp.path(), &path).is_err());
+        assert_eq!(version(&path), 12);
+        assert!(matching_files(temp.path(), "pos-v12-before-v13-").is_empty());
+        assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
+        assert!(!temp.path().join(MIGRATION_LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn legacy_pending_marker_is_still_detected() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pos.db");
+        create_v8_database(&path);
+        let backup = temp.path().join("legacy-backup.db");
+        let marker = MigrationManifest {
+            attempt_id: "legacy".into(),
+            source_version: 8,
+            target_version: 12,
+            created_at_unix_seconds: 1,
+            backup_path: backup.clone(),
+        };
+        write_pending_marker(&temp.path().join(LEGACY_PENDING_MARKER_NAME), &marker).unwrap();
+
+        let error = open_database_path(temp.path(), &path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains(backup.to_string_lossy().as_ref()));
+        assert_eq!(version(&path), 8);
+        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
     }
 
     #[test]
@@ -1461,7 +2223,7 @@ mod tests {
         create_v8_database(&path);
 
         let connection = open_database_path(temp.path(), &path).unwrap();
-        assert_eq!(schema_version(&connection, &path).unwrap(), 12);
+        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
         assert_eq!(
             connection
                 .query_row("SELECT stock FROM products WHERE id=1", [], |row| row
@@ -1471,8 +2233,8 @@ mod tests {
         );
         drop(connection);
 
-        let backups = matching_files(temp.path(), "pos-v8-before-v0.2.0-");
-        let manifests = matching_files(temp.path(), "pos-v0.2.0-migration-completed-");
+        let backups = matching_files(temp.path(), "pos-v8-before-v13-");
+        let manifests = matching_files(temp.path(), "pos-schema-v13-migration-completed-");
         assert_eq!(backups.len(), 1);
         assert_eq!(manifests.len(), 1);
         assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
@@ -1485,29 +2247,27 @@ mod tests {
     }
 
     #[test]
-    fn v12_reopens_without_replacing_backup_or_manifest() {
+    fn v13_reopens_without_replacing_backup_or_manifest() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
         drop(open_database_path(temp.path(), &path).unwrap());
-        let backup = matching_files(temp.path(), "pos-v8-before-v0.2.0-")[0].clone();
-        let manifest = matching_files(temp.path(), "pos-v0.2.0-migration-completed-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let manifest =
+            matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
         let backup_bytes = fs::read(&backup).unwrap();
         let manifest_bytes = fs::read(&manifest).unwrap();
 
         drop(open_database_path(temp.path(), &path).unwrap());
 
-        assert_eq!(
-            matching_files(temp.path(), "pos-v8-before-v0.2.0-").len(),
-            1
-        );
+        assert_eq!(matching_files(temp.path(), "pos-v8-before-v13-").len(), 1);
         assert_eq!(fs::read(backup).unwrap(), backup_bytes);
         assert_eq!(fs::read(manifest).unwrap(), manifest_bytes);
     }
 
     #[test]
     fn rejects_intermediate_future_and_negative_versions() {
-        for requested in [-1_i64, 1, 7, 9, 10, 11, 13] {
+        for requested in [-1_i64, 1, 7, 9, 10, 11, 14] {
             let temp = TempDir::new().unwrap();
             let path = temp.path().join("pos.db");
             let connection = Connection::open(&path).unwrap();
@@ -1520,7 +2280,7 @@ mod tests {
             assert!(error.to_string().contains(path.to_string_lossy().as_ref()));
             assert!(error.recovery_startup_message().is_none());
             assert_eq!(version(&path), requested);
-            assert!(matching_files(temp.path(), "pos-v8-before-").is_empty());
+            assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
         }
     }
 
@@ -1542,7 +2302,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(invalid_path.to_string_lossy().as_ref()));
-        assert!(matching_files(invalid.path(), "pos-v8-before-").is_empty());
+        assert!(matching_files(invalid.path(), "pos-v8-before-v13-").is_empty());
     }
 
     #[test]
@@ -1559,7 +2319,7 @@ mod tests {
             let marker = MigrationManifest {
                 attempt_id: "blocked".into(),
                 source_version: 8,
-                target_version: 12,
+                target_version: 13,
                 created_at_unix_seconds: 1,
                 backup_path: backup.clone(),
             };
@@ -1627,10 +2387,7 @@ mod tests {
 
         assert!(open_database_path(temp.path(), &path).is_err());
         assert_eq!(version(&path), 8);
-        assert_eq!(
-            matching_files(temp.path(), "pos-v8-before-v0.2.0-").len(),
-            1
-        );
+        assert_eq!(matching_files(temp.path(), "pos-v8-before-v13-").len(), 1);
         assert!(temp.path().join(PENDING_MARKER_NAME).exists());
         assert!(open_database_path(temp.path(), &path)
             .unwrap_err()
@@ -1639,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_post_validation_leaves_v12_pending_and_blocks_reopen() {
+    fn failed_post_validation_leaves_v13_pending_and_blocks_reopen() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
@@ -1666,7 +2423,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains(marker.backup_path.to_string_lossy().as_ref()));
-        assert_eq!(version(&path), 12);
+        assert_eq!(version(&path), 13);
         assert!(temp.path().join(PENDING_MARKER_NAME).exists());
         assert!(open_database_path(temp.path(), &path).is_err());
     }
@@ -1685,13 +2442,13 @@ mod tests {
             let manifest = MigrationManifest {
                 attempt_id: format!("completion-{failure_stage:?}"),
                 source_version: 8,
-                target_version: 12,
+                target_version: 13,
                 created_at_unix_seconds: 1,
                 backup_path: temp.path().join("backup.db"),
             };
             write_pending_marker(&active, &manifest).unwrap();
             let completed = temp.path().join(format!(
-                "pos-v0.2.0-migration-completed-{}.json",
+                "pos-schema-v13-migration-completed-{}.json",
                 manifest.attempt_id
             ));
 
@@ -1750,7 +2507,7 @@ mod tests {
             };
             write_json_marker(&active, &manifest, &manifest.restore_id).unwrap();
             let completed = temp.path().join(format!(
-                "pos-v0.2.0-restore-completed-{}.json",
+                "pos-schema-v13-restore-completed-{}.json",
                 manifest.restore_id
             ));
 
@@ -1794,14 +2551,14 @@ mod tests {
         let manifest = MigrationManifest {
             attempt_id: "mismatch".into(),
             source_version: 8,
-            target_version: 12,
+            target_version: 13,
             created_at_unix_seconds: 1,
             backup_path: temp.path().join("backup.db"),
         };
         write_pending_marker(&active, &manifest).unwrap();
         let completed = temp
             .path()
-            .join("pos-v0.2.0-migration-completed-mismatch.json");
+            .join("pos-schema-v13-migration-completed-mismatch.json");
         let different = MigrationManifest {
             backup_path: temp.path().join("different.db"),
             ..manifest
@@ -1830,13 +2587,13 @@ mod tests {
         create_v8_database(&path);
         let source = Connection::open(&path).unwrap();
 
-        let error = create_validated_backup_with(&source, temp.path(), |_, destination| {
+        let error = create_validated_backup_with(&source, temp.path(), 8, |_, destination| {
             Err(safe_error("Fallo de backup inyectado", destination))
         })
         .unwrap_err();
 
         assert!(error.to_string().contains("Fallo de backup inyectado"));
-        assert!(matching_files(temp.path(), "pos-v8-before-v0.2.0-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
         assert_eq!(version(&path), 8);
         assert_eq!(
             source
@@ -1854,13 +2611,13 @@ mod tests {
         create_v8_database(&path);
         let source = Connection::open(&path).unwrap();
 
-        let result = create_validated_backup_with(&source, temp.path(), |_, destination| {
+        let result = create_validated_backup_with(&source, temp.path(), 8, |_, destination| {
             fs::write(destination, b"invalid sqlite backup")
                 .map_err(|_| safe_error("Fallo de escritura inyectado", destination))
         });
 
         assert!(result.is_err());
-        assert!(matching_files(temp.path(), "pos-v8-before-v0.2.0-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
         assert_eq!(version(&path), 8);
     }
 
@@ -1879,7 +2636,7 @@ mod tests {
             .unwrap();
         assert!(sqlite_sidecars(&path)[0].exists());
 
-        let manifest = create_validated_backup(&source, temp.path()).unwrap();
+        let manifest = create_validated_backup(&source, temp.path(), 8).unwrap();
         let backup = Connection::open_with_flags(
             &manifest.backup_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1900,7 +2657,7 @@ mod tests {
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
         drop(open_database_path(temp.path(), &path).unwrap());
-        let backup = matching_files(temp.path(), "pos-v8-before-v0.2.0-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
         let current = Connection::open(&path).unwrap();
         current
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
@@ -1914,7 +2671,7 @@ mod tests {
         assert!(sqlite_sidecars(&path)[0].exists());
         drop(current);
 
-        let restored = restore_v8_backup_inner(temp.path(), &path, &backup).unwrap();
+        let restored = restore_migration_backup_inner(temp.path(), &path, &backup).unwrap();
         assert_eq!(schema_version(&restored, &path).unwrap(), 8);
         assert_eq!(
             restored
@@ -1935,6 +2692,35 @@ mod tests {
     }
 
     #[test]
+    fn durable_restore_uses_the_v12_source_declared_by_the_manifest() {
+        let temp = TempDir::new().unwrap();
+        let backup = temp.path().join("backup-v12.db");
+        create_v12_database(&backup);
+        let path = temp.path().join("pos.db");
+        let mut current = Connection::open(&path).unwrap();
+        migrations::run(&mut current).unwrap();
+        drop(current);
+        let manifest = MigrationManifest {
+            attempt_id: "restore-v12".into(),
+            source_version: 12,
+            target_version: 13,
+            created_at_unix_seconds: 1,
+            backup_path: backup.clone(),
+        };
+        write_pending_marker(&temp.path().join(PENDING_MARKER_NAME), &manifest).unwrap();
+
+        let restored = restore_migration_backup_inner(temp.path(), &path, &backup).unwrap();
+
+        assert_eq!(schema_version(&restored, &path).unwrap(), 12);
+        validate_database(&restored, 12, true, &path).unwrap();
+        assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
+        assert!(temp
+            .path()
+            .join("pos-schema-v13-migration-restored-restore-v12.json")
+            .exists());
+    }
+
+    #[test]
     fn failed_restore_after_promotion_never_exposes_v8_with_old_sidecars_and_rolls_back() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.sqlite");
@@ -1951,28 +2737,29 @@ mod tests {
         let manifest = MigrationManifest {
             attempt_id: "replace-failure".into(),
             source_version: 8,
-            target_version: 12,
+            target_version: 13,
             created_at_unix_seconds: 1,
             backup_path: backup.clone(),
         };
         let pending = temp.path().join(PENDING_MARKER_NAME);
         write_pending_marker(&pending, &manifest).unwrap();
 
-        let error = restore_v8_backup_inner_with_hook(temp.path(), &path, &backup, |stage| {
-            if stage == RestoreStage::NamespaceQuarantined {
-                assert!(!path.exists());
-                assert!(!wal.exists());
-                assert!(!shm.exists());
-            }
-            if stage == RestoreStage::BackupPromoted {
-                assert_eq!(version(&path), 8);
-                assert!(!wal.exists());
-                assert!(!shm.exists());
-                return Err(std::io::Error::other("injected post-promote failure"));
-            }
-            Ok(())
-        })
-        .unwrap_err();
+        let error =
+            restore_migration_backup_inner_with_hook(temp.path(), &path, &backup, |stage| {
+                if stage == RestoreStage::NamespaceQuarantined {
+                    assert!(!path.exists());
+                    assert!(!wal.exists());
+                    assert!(!shm.exists());
+                }
+                if stage == RestoreStage::BackupPromoted {
+                    assert_eq!(version(&path), 8);
+                    assert!(!wal.exists());
+                    assert!(!shm.exists());
+                    return Err(std::io::Error::other("injected post-promote failure"));
+                }
+                Ok(())
+            })
+            .unwrap_err();
 
         assert!(error
             .to_string()
@@ -2004,20 +2791,20 @@ mod tests {
         let manifest = MigrationManifest {
             attempt_id: "successful-restore".into(),
             source_version: 8,
-            target_version: 12,
+            target_version: 13,
             created_at_unix_seconds: 1,
             backup_path: backup.clone(),
         };
         let pending = temp.path().join(PENDING_MARKER_NAME);
         write_pending_marker(&pending, &manifest).unwrap();
 
-        let restored = restore_v8_backup_inner(temp.path(), &path, &backup).unwrap();
+        let restored = restore_migration_backup_inner(temp.path(), &path, &backup).unwrap();
 
         assert_eq!(schema_version(&restored, &path).unwrap(), 8);
         assert!(!pending.exists());
         let archived = temp
             .path()
-            .join("pos-v0.2.0-migration-restored-successful-restore.json");
+            .join("pos-schema-v13-migration-restored-successful-restore.json");
         assert_eq!(
             fs::read(archived).unwrap(),
             serde_json::to_vec_pretty(&manifest).unwrap()
@@ -2027,7 +2814,7 @@ mod tests {
             .all(|sidecar| !sidecar.exists()));
         assert_eq!(matching_files(temp.path(), ".pos-quarantine-").len(), 3);
         assert_eq!(
-            matching_files(temp.path(), "pos-v0.2.0-restore-completed-").len(),
+            matching_files(temp.path(), "pos-schema-v13-restore-completed-").len(),
             1
         );
         assert!(!temp.path().join(RESTORE_MARKER_NAME).exists());
@@ -2063,20 +2850,21 @@ mod tests {
                 &MigrationManifest {
                     attempt_id: format!("failure-{failure_stage:?}"),
                     source_version: 8,
-                    target_version: 12,
+                    target_version: 13,
                     created_at_unix_seconds: 1,
                     backup_path: backup.clone(),
                 },
             )
             .unwrap();
 
-            let result = restore_v8_backup_inner_with_hook(temp.path(), &path, &backup, |stage| {
-                if stage == failure_stage {
-                    Err(std::io::Error::other("injected stage failure"))
-                } else {
-                    Ok(())
-                }
-            });
+            let result =
+                restore_migration_backup_inner_with_hook(temp.path(), &path, &backup, |stage| {
+                    if stage == failure_stage {
+                        Err(std::io::Error::other("injected stage failure"))
+                    } else {
+                        Ok(())
+                    }
+                });
 
             assert!(result.is_err(), "stage {failure_stage:?}");
             assert_eq!(fs::read(&path).unwrap(), before, "stage {failure_stage:?}");
@@ -2173,13 +2961,13 @@ mod tests {
             let manifest = MigrationManifest {
                 attempt_id: format!("windows-{failure_stage:?}"),
                 source_version: 8,
-                target_version: 12,
+                target_version: 13,
                 created_at_unix_seconds: 1,
                 backup_path: temp.path().join("backup.db"),
             };
             write_pending_marker(&active, &manifest).unwrap();
             let completed = temp.path().join(format!(
-                "pos-v0.2.0-migration-completed-{}.json",
+                "pos-schema-v13-migration-completed-{}.json",
                 manifest.attempt_id
             ));
 
@@ -2223,7 +3011,7 @@ mod tests {
         drop(migration_lock);
         fs::write(temp.path().join(MIGRATION_LOCK_NAME), b"stale metadata").unwrap();
         let connection = open_database_path(temp.path(), &path).unwrap();
-        assert_eq!(schema_version(&connection, &path).unwrap(), 12);
+        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
     }
 
     #[cfg(unix)]
@@ -2240,8 +3028,9 @@ mod tests {
             )
             .unwrap();
 
-        let backup = matching_files(temp.path(), "pos-v8-before-v0.2.0-")[0].clone();
-        let manifest = matching_files(temp.path(), "pos-v0.2.0-migration-completed-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let manifest =
+            matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
         for file in [path, backup, manifest] {
             assert_eq!(
                 fs::metadata(file).unwrap().permissions().mode() & 0o777,

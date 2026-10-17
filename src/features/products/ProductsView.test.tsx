@@ -22,7 +22,7 @@ const piecePresentation = {
   id: 101,
   product_id: 11,
   name: "Bolsa 250 g",
-  mode: "fixed" as const,
+  mode: "measured" as const,
   base_quantity: 250,
   price: 1250,
   barcode: "750000000001",
@@ -49,7 +49,7 @@ const measuredPresentation = {
 };
 
 const view: ProductView = {
-  stats: { product_count: 1, piece_stock: 0, gram_stock: 1250, milliliter_stock: 0, brand_count: 1, inventory_value: 0 },
+  stats: { product_count: 1, piece_stock: 0, gram_stock: 1250, milliliter_stock: 0, centimeter_stock: 0, brand_count: 1, inventory_value_cents: 6250, products_without_cost: 0 },
   items: [{
     id: 11,
     name: "Cafe molido",
@@ -58,9 +58,9 @@ const view: ProductView = {
     stock: 5,
     stock_base: 1250,
     base_unit: "gram",
-    inventory_cost_cents: null,
-    inventory_cost_status: "unknown",
-    average_cost_cents: null,
+    inventory_cost_cents: 6250,
+    inventory_cost_status: "known",
+    average_cost_cents: 5,
     brand_id: 1,
     brand_name: "Origen",
     category_id: 2,
@@ -113,7 +113,7 @@ describe("ProductsView", () => {
     expect(screen.getByRole("button", { name: "Editar producto Te verde" })).toBeTruthy();
   });
 
-  it("creates one SKU with presentations, initial cost and blocks duplicate submits", async () => {
+  it("creates one SKU with measured presentations and blocks duplicate submits", async () => {
     const request = deferred<Awaited<ReturnType<typeof createProductWithPresentations>>>();
     mockedCreateProduct.mockReturnValue(request.promise);
     await renderLoaded();
@@ -121,23 +121,20 @@ describe("ProductsView", () => {
     fireEvent.change(screen.getAllByLabelText(/^Nombre/)[0], { target: { value: "Te verde" } });
     fireEvent.change(screen.getByLabelText(/^SKU unico/), { target: { value: "TE-1" } });
     fireEvent.change(screen.getByLabelText(/^Unidad base de inventario/), { target: { value: "gram" } });
-    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Peso exacto");
+    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Kilogramo");
     fireEvent.change(screen.getByLabelText(/^Nombre de presentacion/), { target: { value: "Kilogramo" } });
     fireEvent.change(screen.getByLabelText(/^Precio de venta/), { target: { value: "19.95" } });
     fireEvent.change(screen.getByLabelText(/^Codigo de barras/), { target: { value: "750000000099" } });
     fireEvent.click(screen.getByRole("button", { name: "Agregar presentacion" }));
-    fireEvent.click(screen.getAllByRole("radio", { name: "Paquete" })[1]);
-    expect((screen.getAllByLabelText(/^Nombre de presentacion/)[1] as HTMLInputElement).value).toBe("Paquete");
+    fireEvent.click(screen.getAllByRole("radio", { name: "Otra medida" })[1]);
     fireEvent.change(screen.getAllByLabelText(/^Nombre de presentacion/)[1], { target: { value: "Bolsa 250 g" } });
     expect(screen.getByRole("button", { name: "Quitar presentación Kilogramo" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Quitar presentación Bolsa 250 g" })).toBeTruthy();
     expect(screen.queryByText(/Ejemplos: piezas, bolsas, cajas o botellas/)).toBeNull();
-    fireEvent.change(screen.getByLabelText(/^Cantidad contenida en gramos/), { target: { value: "250" } });
+    fireEvent.change(screen.getAllByLabelText(/^Base del precio en gramos/)[1], { target: { value: "250" } });
     fireEvent.change(screen.getAllByLabelText(/^Precio de venta/)[1], { target: { value: "6.00" } });
-    fireEvent.change(screen.getByLabelText(/^Stock inicial/), { target: { value: "3000" } });
-    fireEvent.change(screen.getByLabelText(/^Precio de compra/), { target: { value: "0.02" } });
-    expect(screen.getByText("$60.00")).toBeTruthy();
-    expect(screen.getByText("El valor definitivo se confirma al guardar.")).toBeTruthy();
+    expect(screen.queryByLabelText(/^Stock inicial/)).toBeNull();
+    expect(screen.queryByLabelText(/^Precio de compra/)).toBeNull();
     expect(screen.getAllByLabelText(/SKU/)).toHaveLength(1);
     const form = document.getElementById("product-form")!;
     fireEvent.submit(form);
@@ -150,8 +147,6 @@ describe("ProductsView", () => {
       brand_id: 1,
       category_id: 2,
       base_unit: "gram",
-      initial_stock: 3000,
-      initial_purchase_price_per_base: "0.02",
       presentations: [
         {
           name: "Kilogramo",
@@ -164,7 +159,7 @@ describe("ProductsView", () => {
         },
         {
           name: "Bolsa 250 g",
-          mode: "fixed",
+          mode: "measured",
           base_quantity: 250,
           price: "6.00",
           barcode: null,
@@ -177,14 +172,13 @@ describe("ProductsView", () => {
     await act(async () => request.promise);
   });
 
-  it("creates initial stock without valuation when purchase price is omitted", async () => {
+  it("creates a piece product without retired initial inventory fields", async () => {
     mockedCreateProduct.mockResolvedValueOnce(view.items[0]);
     await renderLoaded();
     fireEvent.click(screen.getByRole("button", { name: "Nuevo producto" }));
-    fireEvent.change(screen.getAllByLabelText(/^Nombre/)[0], { target: { value: "Producto sin costo" } });
-    fireEvent.change(screen.getByLabelText(/^SKU unico/), { target: { value: "SIN-COSTO-1" } });
+    fireEvent.change(screen.getAllByLabelText(/^Nombre/)[0], { target: { value: "Producto nuevo" } });
+    fireEvent.change(screen.getByLabelText(/^SKU unico/), { target: { value: "NUEVO-1" } });
     fireEvent.change(screen.getByLabelText(/^Precio de venta/), { target: { value: "12.00" } });
-    fireEvent.change(screen.getByLabelText(/^Stock inicial/), { target: { value: "5" } });
 
     await act(async () => {
       fireEvent.submit(document.getElementById("product-form")!);
@@ -193,8 +187,6 @@ describe("ProductsView", () => {
     expect(mockedCreateProduct).toHaveBeenCalledOnce();
     expect(mockedCreateProduct).toHaveBeenCalledWith(
       expect.objectContaining({
-        initial_stock: 5,
-        initial_purchase_price_per_base: null,
         presentations: [expect.objectContaining({ name: "Pieza", mode: "fixed", base_quantity: 1, is_default: true, is_active: true })],
       }),
     );
@@ -205,9 +197,9 @@ describe("ProductsView", () => {
     await renderLoaded();
     fireEvent.click(screen.getByRole("button", { name: "Editar producto Cafe molido" }));
     expect((screen.getByLabelText(/^Unidad base de inventario/) as HTMLSelectElement).disabled).toBe(true);
-    expect((screen.getAllByRole("radio", { name: "Paquete" })[0].closest("fieldset") as HTMLFieldSetElement).disabled).toBe(true);
-    expect((screen.getByLabelText(/^Cantidad contenida en gramos/) as HTMLInputElement).disabled).toBe(true);
-    expect((screen.getByLabelText(/^Base del precio en gramos/) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getAllByRole("radio", { name: "Otra medida" })[0].closest("fieldset") as HTMLFieldSetElement).disabled).toBe(true);
+    expect((screen.getAllByLabelText(/^Base del precio en gramos/)[0] as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getAllByLabelText(/^Base del precio en gramos/)[1] as HTMLInputElement).disabled).toBe(true);
     expect(screen.getAllByText("Conversion bloqueada por historial.")).toHaveLength(2);
     expect(screen.getAllByText("Historica")).toHaveLength(2);
     expect((screen.getAllByLabelText(/^Nombre de presentacion/)[1] as HTMLInputElement).disabled).toBe(false);
@@ -232,10 +224,45 @@ describe("ProductsView", () => {
       category_id: 2,
       base_unit: "gram",
       presentations: [
-        { id: 101, name: "Bolsa 250 g", mode: "fixed", base_quantity: 250, price: "12.50", barcode: "750000000001", is_default: false, is_active: false },
+        { id: 101, name: "Bolsa 250 g", mode: "measured", base_quantity: 250, price: "12.50", barcode: "750000000001", is_default: false, is_active: false },
         { id: 102, name: "Kilogramo", mode: "measured", base_quantity: 1000, price: "40.00", barcode: null, is_default: true, is_active: true },
       ],
     });
+  });
+
+  it("shows a used legacy fixed gram presentation readonly and preserves its conversion", async () => {
+    const legacyPresentation = {
+      ...piecePresentation,
+      name: "Bolsa historica",
+      mode: "fixed" as const,
+      base_quantity: 250,
+      is_conversion_locked: true,
+    };
+    mockedGetProductsView.mockResolvedValueOnce({
+      ...view,
+      items: [{
+        ...view.items[0],
+        presentations: [legacyPresentation, measuredPresentation],
+        default_presentation: legacyPresentation,
+      }],
+    });
+    mockedUpdateProduct.mockResolvedValue(view.items[0]);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "Editar producto Cafe molido" }));
+
+    const legacyKind = screen.getByRole("radio", { name: "Venta fija historica" }) as HTMLInputElement;
+    expect(legacyKind.checked).toBe(true);
+    expect(legacyKind.disabled).toBe(true);
+    expect(screen.queryByRole("radio", { name: "Otra medida", checked: true })).toBeNull();
+    fireEvent.change(screen.getAllByLabelText(/^Nombre de presentacion/)[0], { target: { value: "Bolsa historica editada" } });
+    fireEvent.submit(document.getElementById("product-form")!);
+    await act(async () => undefined);
+
+    expect(mockedUpdateProduct).toHaveBeenCalledWith(11, expect.objectContaining({
+      presentations: expect.arrayContaining([
+        expect.objectContaining({ id: 101, name: "Bolsa historica editada", mode: "fixed", base_quantity: 250 }),
+      ]),
+    }));
   });
 
   it("allows removing a persisted presentation when its conversion is not locked", async () => {
@@ -250,9 +277,9 @@ describe("ProductsView", () => {
 
     expect(screen.getAllByText("Conversion bloqueada por historial.")).toHaveLength(1);
     expect(screen.getAllByText("Historica")).toHaveLength(1);
-    expect((screen.getAllByRole("radio", { name: "Peso exacto" })[1] as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getAllByRole("radio", { name: "Kilogramo" })[1] as HTMLInputElement).disabled).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Quitar presentación Kilogramo" }));
-    expect(screen.queryByText("Kilogramo")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Kilogramo" })).toBeNull();
 
     fireEvent.submit(document.getElementById("product-form")!);
     await act(async () => undefined);
@@ -261,13 +288,26 @@ describe("ProductsView", () => {
     }));
   });
 
-  it("shows formatted stock, active presentations and unknown cost separately", async () => {
+  it("shows formatted stock and value at accumulated cost", async () => {
     await renderLoaded();
     expect(screen.getAllByText("1.25 kg").length).toBeGreaterThan(0);
     expect(screen.getByText("Bolsa 250 g")).toBeTruthy();
-    expect(screen.getByText("$12.50 por Bolsa 250 g")).toBeTruthy();
-    expect(screen.getAllByText("Sin costo registrado").length).toBeGreaterThan(0);
-    expect(screen.getByText("No incluidos en el valor a costo")).toBeTruthy();
+    expect(screen.getByText("$12.50 por 250 g")).toBeTruthy();
+    expect(screen.getAllByText("$62.50").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Valor a costo").length).toBeGreaterThan(0);
+    expect(screen.getByText("Promedio: $0.05")).toBeTruthy();
+  });
+
+  it("shows historical unknown cost without treating it as zero", async () => {
+    mockedGetProductsView.mockResolvedValueOnce({
+      ...view,
+      stats: { ...view.stats, inventory_value_cents: 0, products_without_cost: 1 },
+      items: [{ ...view.items[0], inventory_cost_cents: null, inventory_cost_status: "unknown", average_cost_cents: null }],
+    });
+    await renderLoaded();
+
+    expect(screen.getByText("Costo desconocido")).toBeTruthy();
+    expect(screen.getByText("1 sin costo conocido")).toBeTruthy();
   });
 
   it("ignores out-of-order list responses and completion after unmount", async () => {
@@ -354,9 +394,8 @@ describe("ProductsView", () => {
     const unit = screen.getByLabelText(/^Unidad base de inventario/) as HTMLSelectElement;
     const name = screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement;
     const price = screen.getByLabelText(/^Precio de venta/) as HTMLInputElement;
-    await events.clear(name);
-    await events.type(name, "Caja");
-    await events.type(price, "25.00");
+    fireEvent.change(name, { target: { value: "Caja" } });
+    fireEvent.change(price, { target: { value: "25.00" } });
 
     await events.selectOptions(unit, "gram");
     expect(screen.getByRole("dialog", { name: "Cambiar unidad base" })).toBeTruthy();
@@ -364,12 +403,12 @@ describe("ProductsView", () => {
     await events.click(screen.getByRole("button", { name: "Conservar datos" }));
     expect(unit.value).toBe("piece");
     expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Caja");
-    expect((screen.getByLabelText(/^Precio de venta/) as HTMLInputElement).value).toBe("25");
+    expect((screen.getByLabelText(/^Precio de venta/) as HTMLInputElement).value).toBe("25.00");
 
     await events.selectOptions(unit, "gram");
     await events.click(screen.getByRole("button", { name: "Cambiar y reiniciar" }));
     expect(unit.value).toBe("gram");
-    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Peso exacto");
+    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Kilogramo");
     expect((screen.getByLabelText(/^Precio de venta/) as HTMLInputElement).value).toBe("");
   });
 
@@ -380,7 +419,7 @@ describe("ProductsView", () => {
     await events.click(screen.getByRole("button", { name: "Nuevo producto" }));
     await events.selectOptions(screen.getByLabelText(/^Unidad base de inventario/), "gram");
     expect(screen.queryByRole("dialog", { name: "Cambiar unidad base" })).toBeNull();
-    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Peso exacto");
+    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Kilogramo");
   });
 
   it("gives default actions contextual names and restores focus after removing cards", async () => {
@@ -399,19 +438,35 @@ describe("ProductsView", () => {
     expect(document.activeElement).toBe(screen.getByRole("region", { name: "Presentacion 1: Pieza" }));
   });
 
-  it("switches gram sale kinds, proposed names and dynamic quantity fields", async () => {
+  it("switches grams between the locked standard base and another measure", async () => {
     await renderLoaded();
     fireEvent.click(screen.getByRole("button", { name: "Nuevo producto" }));
     fireEvent.change(screen.getByLabelText(/^Unidad base de inventario/), { target: { value: "gram" } });
-    expect((screen.getByRole("radio", { name: "Peso exacto" }) as HTMLInputElement).checked).toBe(true);
-    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Peso exacto");
-    expect(screen.getByLabelText(/^Base del precio en gramos/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("radio", { name: "Paquete" }));
-    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Paquete");
-    expect(screen.getByLabelText(/^Cantidad contenida en gramos/)).toBeTruthy();
+    expect((screen.getByRole("radio", { name: "Kilogramo" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Kilogramo");
+    expect((screen.getByLabelText(/^Base del precio en gramos/) as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: "Otra medida" }));
+    expect((screen.getByLabelText(/^Base del precio en gramos/) as HTMLInputElement).disabled).toBe(false);
   });
 
-  it("offers Paquete and Volumen exacto for milliliters and preserves measured payload", async () => {
+  it("rejects another measure outside the JavaScript-safe positive range", async () => {
+    mockedCreateProduct.mockClear();
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "Nuevo producto" }));
+    fireEvent.change(screen.getAllByLabelText(/^Nombre/)[0], { target: { value: "Cafe" } });
+    fireEvent.change(screen.getByLabelText(/^SKU unico/), { target: { value: "CAFE-SAFE" } });
+    fireEvent.change(screen.getByLabelText(/^Unidad base de inventario/), { target: { value: "gram" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Otra medida" }));
+    fireEvent.change(screen.getByLabelText(/^Nombre de presentacion/), { target: { value: "Medida" } });
+    fireEvent.change(screen.getByLabelText(/^Base del precio en gramos/), { target: { value: "9007199254740992" } });
+    fireEvent.change(screen.getByLabelText(/^Precio de venta/), { target: { value: "1.00" } });
+    fireEvent.submit(document.getElementById("product-form")!);
+
+    expect(screen.getByRole("alert").textContent).toContain("entero positivo y seguro");
+    expect(mockedCreateProduct).not.toHaveBeenCalled();
+  });
+
+  it("offers Litro and Otra medida for milliliters and preserves measured payload", async () => {
     mockedCreateProduct.mockResolvedValueOnce(view.items[0]);
     await renderLoaded();
     fireEvent.click(screen.getByRole("button", { name: "Nuevo producto" }));
@@ -419,9 +474,10 @@ describe("ProductsView", () => {
     fireEvent.change(screen.getByLabelText(/^SKU unico/), { target: { value: "ACEITE-1" } });
     fireEvent.change(screen.getByLabelText(/^Unidad base de inventario/), { target: { value: "milliliter" } });
 
-    expect(screen.getByRole("radio", { name: "Paquete" })).toBeTruthy();
-    expect((screen.getByRole("radio", { name: "Volumen exacto" }) as HTMLInputElement).checked).toBe(true);
-    expect((screen.getByLabelText(/^Nombre de presentacion/) as HTMLInputElement).value).toBe("Volumen exacto");
+    expect((screen.getByRole("radio", { name: "Litro" }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByRole("radio", { name: "Otra medida" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("radio", { name: "Otra medida" }));
+    fireEvent.change(screen.getByLabelText(/^Nombre de presentacion/), { target: { value: "Medio litro" } });
     fireEvent.change(screen.getByLabelText(/^Base del precio en mililitros/), { target: { value: "500" } });
     fireEvent.change(screen.getByLabelText(/^Precio de venta/), { target: { value: "35.00" } });
     fireEvent.submit(document.getElementById("product-form")!);
@@ -429,16 +485,27 @@ describe("ProductsView", () => {
 
     expect(mockedCreateProduct).toHaveBeenCalledWith(expect.objectContaining({
       base_unit: "milliliter",
-      presentations: [expect.objectContaining({ name: "Volumen exacto", mode: "measured", base_quantity: 500 })],
+      presentations: [expect.objectContaining({ name: "Medio litro", mode: "measured", base_quantity: 500 })],
     }));
   });
 
-  it("calculates the estimated initial value with exact decimal integers", async () => {
+  it("uses a canonical locked meter base for centimeter products", async () => {
+    mockedCreateProduct.mockResolvedValueOnce(view.items[0]);
     await renderLoaded();
     fireEvent.click(screen.getByRole("button", { name: "Nuevo producto" }));
-    fireEvent.change(screen.getByLabelText(/^Stock inicial/), { target: { value: "10000000000001" } });
-    fireEvent.change(screen.getByLabelText(/^Precio de compra/), { target: { value: "0.01" } });
-    expect(screen.getByText("$100,000,000,000.01")).toBeTruthy();
+    fireEvent.change(screen.getAllByLabelText(/^Nombre/)[0], { target: { value: "Cable" } });
+    fireEvent.change(screen.getByLabelText(/^SKU unico/), { target: { value: "CABLE-1" } });
+    fireEvent.change(screen.getByLabelText(/^Unidad base de inventario/), { target: { value: "centimeter" } });
+    expect((screen.getByRole("radio", { name: "Metro" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText(/^Base del precio en centimetros/) as HTMLInputElement).value).toBe("100");
+    expect((screen.getByLabelText(/^Base del precio en centimetros/) as HTMLInputElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText(/^Precio de venta/), { target: { value: "25.00" } });
+    fireEvent.submit(document.getElementById("product-form")!);
+    await act(async () => undefined);
+    expect(mockedCreateProduct).toHaveBeenCalledWith(expect.objectContaining({
+      base_unit: "centimeter",
+      presentations: [expect.objectContaining({ name: "Metro", mode: "measured", base_quantity: 100 })],
+    }));
   });
 
   it("drops save completion and session callbacks after a session change", async () => {

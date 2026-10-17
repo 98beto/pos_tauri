@@ -21,14 +21,12 @@ type ProductDraft = {
   name: string;
   sku: string;
   baseUnit: BaseUnit;
-  initialStock: string;
-  initialPurchasePrice: string;
   brandId: string;
   categoryId: string;
   presentations: PresentationDraft[];
 };
 
-type SaleKind = "piece" | "package" | "exact";
+type SaleKind = "piece" | "package" | "standard" | "custom" | "legacy";
 
 type PresentationDraft = {
   key: number;
@@ -48,15 +46,27 @@ const unitLabels: Record<BaseUnit, { singular: string; plural: string }> = {
   piece: { singular: "pieza", plural: "piezas" },
   gram: { singular: "gramo", plural: "gramos" },
   milliliter: { singular: "mililitro", plural: "mililitros" },
+  centimeter: { singular: "centimetro", plural: "centimetros" },
 };
 
+const measuredUnitConfig = {
+  gram: { name: "Kilogramo", baseQuantity: 1_000 },
+  milliliter: { name: "Litro", baseQuantity: 1_000 },
+  centimeter: { name: "Metro", baseQuantity: 100 },
+} satisfies Record<Exclude<BaseUnit, "piece">, { name: string; baseQuantity: number }>;
+
+function standardBaseQuantity(baseUnit: BaseUnit): number | undefined {
+  return baseUnit === "piece" ? undefined : measuredUnitConfig[baseUnit].baseQuantity;
+}
+
 function initialPresentation(baseUnit: BaseUnit, key = 0): PresentationDraft {
+  const measured = baseUnit === "piece" ? undefined : measuredUnitConfig[baseUnit];
   return {
     key,
-    name: baseUnit === "piece" ? "Pieza" : baseUnit === "gram" ? "Peso exacto" : "Volumen exacto",
-    saleKind: baseUnit === "piece" ? "piece" : "exact",
+    name: measured?.name ?? "Pieza",
+    saleKind: baseUnit === "piece" ? "piece" : "standard",
     mode: baseUnit === "piece" ? "fixed" : "measured",
-    baseQuantity: baseUnit === "piece" ? "1" : "1000",
+    baseQuantity: String(measured?.baseQuantity ?? 1),
     price: "",
     barcode: "",
     isActive: true,
@@ -81,38 +91,27 @@ function hasMeaningfulPresentationData(draft: ProductDraft): boolean {
 
 function saleKindOptions(baseUnit: BaseUnit): { kind: SaleKind; label: string }[] {
   if (baseUnit === "piece") return [{ kind: "piece", label: "Pieza" }, { kind: "package", label: "Paquete" }];
-  return [{ kind: "package", label: "Paquete" }, { kind: "exact", label: baseUnit === "gram" ? "Peso exacto" : "Volumen exacto" }];
+  return [{ kind: "standard", label: measuredUnitConfig[baseUnit].name }, { kind: "custom", label: "Otra medida" }];
 }
 
 function saleKindChanges(kind: SaleKind, baseUnit: BaseUnit, currentQuantity: string): Partial<PresentationDraft> {
   if (kind === "piece") return { name: "Pieza", saleKind: kind, mode: "fixed", baseQuantity: "1" };
   if (kind === "package") return { name: "Paquete", saleKind: kind, mode: "fixed", baseQuantity: currentQuantity || "1" };
-  return { name: baseUnit === "gram" ? "Peso exacto" : "Volumen exacto", saleKind: kind, mode: "measured", baseQuantity: currentQuantity || "1000" };
+  const standard = baseUnit === "piece" ? undefined : measuredUnitConfig[baseUnit];
+  if (kind === "standard" && standard) return { name: standard.name, saleKind: kind, mode: "measured", baseQuantity: String(standard.baseQuantity) };
+  return { name: "", saleKind: kind, mode: "measured", baseQuantity: currentQuantity || "1" };
 }
 
 const emptyDraft: ProductDraft = {
   name: "",
   sku: "",
   baseUnit: "piece",
-  initialStock: "0",
-  initialPurchasePrice: "",
   brandId: "",
   categoryId: "",
   presentations: [initialPresentation("piece")],
 };
 const selectClass = "h-11 w-full rounded-control border border-line-strong bg-surface px-3 text-sm text-ink outline-none focus:border-brand focus:ring-3 focus:ring-brand/12 disabled:bg-surface-soft";
 type LoadResult = "success" | "error" | "stale";
-
-function estimatedInventoryValue(stockText: string, priceText: string): string {
-  const stock = stockText.trim();
-  const price = priceText.trim();
-  if (!/^\d+$/.test(stock) || !/^\d+(?:\.\d{1,2})?$/.test(price)) return "-";
-  const [whole, fraction = ""] = price.split(".");
-  const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0"));
-  const total = BigInt(stock) * cents;
-  if (total > BigInt(Number.MAX_SAFE_INTEGER)) return "-";
-  return formatMoney(Number(total));
-}
 
 function SelectField({ label, value, onChange, children, required = false, disabled = false, hint }: { label: string; value: string; onChange: (value: string) => void; children: React.ReactNode; required?: boolean; disabled?: boolean; hint?: string }) {
   const id = useId();
@@ -275,15 +274,17 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       name: product.name,
       sku: product.sku,
       baseUnit: product.base_unit,
-      initialStock: "0",
-      initialPurchasePrice: "",
       brandId: product.brand_id.toString(),
       categoryId: product.category_id.toString(),
       presentations: product.presentations.map((presentation, index) => ({
         key: index,
         id: presentation.id,
         name: presentation.name,
-        saleKind: presentation.mode === "measured" ? "exact" : product.base_unit === "piece" && presentation.base_quantity === 1 ? "piece" : "package",
+        saleKind: product.base_unit !== "piece" && presentation.mode === "fixed"
+          ? "legacy"
+          : presentation.mode === "measured"
+          ? presentation.base_quantity === standardBaseQuantity(product.base_unit) ? "standard" : "custom"
+          : product.base_unit === "piece" && presentation.base_quantity === 1 ? "piece" : "package",
         mode: presentation.mode,
         baseQuantity: presentation.base_quantity.toString(),
         price: centsToDecimal(presentation.price),
@@ -324,6 +325,19 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       setProductError("Debe haber al menos una presentacion activa y una sola predeterminada activa.");
       return;
     }
+    const invalidBase = draft.presentations.some((presentation) => {
+      const canonicalBase = presentation.saleKind === "standard"
+        ? standardBaseQuantity(draft.baseUnit)
+        : Number(presentation.baseQuantity);
+      return canonicalBase === undefined
+        || (presentation.saleKind !== "standard" && !/^\d+$/.test(presentation.baseQuantity))
+        || !Number.isSafeInteger(canonicalBase)
+        || canonicalBase <= 0;
+    });
+    if (invalidBase) {
+      setProductError("La base de cada presentacion debe ser un entero positivo y seguro.");
+      return;
+    }
     productSaveInFlight.current = true;
     const saveGeneration = ++productSaveGeneration.current;
     const ownerSession = sessionId;
@@ -339,34 +353,27 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
         category_id: Number(draft.categoryId),
         base_unit: draft.baseUnit,
       };
+      const presentationPayload = draft.presentations.map((presentation) => ({
+        id: presentation.id,
+        name: presentation.name,
+        mode: presentation.mode,
+        base_quantity: presentation.saleKind === "standard"
+          ? standardBaseQuantity(draft.baseUnit)!
+          : Number(presentation.baseQuantity),
+        price: presentation.price,
+        barcode: presentation.barcode.trim() || null,
+        is_default: presentation.isDefault,
+        is_active: presentation.isActive,
+      }));
       if (editingProduct) {
         await updateProductWithPresentations(editingProduct.id, {
           ...common,
-          presentations: draft.presentations.map((presentation) => ({
-            id: presentation.id,
-            name: presentation.name,
-            mode: presentation.mode,
-            base_quantity: Number(presentation.baseQuantity),
-            price: presentation.price,
-            barcode: presentation.barcode.trim() || null,
-            is_default: presentation.isDefault,
-            is_active: presentation.isActive,
-          })),
+          presentations: presentationPayload,
         });
       } else {
         await createProductWithPresentations({
           ...common,
-          initial_stock: Number(draft.initialStock),
-          initial_purchase_price_per_base: draft.initialPurchasePrice.trim() || null,
-          presentations: draft.presentations.map((presentation) => ({
-            name: presentation.name,
-            mode: presentation.mode,
-            base_quantity: Number(presentation.baseQuantity),
-            price: presentation.price,
-            barcode: presentation.barcode.trim() || null,
-            is_default: presentation.isDefault,
-            is_active: presentation.isActive,
-          })),
+          presentations: presentationPayload.map(({ id: _id, ...presentation }) => presentation),
         });
       }
       if (!isCurrent(ownerSession, generation) || productSaveGeneration.current !== saveGeneration) return;
@@ -416,8 +423,6 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       : "Segun filtros actuales";
   const statValue = (value: number | undefined, money = false) =>
     statsUnavailable || value === undefined ? "-" : money ? formatMoney(value) : value;
-  const unknownCostCount = statsUnavailable ? "-" : view.items.filter((product) => product.inventory_cost_status === "unknown").length;
-  const initialInventoryValue = estimatedInventoryValue(draft.initialStock, draft.initialPurchasePrice);
 
   if (loading && !view) return <main id="main-content" tabIndex={-1} className="grid min-h-[calc(100dvh-88px)] place-items-center"><Spinner className="size-6 text-brand" /></main>;
 
@@ -428,8 +433,8 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
         <StatCard label="Existencia en piezas" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.piece_stock, "piece")} detail={statsDetail} />
         <StatCard label="Existencia por peso" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.gram_stock, "gram")} detail={statsDetail} />
         <StatCard label="Existencia por volumen" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.milliliter_stock, "milliliter")} detail={statsDetail} />
-        <StatCard label="Valor total a costo" value={statValue(view?.stats.inventory_value, true)} detail={statsDetail} />
-        <StatCard label="Sin costo registrado" value={unknownCostCount} detail="No incluidos en el valor a costo" />
+        <StatCard label="Existencia por longitud" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.centimeter_stock, "centimeter")} detail={statsDetail} />
+        <StatCard label="Valor a costo" value={statValue(view?.stats.inventory_value_cents, true)} detail={statsUnavailable ? statsDetail : view.stats.products_without_cost ? `${view.stats.products_without_cost} sin costo conocido` : "Todos los costos son conocidos"} />
       </div>
 
       <section className="mt-5 rounded-card border border-line bg-surface">
@@ -456,7 +461,7 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
                 <td className="border-b border-line px-5 py-4"><span className="block font-semibold">{product.default_presentation.name}</span><span className="text-xs text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${product.stock_base === 0 ? "bg-danger-soft text-danger" : "bg-brand-soft text-brand"}`}>{formatBaseQuantity(product.stock_base, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</td>
-                <td className="border-b border-line px-5 py-4 text-right">{product.inventory_cost_status === "known" && product.inventory_cost_cents !== null ? <span className="font-semibold">{formatMoney(product.inventory_cost_cents)}</span> : <span className="text-xs font-semibold text-muted">Sin costo registrado</span>}</td>
+                <td className="border-b border-line px-5 py-4 text-right">{product.inventory_cost_status === "unknown" || product.inventory_cost_cents === null ? <span className="text-xs font-semibold text-muted">Costo desconocido</span> : <><span className="block font-semibold">{formatMoney(product.inventory_cost_cents)}</span><span className="text-xs text-muted">Promedio: {product.average_cost_cents === null ? "-" : formatMoney(product.average_cost_cents)}</span></>}</td>
                 <td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" aria-label={`Editar producto ${product.name}`} onClick={() => openEdit(product)}>Editar</Button></td>
               </tr>)}</tbody>
             </table>
@@ -464,27 +469,31 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
         </div>
       </section>
 
-      <Modal open={productOpen} onClose={() => setProductOpen(false)} closeDisabled={savingProduct} title={editingProduct ? "Editar producto" : "Nuevo producto"} description={editingProduct ? "La unidad base y las presentaciones historicas se conservan." : "El stock inicial genera un movimiento de inventario."} size="lg" footer={<><Button disabled={savingProduct} onClick={() => setProductOpen(false)}>Cancelar</Button><Button form="product-form" type="submit" variant="primary" loading={savingProduct}>Guardar producto</Button></>}>
+      <Modal open={productOpen} onClose={() => setProductOpen(false)} closeDisabled={savingProduct} title={editingProduct ? "Editar producto" : "Nuevo producto"} description={editingProduct ? "La unidad base y las presentaciones historicas se conservan." : "El producto se crea con stock cero; registra entradas desde Inventario."} size="lg" footer={<><Button disabled={savingProduct} onClick={() => setProductOpen(false)}>Cancelar</Button><Button form="product-form" type="submit" variant="primary" loading={savingProduct}>Guardar producto</Button></>}>
         <form id="product-form" onSubmit={(event) => void saveProduct(event)} className="grid gap-4 sm:grid-cols-2">
           {productError && <div className="rounded-control border border-danger/25 bg-danger-soft px-4 py-3 text-sm text-danger sm:col-span-2" role="alert">{productError}</div>}
           <Field data-autofocus label="Nombre" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required disabled={savingProduct} />
           <Field label="SKU unico del producto" value={draft.sku} onChange={(event) => setDraft({ ...draft, sku: event.target.value })} required disabled={savingProduct} hint="Las presentaciones no usan SKU." />
-          <SelectField label="Unidad base de inventario" value={draft.baseUnit} onChange={(baseUnit) => changeBaseUnit(baseUnit as BaseUnit)} required disabled={savingProduct || Boolean(editingProduct)} hint={editingProduct ? "No se puede cambiar porque las existencias ya estan registradas." : "No se puede cambiar despues de crear el producto."}><option value="piece">Pieza</option><option value="gram">Gramo</option><option value="milliliter">Mililitro</option></SelectField>
+          <SelectField label="Unidad base de inventario" value={draft.baseUnit} onChange={(baseUnit) => changeBaseUnit(baseUnit as BaseUnit)} required disabled={savingProduct || Boolean(editingProduct)} hint={editingProduct ? "No se puede cambiar porque las existencias ya estan registradas." : "No se puede cambiar despues de crear el producto."}><option value="piece">Pieza</option><option value="gram">Gramo</option><option value="milliliter">Mililitro</option><option value="centimeter">Centimetro</option></SelectField>
           <SelectField label="Marca" value={draft.brandId} onChange={(brandId) => setDraft({ ...draft, brandId })} required disabled={savingProduct}><option value="">Selecciona una marca</option>{brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</SelectField>
           <SelectField label="Categoria" value={draft.categoryId} onChange={(categoryId) => setDraft({ ...draft, categoryId })} required disabled={savingProduct}><option value="">Selecciona una categoria</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</SelectField>
-          <div className="hidden sm:block" aria-hidden="true" />
-          {!editingProduct && <>
-            <Field label={`Stock inicial en ${unitLabels[draft.baseUnit].plural}`} type="number" min="0" step="1" value={draft.initialStock} onChange={(event) => setDraft({ ...draft, initialStock: event.target.value })} required disabled={savingProduct} />
-            <Field label={`Precio de compra por ${unitLabels[draft.baseUnit].singular} (opcional)`} type="number" min="0" step="0.01" value={draft.initialPurchasePrice} onChange={(event) => setDraft({ ...draft, initialPurchasePrice: event.target.value })} inputMode="decimal" placeholder="Sin costo registrado" disabled={savingProduct} hint="Si lo dejas vacío, el inventario se guardará sin valoración hasta que establezcas su costo actual." />
-             <div className="rounded-control border border-line bg-surface-soft px-4 py-3 sm:col-span-2" aria-live="polite"><span className="block text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Valor inicial estimado del inventario</span><strong className="mt-1 block font-heading text-xl">{initialInventoryValue}</strong><p className="mt-1 text-xs text-muted">El valor definitivo se confirma al guardar.</p></div>
-          </>}
           <fieldset className="grid gap-3 sm:col-span-2" disabled={savingProduct}>
             <legend className="sr-only">Presentaciones</legend>
             <div className="flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-heading text-lg font-bold">Presentaciones</h2><p className="mt-1 text-xs text-muted">Todas usan el SKU del producto; el codigo de barras es opcional.</p></div><div ref={addPresentationRef}><Button size="sm" onClick={() => setDraft({ ...draft, presentations: [...draft.presentations, { ...initialPresentation(draft.baseUnit, presentationKey.current++), name: "", isDefault: false }] })}>Agregar presentacion</Button></div></div>
             {draft.presentations.map((presentation, index) => {
               const kind = presentation.saleKind;
-              const quantityLabel = kind === "package" ? `Cantidad contenida en ${unitLabels[draft.baseUnit].plural}` : `Base del precio en ${unitLabels[draft.baseUnit].plural}`;
-              const summary = kind === "piece" ? "1 pieza por venta" : kind === "package" ? `${presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural} por paquete` : `Precio por ${presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural}`;
+              const quantityLabel = kind === "legacy"
+                ? `Cantidad fija por venta en ${unitLabels[draft.baseUnit].plural}`
+                : kind === "package"
+                  ? `Cantidad contenida en ${unitLabels[draft.baseUnit].plural}`
+                  : `Base del precio en ${unitLabels[draft.baseUnit].plural}`;
+              const summary = kind === "piece"
+                ? "1 pieza por venta"
+                : kind === "legacy"
+                  ? `${presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural} por venta fija historica`
+                  : kind === "package"
+                    ? `${presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural} por paquete`
+                  : `Precio por ${kind === "standard" ? standardBaseQuantity(draft.baseUnit) : presentation.baseQuantity || "-"} ${unitLabels[draft.baseUnit].plural}`;
               const updatePresentation = (changes: Partial<PresentationDraft>) => setDraft({ ...draft, presentations: draft.presentations.map((item) => item.key === presentation.key ? { ...item, ...changes } : item) });
               const title = presentation.name || `Presentacion ${index + 1}`;
               return <section key={presentation.key} ref={(node) => { if (node) presentationRefs.current.set(presentation.key, node); else presentationRefs.current.delete(presentation.key); }} tabIndex={-1} className="grid gap-3 rounded-card border border-line bg-surface p-4 shadow-sm outline-none focus-visible:ring-3 focus-visible:ring-brand/20 sm:grid-cols-2 lg:grid-cols-3" aria-label={`Presentacion ${index + 1}: ${title}`}>
@@ -493,11 +502,11 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
                   {!presentation.isConversionLocked && draft.presentations.length > 1 && <Button size="sm" variant="ghost" aria-label={`Quitar presentación ${title}`} onClick={() => removePresentation(index)}>Quitar</Button>}
                 </div>
                 <Field label="Nombre de presentacion" value={presentation.name} onChange={(event) => updatePresentation({ name: event.target.value })} required />
-                <fieldset className="grid gap-2" disabled={presentation.isConversionLocked}>
+                <fieldset className="grid gap-2" disabled={presentation.isConversionLocked || kind === "legacy"}>
                   <legend className="text-[0.625rem] font-extrabold tracking-[0.08em] text-muted uppercase">Forma de venta</legend>
-                  <div className="grid grid-cols-2 rounded-control border border-line-strong bg-surface-soft p-1">{saleKindOptions(draft.baseUnit).map((option) => <label key={option.kind} className={`cursor-pointer rounded-[calc(var(--radius-control)-0.25rem)] px-3 py-2 text-center text-sm font-bold outline-none transition has-focus-visible:ring-3 has-focus-visible:ring-brand/20 ${kind === option.kind ? "bg-surface text-brand shadow-sm" : "text-muted hover:text-ink"}`}><input className="sr-only" type="radio" name={`sale-kind-${presentation.key}`} value={option.kind} checked={kind === option.kind} onChange={() => updatePresentation(saleKindChanges(option.kind, draft.baseUnit, presentation.baseQuantity))} />{option.label}</label>)}</div>
+                  {kind === "legacy" ? <div className="rounded-control border border-line-strong bg-surface-soft p-1"><label className="block rounded-[calc(var(--radius-control)-0.25rem)] bg-surface px-3 py-2 text-center text-sm font-bold text-muted shadow-sm"><input className="sr-only" type="radio" name={`sale-kind-${presentation.key}`} value="legacy" checked readOnly disabled />Venta fija historica</label></div> : <div className="grid grid-cols-2 rounded-control border border-line-strong bg-surface-soft p-1">{saleKindOptions(draft.baseUnit).map((option) => <label key={option.kind} className={`cursor-pointer rounded-[calc(var(--radius-control)-0.25rem)] px-3 py-2 text-center text-sm font-bold outline-none transition has-focus-visible:ring-3 has-focus-visible:ring-brand/20 ${kind === option.kind ? "bg-surface text-brand shadow-sm" : "text-muted hover:text-ink"}`}><input className="sr-only" type="radio" name={`sale-kind-${presentation.key}`} value={option.kind} checked={kind === option.kind} onChange={() => updatePresentation(saleKindChanges(option.kind, draft.baseUnit, presentation.baseQuantity))} />{option.label}</label>)}</div>}
                 </fieldset>
-                {kind !== "piece" && <Field label={quantityLabel} type="number" min="1" step="1" value={presentation.baseQuantity} onChange={(event) => updatePresentation({ baseQuantity: event.target.value })} required disabled={presentation.isConversionLocked} />}
+                {kind !== "piece" && <Field label={quantityLabel} type="number" min="1" max={Number.MAX_SAFE_INTEGER} step="1" value={kind === "standard" ? String(standardBaseQuantity(draft.baseUnit)) : presentation.baseQuantity} onChange={(event) => updatePresentation({ baseQuantity: event.target.value })} required disabled={presentation.isConversionLocked || kind === "standard" || kind === "legacy"} />}
                 {presentation.isConversionLocked && <p className="text-xs font-semibold text-muted sm:col-span-2 lg:col-span-3">Conversion bloqueada por historial.</p>}
                 <Field label="Precio de venta" type="number" min="0.01" step="0.01" value={presentation.price} onChange={(event) => updatePresentation({ price: event.target.value })} inputMode="decimal" placeholder="0.00" required />
                 <Field label="Codigo de barras (opcional)" value={presentation.barcode} onChange={(event) => updatePresentation({ barcode: event.target.value })} />
