@@ -80,7 +80,7 @@ const PINNED_REFERENCE_FILES = new Map([
   ["scripts/validate-retired-inventory-costs.node-test.mjs", "2a4bea52a96310e78ecfb7a3b33ef79998aa76ccce8db62911d82caaf846e7e7"],
   // These files retain the shipped-schema compatibility and migration QA corpus.
   ["src-tauri/src/db/migrations.rs", "353a4b5226533e325983d53f97f833c75a99b15ce89782877a6af75801975fe2"],
-  ["src-tauri/src/db/mod.rs", "d629a01cc764fd09b93a4af3dc2a9232114f72bc43d176b0564138d08615f5ce"],
+  ["src-tauri/src/db/mod.rs", "a92764382e4067a9cefcf475515623d4cea6f7c39acf39179e33d7d393ad2d1e"],
   ["src-tauri/src/db/tests/migration_qa.rs", "09207bedd4aae147608c3befadbb299fa6db898ebf0be7172b73b384e126c0bf"],
 ]);
 

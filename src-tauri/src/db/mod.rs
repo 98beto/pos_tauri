@@ -1351,12 +1351,21 @@ where
         .map_err(|_| safe_error("No se pudo resolver la base instalada", database_path))?;
     let backup_path = fs::canonicalize(backup_path)
         .map_err(|_| safe_error("No se pudo resolver el backup", backup_path))?;
+    migration_lock
+        .validate()
+        .map_err(|_| locked_error("El bloqueo de migracion fue sustituido"))?;
     if database_path.parent() != Some(directory.as_path())
         || database_path.file_name().and_then(|name| name.to_str()) != Some("pos.db")
     {
         return Err(safe_error(
             "El destino debe ser el pos.db canonico de esta instalacion",
             &database_path,
+        ));
+    }
+    if backup_path.parent() != Some(directory.as_path()) || backup_path == database_path {
+        return Err(safe_error(
+            "El backup debe ser un archivo distinto en el directorio de esta instalacion",
+            &backup_path,
         ));
     }
     reconcile_migration_completion(&directory, &directory.join(PENDING_MARKER_NAME))?;
@@ -1897,8 +1906,8 @@ fn migration_manifest_for_restore(
     }
 
     matches.retain(|(manifest, _)| {
-        manifest.backup_path == backup_path
-            && manifest.database_path == database_path
+        manifest_path_matches(&manifest.backup_path, backup_path)
+            && manifest_path_matches(&manifest.database_path, database_path)
             && backup_path.parent() == Some(directory)
             && manifest.backup_validation_completed
             && matches!(
@@ -1923,6 +1932,31 @@ fn migration_manifest_for_restore(
         manifest,
         pending_path,
     })
+}
+
+// Called while the migration lock is held, with canonical installation paths.
+// Resolve both spellings rather than stripping Windows prefixes or folding case:
+// short names, verbatim paths and case-sensitive directories need OS resolution.
+// Canonical equality also rejects foreign hardlinks, even with identical content
+// and file identity. Handle checks reject replaced entries and reparse points.
+fn manifest_path_matches(recorded: &Path, canonical: &Path) -> bool {
+    let matches = || -> std::io::Result<bool> {
+        if !recorded.is_absolute() {
+            return Ok(false);
+        }
+        reject_symlink(recorded)?;
+        if fs::canonicalize(recorded)? != canonical {
+            return Ok(false);
+        }
+        let file = fs::File::open(canonical)?;
+        if !file.metadata()?.is_file() {
+            return Ok(false);
+        }
+        verify_named_file_handle(&file, recorded)?;
+        verify_named_file_handle(&file, canonical)?;
+        Ok(true)
+    };
+    matches().unwrap_or(false)
 }
 
 fn rollback_or_recovery_error(
@@ -3202,7 +3236,7 @@ mod tests {
         assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
         let manifest: MigrationManifest =
             serde_json::from_slice(&fs::read(&manifests[0]).unwrap()).unwrap();
-        assert_eq!(manifest.backup_path, backups[0]);
+        assert_eq!(manifest.backup_path, fs::canonicalize(&backups[0]).unwrap());
         let backup =
             Connection::open_with_flags(&backups[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         validate_database(&backup, 8, true, &backups[0]).unwrap();
@@ -3820,6 +3854,90 @@ mod tests {
             .exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn restore_resolves_windows_long_short_and_verbatim_manifest_paths_under_lock() {
+        use crate::windows_file_identity::test_path_spellings;
+        for spelling in 0..3 {
+            let temp = TempDir::new().unwrap();
+            let directory = temp.path().join("installation with long directory name");
+            fs::create_dir(&directory).unwrap();
+            let backup = directory.join("backup with long file name.db");
+            create_v8_database(&backup);
+            let path = directory.join("pos.db");
+            let mut current = Connection::open(&path).unwrap();
+            migrations::run(&mut current).unwrap();
+            drop(current);
+            let mut manifest = test_manifest("windows-spellings", 8, 13, backup.clone());
+            manifest.backup_path = test_path_spellings(&backup)[spelling].clone();
+            manifest.database_path = test_path_spellings(&path)[spelling].clone();
+            write_pending_marker(&directory.join(PENDING_MARKER_NAME), &manifest).unwrap();
+
+            let input = (spelling + 1) % 3;
+            let application_lock =
+                crate::process_lock::acquire(&test_path_spellings(&directory)[input]).unwrap();
+            let mut promotions = 0;
+            let restored = restore_migration_backup_inner_with_hook(
+                &test_path_spellings(&directory)[input],
+                &test_path_spellings(&path)[input],
+                &test_path_spellings(&backup)[input],
+                |stage| {
+                    application_lock.validate().unwrap();
+                    if stage == RestoreStage::BackupPromoted {
+                        promotions += 1;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(promotions, 1);
+            assert_eq!(schema_version(&restored, &path).unwrap(), 8);
+            let completed = matching_files(&directory, "pos-schema-v13-restore-completed-");
+            assert_eq!(completed.len(), 1);
+            let completed: RestoreManifest = read_marker(&completed[0], "restore").unwrap();
+            assert_eq!(completed.database_path, fs::canonicalize(&path).unwrap());
+            assert_eq!(completed.backup_path, fs::canonicalize(&backup).unwrap());
+        }
+    }
+
+    #[test]
+    fn restore_rejects_foreign_hardlink_paths_even_with_the_same_backup_identity() {
+        let temp = TempDir::new().unwrap();
+        let foreign = TempDir::new().unwrap();
+        let path = temp.path().join("pos.db");
+        create_v8_database(&path);
+        drop(open_database_path(temp.path(), &path).unwrap());
+        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let foreign_backup = foreign.path().join("backup.db");
+        let foreign_database = foreign.path().join("pos.db");
+        fs::hard_link(&backup, &foreign_backup).unwrap();
+        fs::hard_link(&path, &foreign_database).unwrap();
+        let manifest_path =
+            matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
+        let original = fs::read(&manifest_path).unwrap();
+        let before = fs::read(&path).unwrap();
+        // Even an authentic backup and manifest cannot authorize an outside entry.
+        assert!(restore_migration_backup_inner(temp.path(), &path, &foreign_backup).is_err());
+        for tamper_database in [false, true] {
+            let mut completed: CompletedMigrationManifest =
+                serde_json::from_slice(&original).unwrap();
+            if tamper_database {
+                completed.migration.database_path = foreign_database.clone();
+            } else {
+                completed.migration.backup_path = foreign_backup.clone();
+            }
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&completed).unwrap(),
+            )
+            .unwrap();
+            assert!(restore_migration_backup_inner(temp.path(), &path, &backup).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(!temp.path().join(RESTORE_MARKER_NAME).exists());
+            assert!(matching_files(temp.path(), ".pos-restore-").is_empty());
+        }
+    }
+
     #[test]
     fn failed_restore_after_promotion_never_exposes_v8_with_old_sidecars_and_rolls_back() {
         let temp = TempDir::new().unwrap();
@@ -3855,9 +3973,12 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains(backup.to_string_lossy().as_ref()));
+        assert!(error.to_string().contains(
+            fs::canonicalize(&backup)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        ));
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(fs::read(wal).unwrap(), b"old wal");
         assert_eq!(fs::read(shm).unwrap(), b"old shm");

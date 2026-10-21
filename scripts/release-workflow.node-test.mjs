@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -267,8 +267,18 @@ test("proves maintenance mode is present in every installer payload", () => {
     assert.doesNotMatch(windowsJob, /target\/release\/pos_tauri\.exe[^\n]*maintenance-info/);
     assert.match(windowsJob, /Get-ChildItem[^\n]*\$payload[^\n]*-Recurse[^\n]*pos_tauri\.exe/);
     assert.match(windowsJob, /\$executables\[0\]\.Length -eq 0/);
-    assert.match(windowsJob, /& \$executables\[0\]\.FullName maintenance-info/);
+    assert.doesNotMatch(windowsJob, /& \$executables|\$LASTEXITCODE/);
+    assert.match(windowsJob, /\$maintenance = Start-Process -FilePath \$executables\[0\]\.FullName -ArgumentList "maintenance-info" -Wait -PassThru -RedirectStandardOutput \$stdoutPath -RedirectStandardError \$stderrPath/);
+    assert.match(windowsJob, /Join-Path \$env:RUNNER_TEMP \("(?:nsis|msi)-maintenance-" \+ \[guid\]::NewGuid\(\)\.ToString\("N"\)\)/);
+    assert.match(windowsJob, /\$stdoutPath = "\$capture\.stdout"\n\s+\$stderrPath = "\$capture\.stderr"/);
+    assert.match(windowsJob, /\$stdout = \[System\.IO\.File\]::ReadAllText\(\$stdoutPath\)/);
+    assert.match(windowsJob, /\$stderr = \[System\.IO\.File\]::ReadAllText\(\$stderrPath\)/);
+    assert.match(windowsJob, /\$maintenance\.ExitCode -ne 0 -or \$stdout -cne "Linea POS 0\.2\.1: mantenimiento local disponible`n" -or \$stderr\.Length -ne 0/);
+    assert.match(windowsJob, /throw "[^"]*exit=\$\(\$maintenance\.ExitCode\)[^\n]*stdout=\[\$stdout\] stderr=\[\$stderr\]/);
+    assert.doesNotMatch(windowsJob, /\.Trim\(|Get-Content/);
   }
+  assert.ok(nsis.indexOf("Prove maintenance mode") < nsis.indexOf("Sign final NSIS installer bytes"));
+  assert.ok(msi.indexOf("Prove maintenance mode") < msi.indexOf("actions/upload-artifact@"));
   assert.match(nsis, /Start-Process[^\n]*\$installer\.FullName[^\n]*\/S[^\n]*\/D=\$payload[^\n]*-Wait -PassThru/);
   assert.match(msi, /Start-Process[^\n]*msiexec\.exe[^\n]*-Wait -PassThru/);
   assert.match(msi, /@\("\/a"[^\n]*"\/qn"[^\n]*"\/norestart"[^\n]*TARGETDIR/);
@@ -309,7 +319,7 @@ esac`);
 cp -a "$FIXTURE_ROOT/deb/." "$3/"`);
   await executable(path.join(bin, "rpm2cpio"), `[[ $# == 1 && $1 == "$FIXTURE_ROOT/Linea POS.rpm" ]]
 printf 'rpm payload'`);
-  await executable(path.join(bin, "cpio"), `[[ $# == 2 && $1 == --extract && $2 == --quiet ]]
+  await executable(path.join(bin, "cpio"), `[[ $# == 3 && $1 == --extract && $2 == --make-directories && $3 == --quiet ]]
 [[ $(cat) == 'rpm payload' ]]
 cp -a "$FIXTURE_ROOT/rpm/." ./`);
   return {
@@ -324,6 +334,79 @@ test("Linux maintenance verifier executes the final AppImage through AppRun and 
   const f = await maintenanceFixture(t);
   await f.run();
   assert.equal(await readFile(path.join(f.root, "launches"), "utf8"), "AppRun\n");
+});
+
+test("RPM extraction creates missing parents from a real file-only CPIO archive", async (t) => {
+  const probe = spawnSync("cpio", ["--version"]);
+  if (probe.error?.code === "ENOENT") return t.skip("cpio is not installed");
+  assert.equal(probe.status, 0);
+  const f = await maintenanceFixture(t);
+  const archive = spawnSync("cpio", ["--create", "--format=newc", "--quiet"], {
+    cwd: path.join(f.root, "rpm"), input: "./usr/bin/pos_tauri\n",
+  });
+  assert.equal(archive.status, 0, archive.stderr.toString());
+  const listing = spawnSync("cpio", ["--list", "--quiet"], { input: archive.stdout });
+  assert.equal(listing.status, 0);
+  assert.match(listing.stdout.toString(), /^(?:\.\/)?usr\/bin\/pos_tauri\n$/);
+  await writeFile(path.join(f.root, "Linea POS.rpm"), archive.stdout);
+  await rm(path.join(f.root, "tools", "cpio"));
+  await writeFile(path.join(f.root, "tools", "rpm2cpio"), '#!/usr/bin/env bash\nexec cat -- "$1"\n');
+  await f.run();
+
+  // Prove the same archive reproduces the release failure without the fix.
+  const broken = path.join(f.root, "verifier-without-mkdir.sh");
+  await writeFile(broken, (await readFile(maintenanceVerifier, "utf8")).replace(" --make-directories", ""));
+  await assert.rejects(execFileAsync("bash", [broken, ...["Linea POS.AppImage", "Linea POS.deb", "Linea POS.rpm"].map((name) => path.join(f.root, name))], {
+    env: { ...process.env, LC_ALL: "C", PATH: `${path.join(f.root, "tools")}:${process.env.PATH}`, FIXTURE_ROOT: f.root },
+  }), /Cannot open/);
+});
+
+test("Windows GUI payload capture waits and rejects inexact output, stderr, and failure codes", async (t) => {
+  if (process.platform !== "win32") return t.skip("requires Windows GUI subsystem and pwsh");
+  const probe = spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"]);
+  if (probe.error?.code === "ENOENT") return t.skip("pwsh is not installed");
+  assert.equal(probe.status, 0);
+  const root = await mkdtemp(path.join(os.tmpdir(), "pos GUI capture "));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = path.join(root, "fixture.cs");
+  const exe = path.join(root, "pos_tauri.exe");
+  await writeFile(source, `using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+class Fixture {
+  static int Main(string[] args) {
+    if (args.Length != 1 || args[0] != "maintenance-info") return 99;
+    Thread.Sleep(300);
+    string defect = Environment.GetEnvironmentVariable("CAPTURE_DEFECT");
+    string output = "Linea POS 0.2.1: mantenimiento local disponible\\n";
+    if (defect == "extra") output += "\\n";
+    if (defect == "missing-newline") output = output.TrimEnd('\\n');
+    if (defect == "case") output = output.ToUpperInvariant();
+    byte[] bytes = Encoding.UTF8.GetBytes(output);
+    using (Stream stdout = Console.OpenStandardOutput()) stdout.Write(bytes, 0, bytes.Length);
+    if (defect == "stderr") {
+      using (Stream stderr = Console.OpenStandardError()) stderr.WriteByte(88);
+    }
+    return defect == "exit" ? 42 : 0;
+  }
+}`);
+  const compiler = path.join(process.env.WINDIR, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe");
+  await execFileAsync(compiler, ["/nologo", "/target:winexe", `/out:${exe}`, source]);
+  for (const format of ["NSIS", "MSI"]) {
+    const block = stepRunBlock(release, `Prove maintenance mode is in the ${format} payload`);
+    const capture = block.slice(block.indexOf("$capture ="));
+    const script = path.join(root, `${format}.ps1`);
+    await writeFile(script, `$ErrorActionPreference = "Stop"\n$executables = @(Get-Item -LiteralPath $env:GUI_FIXTURE)\n${capture}`);
+    const run = (defect = "") => execFileAsync("pwsh", ["-NoProfile", "-File", script], {
+      env: { ...process.env, RUNNER_TEMP: root, GUI_FIXTURE: exe, CAPTURE_DEFECT: defect },
+    });
+    await run();
+    await run(); // Repeated invocations must use independent capture files.
+    for (const defect of ["extra", "missing-newline", "case", "stderr", "exit"]) {
+      await assert.rejects(run(defect), /payload maintenance-info failed/);
+    }
+  }
 });
 
 test("Linux maintenance verifier rejects a broken launcher even when its payload binary works", async (t) => {

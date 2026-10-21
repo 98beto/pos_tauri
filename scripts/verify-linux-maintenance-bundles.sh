@@ -38,6 +38,6 @@ verify_binary "$work_dir/deb/usr/bin/pos_tauri"
 mkdir "$work_dir/rpm"
 (
   cd "$work_dir/rpm"
-  rpm2cpio "$rpm" | cpio --extract --quiet
+  rpm2cpio "$rpm" | cpio --extract --make-directories --quiet
 )
 verify_binary "$work_dir/rpm/usr/bin/pos_tauri"

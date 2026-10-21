@@ -37,7 +37,12 @@ pub(crate) fn acquire(directory: &Path) -> Result<ApplicationLock, ApplicationLo
     let file = open_lock_file(&path).map_err(|_| ApplicationLockError::Io)?;
     secure_lock_file(&file).map_err(|_| ApplicationLockError::Io)?;
     FileExt::try_lock_exclusive(&file).map_err(|error| {
-        if error.kind() == io::ErrorKind::WouldBlock {
+        // fs2 uses ERROR_LOCK_VIOLATION (33) on Windows. Its ErrorKind is
+        // not necessarily WouldBlock; PermissionDenied and sharing failures
+        // from opening the file must remain Io.
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+            && error.raw_os_error().is_some()
+        {
             ApplicationLockError::Unavailable
         } else {
             ApplicationLockError::Io
@@ -191,5 +196,50 @@ mod tests {
 
         drop(lock);
         fs::remove_file(&path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_violation_is_contention_but_sharing_and_access_denied_are_io() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(APPLICATION_LOCK_NAME);
+        let first = acquire(temp.path()).unwrap();
+        let second = open_lock_file(&path).unwrap();
+        let error = FileExt::try_lock_exclusive(&second).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(33)); // ERROR_LOCK_VIOLATION
+        assert_eq!(
+            error.raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        assert!(matches!(
+            acquire(temp.path()),
+            Err(ApplicationLockError::Unavailable)
+        ));
+        drop(second);
+        drop(first);
+
+        let denied_share = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert_eq!(open_lock_file(&path).unwrap_err().raw_os_error(), Some(32));
+        assert!(matches!(
+            acquire(temp.path()),
+            Err(ApplicationLockError::Io)
+        ));
+        drop(denied_share);
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions.clone()).unwrap();
+        let denied = open_lock_file(&path).unwrap_err();
+        let result = acquire(temp.path());
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+        assert_eq!(denied.raw_os_error(), Some(5)); // ERROR_ACCESS_DENIED
+        assert!(matches!(result, Err(ApplicationLockError::Io)));
     }
 }

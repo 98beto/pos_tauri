@@ -51,6 +51,28 @@ pub(crate) fn verify_named_file_handle(file: &fs::File, path: &Path) -> io::Resu
 }
 
 #[cfg(test)]
+pub(crate) fn test_path_spellings(path: &Path) -> Vec<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let canonical = fs::canonicalize(path).unwrap();
+    let long = canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+    let wide: Vec<u16> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: Input is NUL-terminated and output has the stated writable capacity.
+    let length =
+        unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    assert!(
+        length > 0 && (length as usize) < buffer.len(),
+        "{}",
+        io::Error::last_os_error()
+    );
+    let short = std::ffi::OsString::from_wide(&buffer[..length as usize]);
+    let short = short.to_str().unwrap();
+    let short = std::path::PathBuf::from(short.strip_prefix(r"\\?\").unwrap_or(short));
+    vec![std::path::PathBuf::from(long), canonical, short]
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -84,6 +106,23 @@ mod tests {
 
         assert!(same_file_handle(&first, &linked).unwrap());
         verify_named_file_handle(&first, &link).unwrap();
+    }
+
+    #[test]
+    fn long_short_and_verbatim_names_have_the_same_handle_identity() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("file with long name for identity.db");
+        fs::write(&path, b"identity").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        for spelling in test_path_spellings(&path) {
+            let reopened = fs::File::open(&spelling).unwrap();
+            assert!(same_file_handle(&file, &reopened).unwrap());
+            verify_named_file_handle(&file, &spelling).unwrap();
+            assert_eq!(
+                fs::canonicalize(&spelling).unwrap(),
+                fs::canonicalize(&path).unwrap()
+            );
+        }
     }
 
     #[test]

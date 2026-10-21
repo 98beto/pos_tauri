@@ -433,9 +433,14 @@ jobs:
           if ($executables.Count -ne 1 -or $executables[0].Length -eq 0) {
             throw "NSIS payload must contain exactly one non-empty pos_tauri.exe"
           }
-          $maintenance = & $executables[0].FullName maintenance-info
-          if ($LASTEXITCODE -ne 0 -or $maintenance -ne "Linea POS 0.2.1: mantenimiento local disponible") {
-            throw "NSIS payload maintenance-info failed"
+          $capture = Join-Path $env:RUNNER_TEMP ("nsis-maintenance-" + [guid]::NewGuid().ToString("N"))
+          $stdoutPath = "$capture.stdout"
+          $stderrPath = "$capture.stderr"
+          $maintenance = Start-Process -FilePath $executables[0].FullName -ArgumentList "maintenance-info" -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+          $stdout = [System.IO.File]::ReadAllText($stdoutPath)
+          $stderr = [System.IO.File]::ReadAllText($stderrPath)
+          if ($maintenance.ExitCode -ne 0 -or $stdout -cne "Linea POS 0.2.1: mantenimiento local disponible`n" -or $stderr.Length -ne 0) {
+            throw "NSIS payload maintenance-info failed (exit=$($maintenance.ExitCode)): stdout=[$stdout] stderr=[$stderr]"
           }
       - name: Sign final NSIS installer bytes
         env:
@@ -520,9 +525,14 @@ jobs:
           if ($executables.Count -ne 1 -or $executables[0].Length -eq 0) {
             throw "MSI payload must contain exactly one non-empty pos_tauri.exe"
           }
-          $maintenance = & $executables[0].FullName maintenance-info
-          if ($LASTEXITCODE -ne 0 -or $maintenance -ne "Linea POS 0.2.1: mantenimiento local disponible") {
-            throw "MSI payload maintenance-info failed"
+          $capture = Join-Path $env:RUNNER_TEMP ("msi-maintenance-" + [guid]::NewGuid().ToString("N"))
+          $stdoutPath = "$capture.stdout"
+          $stderrPath = "$capture.stderr"
+          $maintenance = Start-Process -FilePath $executables[0].FullName -ArgumentList "maintenance-info" -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+          $stdout = [System.IO.File]::ReadAllText($stdoutPath)
+          $stderr = [System.IO.File]::ReadAllText($stderrPath)
+          if ($maintenance.ExitCode -ne 0 -or $stdout -cne "Linea POS 0.2.1: mantenimiento local disponible`n" -or $stderr.Length -ne 0) {
+            throw "MSI payload maintenance-info failed (exit=$($maintenance.ExitCode)): stdout=[$stdout] stderr=[$stderr]"
           }
       - run: git diff --exit-code -- src-tauri/Cargo.lock
       # actions/upload-artifact v7.0.1; update this SHA when renewing the action.
