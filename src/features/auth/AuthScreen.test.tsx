@@ -81,7 +81,7 @@ describe("AuthScreen", () => {
     await screen.findByText("Las contrasenas no coinciden.");
     expect(mockedInitializeOwner).toHaveBeenCalledWith(expect.objectContaining({ confirm_password: "two" }));
     expect(confirmation.getAttribute("aria-invalid")).toBe("true");
-    expect(document.activeElement).toBe(confirmation);
+    await waitFor(() => expect(document.activeElement).toBe(confirmation));
   });
 
   it("creates the owner without logging in and clears both password fields", async () => {
