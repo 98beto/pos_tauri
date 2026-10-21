@@ -185,12 +185,11 @@ test("pins every immutable migration from 001 through 012 with full hashes", asy
   }
 });
 
-test("pins original bytes of the historical and reference corpus", async (t) => {
+test("pins original bytes of the checkout corpus without the ignored local demo", async (t) => {
   const corpus = [
     ["historical-file", "docs/plans/inventory-movement-ux-v0.2.0-rollout.md"],
     ["historical-file", "docs/plans/product-presentations-measured-inventory.md"],
     ["pinned-reference", "README.md"],
-    ["pinned-reference", "docs/demo.html"],
     ["pinned-reference", "docs/plans/measured-presentations-inventory-cost-corrections.md"],
     ["pinned-reference", "docs/quality-assurance.md"],
     ["pinned-reference", "docs/releases.md"],
@@ -207,6 +206,7 @@ test("pins original bytes of the historical and reference corpus", async (t) => 
   const pinnedOnly = { enforceImmutableFiles: false, enforcePinnedFiles: true };
   // Preserve existing corpus drift as a baseline; the repository CLI gate reports it.
   const baseline = await validateRetiredInventoryCosts(root, pinnedOnly);
+  assert.ok(!baseline.some(({ path: relativePath }) => relativePath === "docs/demo.html"));
 
   for (const [symbol, relativePath] of corpus) {
     const buffer = files[relativePath];
@@ -225,6 +225,69 @@ test("pins original bytes of the historical and reference corpus", async (t) => 
         assert.deepEqual(await validateRetiredInventoryCosts(root, pinnedOnly), baseline);
       });
     }
+  }
+});
+
+test("missing optional demo does not weaken required reference checks", async (t) => {
+  const root = await fixture(t, {});
+  const violations = await validateRetiredInventoryCosts(root);
+  assert.ok(violations.some(({ symbol, path: relativePath }) => (
+    symbol === "pinned-reference" && relativePath === "README.md"
+  )));
+  assert.ok(!violations.some(({ path: relativePath }) => relativePath === "docs/demo.html"));
+});
+
+test("accepts only the original optional demo bytes, rejecting byte mutations", async (t) => {
+  const relativePath = "docs/demo.html";
+  let buffer;
+  try {
+    buffer = await readFile(path.join(projectRoot, relativePath));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    t.skip("The optional local corpus is absent in this checkout.");
+    return;
+  }
+  const root = await fixture(t, { [relativePath]: buffer });
+  assert.deepEqual(await validateFixture(root), []);
+  for (const [name, mutate] of byteMutations) {
+    await t.test(name, async () => {
+      await writeFile(path.join(root, relativePath), mutate(buffer));
+      assert.deepEqual(await validateFixture(root), [
+        { symbol: "optional-reference", path: relativePath, line: 1 },
+      ]);
+      await writeFile(path.join(root, relativePath), buffer);
+      assert.deepEqual(await validateFixture(root), []);
+    });
+  }
+});
+
+test("rejects replacement demo bytes even without retired symbols or readable text", async (t) => {
+  const relativePath = "docs/demo.html";
+  const replacement = Buffer.from("<html>Replacement corpus</html>\n");
+  const root = await fixture(t, { [relativePath]: replacement });
+  for (const buffer of [replacement, ...byteMutations.map(([, mutate]) => mutate(replacement))]) {
+    await writeFile(path.join(root, relativePath), buffer);
+    assert.deepEqual(await validateFixture(root), [
+      { symbol: "optional-reference", path: relativePath, line: 1 },
+    ]);
+  }
+});
+
+test("the optional reference does not exempt other HTML source files", async (t) => {
+  const retired = camel("movement", "cost", "cents");
+  const root = await fixture(t, {
+    "docs/demo.html": retired,
+    "docs/guide.html": retired,
+    "src/demo.html": retired,
+  });
+  const violations = await validateRetiredInventoryCosts(root);
+  assert.deepEqual(violations.filter(({ path: entryPath }) => entryPath === "docs/demo.html"), [
+    { symbol: "optional-reference", path: "docs/demo.html", line: 1 },
+  ]);
+  for (const relativePath of ["docs/guide.html", "src/demo.html"]) {
+    assert.deepEqual(violations.filter(({ path: entryPath }) => entryPath === relativePath), [
+      { symbol: snake("movement", "cost", "cents"), path: relativePath, line: 1, column: 1 },
+    ]);
   }
 });
 

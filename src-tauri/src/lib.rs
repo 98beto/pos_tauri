@@ -5,6 +5,8 @@ pub mod maintenance;
 mod models;
 mod process_lock;
 mod services;
+#[cfg(windows)]
+mod windows_file_identity;
 
 use std::sync::{Arc, Mutex};
 use tauri::Manager;

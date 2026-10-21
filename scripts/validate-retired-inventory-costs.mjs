@@ -73,16 +73,21 @@ const HISTORICAL_FILES = new Map([
 
 const PINNED_REFERENCE_FILES = new Map([
   ["README.md", "045f9255f1b9550cfb6f2f078a0ab61dd247312538601e1e8d24f70a51a626b3"],
-  ["docs/demo.html", "2c93226cd014faaafc1a63f4c016f20f5636cd5d303f9ea7c012c5a1137dfa6f"],
   ["docs/plans/measured-presentations-inventory-cost-corrections.md", "43e86deb8a8ebde7561cf48a16ceffac8bf83343c627571407cfae6622d70bc6"],
   ["docs/quality-assurance.md", "4f1caf23b223fb6d92fcee0609d34dcd16e08cc99f89f8cadb9091851b1d4ec7"],
   ["docs/releases.md", "467b4dd31a27ee9775479ac4cedbb30e7dd9a80e95d0b272d8850e355ae5e8ab"],
   // The test suite contains intentional evasions and is itself an immutable reproduction corpus.
-  ["scripts/validate-retired-inventory-costs.node-test.mjs", "010570bbebcef031507e08eeab46e005c680e50fa75952b5ee05c740d1e8ec70"],
+  ["scripts/validate-retired-inventory-costs.node-test.mjs", "2a4bea52a96310e78ecfb7a3b33ef79998aa76ccce8db62911d82caaf846e7e7"],
   // These files retain the shipped-schema compatibility and migration QA corpus.
   ["src-tauri/src/db/migrations.rs", "353a4b5226533e325983d53f97f833c75a99b15ce89782877a6af75801975fe2"],
-  ["src-tauri/src/db/mod.rs", "baefbaf239965cb4f35f288613f727e19e0235e339c821c2e156bd21d07b50dd"],
+  ["src-tauri/src/db/mod.rs", "d629a01cc764fd09b93a4af3dc2a9232114f72bc43d176b0564138d08615f5ce"],
   ["src-tauri/src/db/tests/migration_qa.rs", "09207bedd4aae147608c3befadbb299fa6db898ebf0be7172b73b384e126c0bf"],
+]);
+
+// Local-only historical corpus: absence is allowed, but only the previously pinned
+// bytes may bypass symbol scanning. Never add these paths to required-file checks.
+const OPTIONAL_REFERENCE_FILES = new Map([
+  ["docs/demo.html", "2c93226cd014faaafc1a63f4c016f20f5636cd5d303f9ea7c012c5a1137dfa6f"],
 ]);
 
 // Active-code exceptions are intentionally explicit. Each entry identifies one symbol occurrence
@@ -382,6 +387,12 @@ export async function validateRetiredInventoryCosts(rootDirectory = process.cwd(
     const pinnedHash = PINNED_REFERENCE_FILES.get(entry.path);
     if (pinnedHash !== undefined && enforcePinnedFiles) {
       if (sha256(buffer) !== pinnedHash) violations.push({ symbol: "pinned-reference", path: entry.path, line: 1 });
+      continue;
+    }
+
+    const optionalHash = OPTIONAL_REFERENCE_FILES.get(entry.path);
+    if (optionalHash !== undefined) {
+      if (sha256(buffer) !== optionalHash) violations.push({ symbol: "optional-reference", path: entry.path, line: 1 });
       continue;
     }
 

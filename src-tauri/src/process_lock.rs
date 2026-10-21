@@ -82,10 +82,12 @@ fn open_lock_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(windows)]
-    options.share_mode(
-        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
-            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
-    );
+    options
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .share_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+        );
     options.open(path)
 }
 
@@ -130,19 +132,7 @@ fn lock_path_matches(file: &fs::File, path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn lock_path_matches(file: &fs::File, path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-
-    reject_symlink(path)?;
-    let opened = file.metadata()?;
-    let named = fs::metadata(path)?;
-    if !opened.is_file()
-        || !named.is_file()
-        || opened.volume_serial_number() != named.volume_serial_number()
-        || opened.file_index() != named.file_index()
-    {
-        return Err(io::Error::other("invalid lock file"));
-    }
-    Ok(())
+    crate::windows_file_identity::verify_named_file_handle(file, path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -183,5 +173,23 @@ mod tests {
         fs::write(&path, b"replacement").unwrap();
 
         assert_eq!(lock.validate(), Err(ApplicationLockError::Io));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_lock_cannot_be_deleted_or_replaced() {
+        let temp = TempDir::new().unwrap();
+        let lock = acquire(temp.path()).unwrap();
+        let path = temp.path().join(APPLICATION_LOCK_NAME);
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"replacement").unwrap();
+
+        assert!(fs::remove_file(&path).is_err());
+        assert!(fs::rename(&path, temp.path().join("moved")).is_err());
+        assert!(fs::rename(&replacement, &path).is_err());
+        lock.validate().unwrap();
+
+        drop(lock);
+        fs::remove_file(&path).unwrap();
     }
 }

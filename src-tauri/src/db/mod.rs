@@ -2381,19 +2381,7 @@ fn verify_named_file_handle(file: &fs::File, path: &Path) -> std::io::Result<()>
 
 #[cfg(windows)]
 fn verify_named_file_handle(file: &fs::File, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-
-    reject_symlink(path)?;
-    let opened = file.metadata()?;
-    let named = fs::metadata(path)?;
-    if !opened.is_file()
-        || !named.is_file()
-        || opened.volume_serial_number() != named.volume_serial_number()
-        || opened.file_index() != named.file_index()
-    {
-        return Err(std::io::Error::other("invalid lock file"));
-    }
-    Ok(())
+    crate::windows_file_identity::verify_named_file_handle(file, path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2415,11 +2403,7 @@ fn same_file_handle(left: &fs::File, right: &fs::File) -> std::io::Result<bool> 
 
 #[cfg(windows)]
 fn same_file_handle(left: &fs::File, right: &fs::File) -> std::io::Result<bool> {
-    use std::os::windows::fs::MetadataExt;
-    let left = left.metadata()?;
-    let right = right.metadata()?;
-    Ok(left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index())
+    crate::windows_file_identity::same_file_handle(left, right)
 }
 
 #[cfg(not(any(unix, windows)))]
