@@ -235,7 +235,7 @@ jobs:
       - name: Install Linux bundle and signature dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm cpio minisign
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm libarchive-tools minisign
       - run: pnpm install --frozen-lockfile
       - name: Build frontend without signing secrets
         env:

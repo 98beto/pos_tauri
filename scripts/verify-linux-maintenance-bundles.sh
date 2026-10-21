@@ -33,11 +33,11 @@ finish() {
     printf 'Linux maintenance verification failed: stage=%s exit=%s line=%s command=%q\n' \
       "$stage" "$status" "$failure_line" "$failure_command" >&2
     diagnose_path "$checked_path"
-    if [[ -n "$work_dir" && -f "$work_dir/rpm-payload.cpio" && "$stage" == rpm.* ]]; then
-      printf 'rpm2cpio stdout capture:\n' >&2
-      diagnose_path "$work_dir/rpm-payload.cpio"
-      printf 'rpm2cpio stdout bytes (first 256, hexadecimal):\n' >&2
-      od -An -tx1 -N256 -- "$work_dir/rpm-payload.cpio" >&2 || true
+    if [[ -n "$work_dir" && "$stage" == rpm.* ]]; then
+      printf 'bsdtar RPM input bytes (first 256, hexadecimal):\n' >&2
+      od -An -tx1 -N256 -- "$rpm" >&2 || true
+      printf 'RPM extracted payload (diagnostic only):\n' >&2
+      diagnose_path "$work_dir/rpm/usr/bin/pos_tauri"
     fi
     if [[ -n "$work_dir" && -f "$work_dir/maintenance-info.stdout" ]]; then
       printf 'maintenance stdout bytes (first 256, hexadecimal):\n' >&2
@@ -90,15 +90,11 @@ dpkg-deb --extract "$deb" "$work_dir/deb"
 stage=deb.payload
 verify_binary "$work_dir/deb/usr/bin/pos_tauri"
 
-stage=rpm.convert
-checked_path=$rpm
-rpm2cpio "$rpm" > "$work_dir/rpm-payload.cpio"
-[[ -s "$work_dir/rpm-payload.cpio" ]]
 stage=rpm.extract
+checked_path=$rpm
 mkdir "$work_dir/rpm"
-(
-  cd "$work_dir/rpm"
-  cpio --extract --make-directories --quiet < "$work_dir/rpm-payload.cpio"
-)
+# Require successful extraction of the entire RPM before inspecting or running
+# any payload, even when a failed extractor has already written usable files.
+bsdtar --extract --file "$rpm" --directory "$work_dir/rpm"
 stage=rpm.payload
 verify_binary "$work_dir/rpm/usr/bin/pos_tauri"

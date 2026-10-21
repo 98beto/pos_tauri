@@ -6,6 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { gzipSync } from "node:zlib";
+import { randomBytes } from "node:crypto";
 
 const release = await readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
 const releaseRequest = await readFile(new URL("../.github/workflows/release-request.yml", import.meta.url), "utf8");
@@ -262,7 +264,7 @@ test("proves maintenance mode is present in every installer payload", () => {
   const maintenance = linux.indexOf("- name: Prove maintenance mode is executable from final Linux bundles");
   const sign = linux.indexOf("- name: Sign final Linux installer bytes");
   assert.ok(sanitize < maintenance && maintenance < sign);
-  assert.match(linux, /sudo apt-get install[^\n]*rpm cpio/);
+  assert.match(linux, /sudo apt-get install[^\n]*libarchive-tools/);
   for (const windowsJob of [nsis, msi]) {
     assert.doesNotMatch(windowsJob, /target\/release\/pos_tauri\.exe[^\n]*maintenance-info/);
     assert.match(windowsJob, /Get-ChildItem[^\n]*\$payload[^\n]*-Recurse[^\n]*pos_tauri\.exe/);
@@ -317,11 +319,8 @@ esac`);
   await writeFile(rpm, "rpm");
   await executable(path.join(bin, "dpkg-deb"), `[[ $# == 3 && $1 == --extract && $2 == "$FIXTURE_ROOT/Linea POS.deb" ]]
 cp -a "$FIXTURE_ROOT/deb/." "$3/"`);
-  await executable(path.join(bin, "rpm2cpio"), `[[ $# == 1 && $1 == "$FIXTURE_ROOT/Linea POS.rpm" ]]
-printf 'rpm payload'`);
-  await executable(path.join(bin, "cpio"), `[[ $# == 3 && $1 == --extract && $2 == --make-directories && $3 == --quiet ]]
-[[ $(cat) == 'rpm payload' ]]
-cp -a "$FIXTURE_ROOT/rpm/." ./`);
+  await executable(path.join(bin, "bsdtar"), `[[ $# == 5 && $1 == --extract && $2 == --file && $3 == "$FIXTURE_ROOT/Linea POS.rpm" && $4 == --directory ]]
+cp -a "$FIXTURE_ROOT/rpm/." "$5/"`);
   return {
     root,
     run: (env = {}) => execFileAsync("bash", [maintenanceVerifier, appimage, deb, rpm], {
@@ -336,135 +335,121 @@ test("Linux maintenance verifier executes the final AppImage through AppRun and 
   assert.equal(await readFile(path.join(f.root, "launches"), "utf8"), "AppRun\n");
 });
 
-test("RPM extraction creates missing parents from a real file-only CPIO archive", async (t) => {
-  const probe = spawnSync("cpio", ["--version"]);
-  if (probe.error?.code === "ENOENT") return t.skip("cpio is not installed");
-  assert.equal(probe.status, 0);
-  const f = await maintenanceFixture(t);
-  const archive = spawnSync("cpio", ["--create", "--format=newc", "--quiet"], {
-    cwd: path.join(f.root, "rpm"), input: "./usr/bin/pos_tauri\n",
-  });
-  assert.equal(archive.status, 0, archive.stderr.toString());
-  const listing = spawnSync("cpio", ["--list", "--quiet"], { input: archive.stdout });
-  assert.equal(listing.status, 0);
-  assert.match(listing.stdout.toString(), /^(?:\.\/)?usr\/bin\/pos_tauri\n$/);
-  await writeFile(path.join(f.root, "Linea POS.rpm"), archive.stdout);
-  await rm(path.join(f.root, "tools", "cpio"));
-  await writeFile(path.join(f.root, "tools", "rpm2cpio"), '#!/usr/bin/env bash\nexec cat -- "$1"\n');
-  await f.run();
-
-  // This file-only fixture proves missing-parent handling, not the CI root cause.
-  const broken = path.join(f.root, "verifier-without-mkdir.sh");
-  await writeFile(broken, (await readFile(maintenanceVerifier, "utf8")).replace(" --make-directories", ""));
-  await assert.rejects(execFileAsync("bash", [broken, ...["Linea POS.AppImage", "Linea POS.deb", "Linea POS.rpm"].map((name) => path.join(f.root, name))], {
-    env: { ...process.env, LC_ALL: "C", PATH: `${path.join(f.root, "tools")}:${process.env.PATH}`, FIXTURE_ROOT: f.root },
-  }), /Cannot open/);
-
-  // Extraction must preserve a defective archive's mode and report it, never repair it.
-  await chmod(path.join(f.root, "rpm", "usr", "bin", "pos_tauri"), 0o644);
-  const nonExecutable = spawnSync("cpio", ["--create", "--format=newc", "--quiet"], {
-    cwd: path.join(f.root, "rpm"), input: "./usr/bin/pos_tauri\n",
-  });
-  assert.equal(nonExecutable.status, 0, nonExecutable.stderr.toString());
-  await writeFile(path.join(f.root, "Linea POS.rpm"), nonExecutable.stdout);
-  await assert.rejects(f.run({ LC_ALL: "C" }), (error) => {
-    assert.equal(error.code, 1);
-    assert.match(error.stderr, /stage=rpm\.payload exit=1/);
-    assert.match(error.stderr, /type=regular file mode=644/);
-    return true;
-  });
-});
-
-test("RPM conversion completes before real cpio stops reading at TRAILER with large trailing padding", async (t) => {
-  const probe = spawnSync("cpio", ["--version"]);
-  if (probe.error?.code === "ENOENT") return t.skip("cpio is not installed");
-  assert.equal(probe.status, 0);
-  const f = await maintenanceFixture(t);
-  const archive = spawnSync("cpio", ["--create", "--format=newc", "--quiet"], {
-    cwd: path.join(f.root, "rpm"), input: "./usr/bin/pos_tauri\n",
-  });
-  assert.equal(archive.status, 0, archive.stderr.toString());
-  assert.ok(archive.stdout.includes(Buffer.from("TRAILER!!!\0")));
-  await writeFile(path.join(f.root, "Linea POS.rpm"), Buffer.concat([archive.stdout, Buffer.alloc(8 * 1024 * 1024)]));
-  await rm(path.join(f.root, "tools", "cpio"));
-  // Model a converter that reports a silent write failure as exit 1. The input
-  // here is real CPIO, not RPM; this reproduces a pipe hazard, not the CI cause.
-  await writeFile(path.join(f.root, "tools", "rpm2cpio"), `#!${process.execPath}
-const fs = require("node:fs");
-const bytes = fs.readFileSync(process.argv[2]);
-try {
-  for (let offset = 0; offset < bytes.length;) {
-    offset += fs.writeSync(1, bytes, offset, Math.min(4096, bytes.length - offset));
+// Generate a portable RPM container (v3 lead, signature/main headers, gzip/newc)
+// from synthetic bytes. No rpmbuild, binary fixture, or production data needed.
+function rpmFixture(binary, mode = 0o100755) {
+  const pad = (length, alignment) => Buffer.alloc((alignment - length % alignment) % alignment);
+  function entry(name, data, fileMode) {
+    const filename = Buffer.from(`${name}\0`);
+    const fields = [1, fileMode, 0, 0, 1, 0, data.length, 0, 0, 0, 0, filename.length, 0];
+    const header = Buffer.from(`070701${fields.map((n) => n.toString(16).padStart(8, "0")).join("")}`);
+    return Buffer.concat([header, filename, pad(header.length + filename.length, 4), data, pad(data.length, 4)]);
   }
-} catch (error) {
-  if (error.code === "EPIPE") process.exit(1);
-  throw error;
+  const lead = Buffer.alloc(96);
+  lead.set([0xed, 0xab, 0xee, 0xdb, 3, 0, 0, 0, 0, 1]);
+  lead.write("maintenance-fixture-1-1", 10);
+  lead.writeUInt16BE(1, 76); // Linux
+  lead.writeUInt16BE(5, 78); // header-style signature
+  function header(tags) {
+    const intro = Buffer.alloc(16);
+    intro.set([0x8e, 0xad, 0xe8, 1]);
+    intro.writeUInt32BE(tags.length, 8);
+    const indexes = Buffer.alloc(tags.length * 16);
+    const strings = [];
+    let offset = 0;
+    for (const [i, [tag, value]] of tags.entries()) {
+      const bytes = Buffer.from(`${value}\0`);
+      [tag, 6, offset, 1].forEach((n, j) => indexes.writeUInt32BE(n, i * 16 + j * 4));
+      strings.push(bytes);
+      offset += bytes.length;
+    }
+    intro.writeUInt32BE(offset, 12);
+    return Buffer.concat([intro, indexes, ...strings]);
+  }
+  const signature = header([]);
+  const metadata = header([[1000, "maintenance-fixture"], [1001, "1"], [1002, "1"], [1022, "noarch"], [1124, "cpio"], [1125, "gzip"], [1126, "9"]]);
+  const payload = Buffer.concat([
+    entry("./usr/bin/pos_tauri", binary, mode),
+    // Force multiple decompressor reads, including after the executable exists.
+    entry("./usr/share/maintenance-fixture/padding", randomBytes(128 * 1024), 0o100644),
+    entry("TRAILER!!!", Buffer.alloc(0), 0),
+  ]);
+  return Buffer.concat([lead, signature, pad(signature.length, 8), metadata, gzipSync(payload)]);
 }
-fs.writeFileSync(process.env.FIXTURE_ROOT + "/producer-completed", "complete");
-process.exit(Number(process.env.PRODUCER_STATUS || 0));
-`);
-  const pipeRoot = path.join(f.root, "pipe extraction");
-  await mkdir(pipeRoot);
-  const pipeline = spawnSync("bash", ["-c", 'set -euo pipefail; rpm2cpio "$1" | cpio --extract --make-directories --quiet', "bash", path.join(f.root, "Linea POS.rpm")], {
-    cwd: pipeRoot,
-    env: { ...process.env, LC_ALL: "C", PATH: `${path.join(f.root, "tools")}:${process.env.PATH}`, FIXTURE_ROOT: f.root },
-  });
-  assert.equal(pipeline.status, 1);
-  assert.equal(pipeline.stderr.toString(), "");
-  assert.equal((await execFileAsync(path.join(pipeRoot, "usr", "bin", "pos_tauri"), ["maintenance-info"])).stdout, maintenanceOutput);
-  await assert.rejects(readFile(path.join(f.root, "producer-completed")), { code: "ENOENT" });
 
+test("real bsdtar extracts RPM, preserves payload checks, and rejects damaged archives", async (t) => {
+  const probe = spawnSync("bsdtar", ["--version"]);
+  if (probe.error?.code === "ENOENT") return t.skip("bsdtar is not installed (libarchive-tools)");
+  assert.equal(probe.status, 0);
+  const f = await maintenanceFixture(t);
+  await rm(path.join(f.root, "tools", "bsdtar"));
+  const binary = Buffer.from(`#!/usr/bin/env bash\nset -eu\n[[ $# == 1 && $1 == maintenance-info ]]\nprintf called > "$FIXTURE_ROOT/rpm-executed"\nprintf '%s' '${maintenanceOutput}'\n`);
+  const archive = rpmFixture(binary);
+  const rpm = path.join(f.root, "Linea POS.rpm");
+  await writeFile(rpm, archive);
   await f.run();
-  assert.equal(await readFile(path.join(f.root, "producer-completed"), "utf8"), "complete");
+  assert.equal(await readFile(path.join(f.root, "rpm-executed"), "utf8"), "called");
+  await rm(path.join(f.root, "rpm-executed"));
+  assert.deepEqual(await readFile(rpm), archive, "verification must not modify the RPM");
 
-  // Even a fully emitted, extractable archive cannot excuse converter failure.
-  await writeFile(path.join(f.root, "tools", "cpio"), '#!/usr/bin/env bash\nprintf called > "$FIXTURE_ROOT/cpio-called"\nexit 0\n', { mode: 0o755 });
-  await assert.rejects(f.run({ PRODUCER_STATUS: "1", LC_ALL: "C" }), (error) => {
-    assert.equal(error.code, 1);
-    assert.match(error.stderr, /stage=rpm\.convert exit=1/);
-    assert.match(error.stderr, /rpm2cpio stdout capture:/);
-    assert.ok(error.stderr.includes(`size=${archive.stdout.length + 8 * 1024 * 1024}`));
-    return true;
-  });
-  await assert.rejects(readFile(path.join(f.root, "cpio-called")), { code: "ENOENT" });
-});
-
-test("RPM conversion rejects empty success and extraction preserves cpio failure", async (t) => {
-  for (const defect of ["empty", "cpio failure"]) {
-    await t.test(defect, async (t) => {
-      const f = await maintenanceFixture(t);
-      if (defect === "empty") {
-        await writeFile(path.join(f.root, "tools", "rpm2cpio"), "#!/usr/bin/env bash\nexit 0\n");
-      }
-      await writeFile(path.join(f.root, "tools", "cpio"), '#!/usr/bin/env bash\nprintf called > "$FIXTURE_ROOT/cpio-called"\nexit 23\n');
+  const corrupt = Buffer.from(archive);
+  corrupt.fill(0, 0, 96); // invalid RPM lead, not a different archive format
+  const corruptPayload = Buffer.from(archive);
+  const gzipOffset = archive.indexOf(Buffer.from([0x1f, 0x8b, 8, 0]), 96);
+  assert.ok(gzipOffset > 96);
+  corruptPayload[gzipOffset + 2] = 0x7f; // invalid gzip compression method
+  for (const [name, bytes, stage] of [
+    ["truncated header", archive.subarray(0, 110), "extract"],
+    ["truncated payload", archive.subarray(0, archive.length - 65536), "extract"],
+    ["corrupt", corrupt, "extract"],
+    ["corrupt payload", corruptPayload, "extract"],
+    ["empty", Buffer.alloc(0), "payload"],
+    ["not executable", rpmFixture(binary, 0o100644), "payload"],
+    ["symlink", rpmFixture(Buffer.from("/bin/true"), 0o120777), "payload"],
+    ["extra stdout", rpmFixture(Buffer.concat([binary, Buffer.from("printf extra\\n\n")])), "payload"],
+    ["missing newline", rpmFixture(Buffer.from(binary.toString().replace(maintenanceOutput, maintenanceOutput.trimEnd()))), "payload"],
+    ["nonzero", rpmFixture(Buffer.concat([binary, Buffer.from("exit 42\n")])), "payload"],
+  ]) {
+    await t.test(name, async () => {
+      await writeFile(rpm, bytes);
       await assert.rejects(f.run({ LC_ALL: "C" }), (error) => {
-        assert.equal(error.code, defect === "empty" ? 1 : 23);
-        assert.match(error.stderr, new RegExp(`stage=rpm\\.${defect === "empty" ? "convert" : "extract"} exit=`));
-        assert.match(error.stderr, /rpm2cpio stdout capture:/);
-        assert.match(error.stderr, /path=.*rpm-payload\.cpio/);
-        if (defect === "empty") assert.match(error.stderr, /size=0/);
+        assert.match(error.stderr, new RegExp(`stage=rpm\\.${stage} exit=`));
+        if (name === "nonzero") assert.equal(error.code, 42);
+        if (name === "symlink") assert.match(error.stderr, /type=symbolic link/);
+        if (name === "not executable") assert.match(error.stderr, /type=regular file mode=644/);
         return true;
       });
-      if (defect === "empty") await assert.rejects(readFile(path.join(f.root, "cpio-called")), { code: "ENOENT" });
-      else assert.equal(await readFile(path.join(f.root, "cpio-called"), "utf8"), "called");
+      if (stage === "extract") await assert.rejects(readFile(path.join(f.root, "rpm-executed")), { code: "ENOENT" });
     });
   }
+
+  // Run the actual extractor successfully, then inject a silent producer error.
+  // Its usable payload must not be executed and the exact status must survive.
+  await writeFile(rpm, archive);
+  await rm(path.join(f.root, "rpm-executed"), { force: true });
+  const realBsdtar = (await execFileAsync("bash", ["-c", "command -v bsdtar"])).stdout.trim();
+  await writeFile(path.join(f.root, "tools", "bsdtar"), `#!/usr/bin/env bash\nset -eu\n"$REAL_BSDTAR" "$@"\nprintf complete > "$FIXTURE_ROOT/extracted"\nexit 37\n`, { mode: 0o755 });
+  await assert.rejects(f.run({ REAL_BSDTAR: realBsdtar, LC_ALL: "C" }), (error) => {
+    assert.equal(error.code, 37);
+    assert.match(error.stderr, /stage=rpm\.extract exit=37/);
+    assert.match(error.stderr, /RPM extracted payload \(diagnostic only\):[\s\S]*type=regular file mode=755/);
+    return true;
+  });
+  assert.equal(await readFile(path.join(f.root, "extracted"), "utf8"), "complete");
+  await assert.rejects(readFile(path.join(f.root, "rpm-executed")), { code: "ENOENT" });
 });
 
-test("Linux maintenance failure diagnostics identify conversion/extraction stages and preserve exit codes", async (t) => {
+test("Linux maintenance failure diagnostics identify extraction stages and preserve exit codes", async (t) => {
   for (const format of ["appimage", "deb", "rpm"]) {
     await t.test(format, async (t) => {
       const f = await maintenanceFixture(t);
       if (format !== "appimage") {
-        const tool = format === "deb" ? "dpkg-deb" : "rpm2cpio";
+        const tool = format === "deb" ? "dpkg-deb" : "bsdtar";
         await writeFile(path.join(f.root, "tools", tool), "#!/usr/bin/env bash\nexit 37\n");
-        if (format === "rpm") {
-          await writeFile(path.join(f.root, "tools", "cpio"), "#!/usr/bin/env bash\ncat >/dev/null\n");
-        }
       }
       await assert.rejects(f.run({ LC_ALL: "C", APPIMAGE_EXTRACT_STATUS: format === "appimage" ? "37" : "0" }), (error) => {
         assert.equal(error.code, 37);
-        assert.match(error.stderr, new RegExp(`stage=${format}\\.${format === "rpm" ? "convert" : "extract"} exit=37`));
+        assert.match(error.stderr, new RegExp(`stage=${format}\\.extract exit=37`));
         assert.match(error.stderr, /type=regular file mode=/);
         assert.match(error.stderr, /command=/);
         return true;
