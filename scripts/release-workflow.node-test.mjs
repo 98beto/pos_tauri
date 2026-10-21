@@ -353,7 +353,7 @@ test("RPM extraction creates missing parents from a real file-only CPIO archive"
   await writeFile(path.join(f.root, "tools", "rpm2cpio"), '#!/usr/bin/env bash\nexec cat -- "$1"\n');
   await f.run();
 
-  // Prove the same archive reproduces the release failure without the fix.
+  // This file-only fixture proves missing-parent handling, not the CI root cause.
   const broken = path.join(f.root, "verifier-without-mkdir.sh");
   await writeFile(broken, (await readFile(maintenanceVerifier, "utf8")).replace(" --make-directories", ""));
   await assert.rejects(execFileAsync("bash", [broken, ...["Linea POS.AppImage", "Linea POS.deb", "Linea POS.rpm"].map((name) => path.join(f.root, name))], {
@@ -375,7 +375,83 @@ test("RPM extraction creates missing parents from a real file-only CPIO archive"
   });
 });
 
-test("Linux maintenance failure diagnostics identify extraction stages and preserve exit codes", async (t) => {
+test("RPM conversion completes before real cpio stops reading at TRAILER with large trailing padding", async (t) => {
+  const probe = spawnSync("cpio", ["--version"]);
+  if (probe.error?.code === "ENOENT") return t.skip("cpio is not installed");
+  assert.equal(probe.status, 0);
+  const f = await maintenanceFixture(t);
+  const archive = spawnSync("cpio", ["--create", "--format=newc", "--quiet"], {
+    cwd: path.join(f.root, "rpm"), input: "./usr/bin/pos_tauri\n",
+  });
+  assert.equal(archive.status, 0, archive.stderr.toString());
+  assert.ok(archive.stdout.includes(Buffer.from("TRAILER!!!\0")));
+  await writeFile(path.join(f.root, "Linea POS.rpm"), Buffer.concat([archive.stdout, Buffer.alloc(8 * 1024 * 1024)]));
+  await rm(path.join(f.root, "tools", "cpio"));
+  // Model a converter that reports a silent write failure as exit 1. The input
+  // here is real CPIO, not RPM; this reproduces a pipe hazard, not the CI cause.
+  await writeFile(path.join(f.root, "tools", "rpm2cpio"), `#!${process.execPath}
+const fs = require("node:fs");
+const bytes = fs.readFileSync(process.argv[2]);
+try {
+  for (let offset = 0; offset < bytes.length;) {
+    offset += fs.writeSync(1, bytes, offset, Math.min(4096, bytes.length - offset));
+  }
+} catch (error) {
+  if (error.code === "EPIPE") process.exit(1);
+  throw error;
+}
+fs.writeFileSync(process.env.FIXTURE_ROOT + "/producer-completed", "complete");
+process.exit(Number(process.env.PRODUCER_STATUS || 0));
+`);
+  const pipeRoot = path.join(f.root, "pipe extraction");
+  await mkdir(pipeRoot);
+  const pipeline = spawnSync("bash", ["-c", 'set -euo pipefail; rpm2cpio "$1" | cpio --extract --make-directories --quiet', "bash", path.join(f.root, "Linea POS.rpm")], {
+    cwd: pipeRoot,
+    env: { ...process.env, LC_ALL: "C", PATH: `${path.join(f.root, "tools")}:${process.env.PATH}`, FIXTURE_ROOT: f.root },
+  });
+  assert.equal(pipeline.status, 1);
+  assert.equal(pipeline.stderr.toString(), "");
+  assert.equal((await execFileAsync(path.join(pipeRoot, "usr", "bin", "pos_tauri"), ["maintenance-info"])).stdout, maintenanceOutput);
+  await assert.rejects(readFile(path.join(f.root, "producer-completed")), { code: "ENOENT" });
+
+  await f.run();
+  assert.equal(await readFile(path.join(f.root, "producer-completed"), "utf8"), "complete");
+
+  // Even a fully emitted, extractable archive cannot excuse converter failure.
+  await writeFile(path.join(f.root, "tools", "cpio"), '#!/usr/bin/env bash\nprintf called > "$FIXTURE_ROOT/cpio-called"\nexit 0\n', { mode: 0o755 });
+  await assert.rejects(f.run({ PRODUCER_STATUS: "1", LC_ALL: "C" }), (error) => {
+    assert.equal(error.code, 1);
+    assert.match(error.stderr, /stage=rpm\.convert exit=1/);
+    assert.match(error.stderr, /rpm2cpio stdout capture:/);
+    assert.ok(error.stderr.includes(`size=${archive.stdout.length + 8 * 1024 * 1024}`));
+    return true;
+  });
+  await assert.rejects(readFile(path.join(f.root, "cpio-called")), { code: "ENOENT" });
+});
+
+test("RPM conversion rejects empty success and extraction preserves cpio failure", async (t) => {
+  for (const defect of ["empty", "cpio failure"]) {
+    await t.test(defect, async (t) => {
+      const f = await maintenanceFixture(t);
+      if (defect === "empty") {
+        await writeFile(path.join(f.root, "tools", "rpm2cpio"), "#!/usr/bin/env bash\nexit 0\n");
+      }
+      await writeFile(path.join(f.root, "tools", "cpio"), '#!/usr/bin/env bash\nprintf called > "$FIXTURE_ROOT/cpio-called"\nexit 23\n');
+      await assert.rejects(f.run({ LC_ALL: "C" }), (error) => {
+        assert.equal(error.code, defect === "empty" ? 1 : 23);
+        assert.match(error.stderr, new RegExp(`stage=rpm\\.${defect === "empty" ? "convert" : "extract"} exit=`));
+        assert.match(error.stderr, /rpm2cpio stdout capture:/);
+        assert.match(error.stderr, /path=.*rpm-payload\.cpio/);
+        if (defect === "empty") assert.match(error.stderr, /size=0/);
+        return true;
+      });
+      if (defect === "empty") await assert.rejects(readFile(path.join(f.root, "cpio-called")), { code: "ENOENT" });
+      else assert.equal(await readFile(path.join(f.root, "cpio-called"), "utf8"), "called");
+    });
+  }
+});
+
+test("Linux maintenance failure diagnostics identify conversion/extraction stages and preserve exit codes", async (t) => {
   for (const format of ["appimage", "deb", "rpm"]) {
     await t.test(format, async (t) => {
       const f = await maintenanceFixture(t);
@@ -388,7 +464,7 @@ test("Linux maintenance failure diagnostics identify extraction stages and prese
       }
       await assert.rejects(f.run({ LC_ALL: "C", APPIMAGE_EXTRACT_STATUS: format === "appimage" ? "37" : "0" }), (error) => {
         assert.equal(error.code, 37);
-        assert.match(error.stderr, new RegExp(`stage=${format}\\.extract exit=37`));
+        assert.match(error.stderr, new RegExp(`stage=${format}\\.${format === "rpm" ? "convert" : "extract"} exit=37`));
         assert.match(error.stderr, /type=regular file mode=/);
         assert.match(error.stderr, /command=/);
         return true;

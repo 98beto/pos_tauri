@@ -33,6 +33,12 @@ finish() {
     printf 'Linux maintenance verification failed: stage=%s exit=%s line=%s command=%q\n' \
       "$stage" "$status" "$failure_line" "$failure_command" >&2
     diagnose_path "$checked_path"
+    if [[ -n "$work_dir" && -f "$work_dir/rpm-payload.cpio" && "$stage" == rpm.* ]]; then
+      printf 'rpm2cpio stdout capture:\n' >&2
+      diagnose_path "$work_dir/rpm-payload.cpio"
+      printf 'rpm2cpio stdout bytes (first 256, hexadecimal):\n' >&2
+      od -An -tx1 -N256 -- "$work_dir/rpm-payload.cpio" >&2 || true
+    fi
     if [[ -n "$work_dir" && -f "$work_dir/maintenance-info.stdout" ]]; then
       printf 'maintenance stdout bytes (first 256, hexadecimal):\n' >&2
       od -An -tx1 -N256 -- "$work_dir/maintenance-info.stdout" >&2 || true
@@ -84,12 +90,15 @@ dpkg-deb --extract "$deb" "$work_dir/deb"
 stage=deb.payload
 verify_binary "$work_dir/deb/usr/bin/pos_tauri"
 
-stage=rpm.extract
+stage=rpm.convert
 checked_path=$rpm
+rpm2cpio "$rpm" > "$work_dir/rpm-payload.cpio"
+[[ -s "$work_dir/rpm-payload.cpio" ]]
+stage=rpm.extract
 mkdir "$work_dir/rpm"
 (
   cd "$work_dir/rpm"
-  rpm2cpio "$rpm" | cpio --extract --make-directories --quiet
+  cpio --extract --make-directories --quiet < "$work_dir/rpm-payload.cpio"
 )
 stage=rpm.payload
 verify_binary "$work_dir/rpm/usr/bin/pos_tauri"
