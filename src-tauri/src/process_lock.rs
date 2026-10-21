@@ -232,13 +232,13 @@ mod tests {
         ));
         drop(denied_share);
 
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions.clone()).unwrap();
+        fs::set_permissions(&path, permissions).unwrap();
         let denied = open_lock_file(&path).unwrap_err();
         let result = acquire(temp.path());
-        permissions.set_readonly(false);
-        fs::set_permissions(&path, permissions).unwrap();
+        fs::set_permissions(&path, original_permissions).unwrap();
         assert_eq!(denied.raw_os_error(), Some(5)); // ERROR_ACCESS_DENIED
         assert!(matches!(result, Err(ApplicationLockError::Io)));
     }
