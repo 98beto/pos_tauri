@@ -308,7 +308,7 @@ exit "\${LAUNCHER_STATUS-0}"`);
   const appimage = path.join(root, "Linea POS.AppImage");
   await executable(appimage, `case "\${1-}" in
   --appimage-extract-and-run) shift; exec "$FIXTURE_ROOT/appimage/AppRun" "$@" ;;
-  --appimage-extract) mkdir squashfs-root; cp -a "$FIXTURE_ROOT/appimage/." squashfs-root/ ;;
+  --appimage-extract) [[ \${APPIMAGE_EXTRACT_STATUS-0} == 0 ]] || exit "$APPIMAGE_EXTRACT_STATUS"; mkdir squashfs-root; cp -a "$FIXTURE_ROOT/appimage/." squashfs-root/ ;;
   *) exit 90 ;;
 esac`);
   const deb = path.join(root, "Linea POS.deb");
@@ -359,6 +359,42 @@ test("RPM extraction creates missing parents from a real file-only CPIO archive"
   await assert.rejects(execFileAsync("bash", [broken, ...["Linea POS.AppImage", "Linea POS.deb", "Linea POS.rpm"].map((name) => path.join(f.root, name))], {
     env: { ...process.env, LC_ALL: "C", PATH: `${path.join(f.root, "tools")}:${process.env.PATH}`, FIXTURE_ROOT: f.root },
   }), /Cannot open/);
+
+  // Extraction must preserve a defective archive's mode and report it, never repair it.
+  await chmod(path.join(f.root, "rpm", "usr", "bin", "pos_tauri"), 0o644);
+  const nonExecutable = spawnSync("cpio", ["--create", "--format=newc", "--quiet"], {
+    cwd: path.join(f.root, "rpm"), input: "./usr/bin/pos_tauri\n",
+  });
+  assert.equal(nonExecutable.status, 0, nonExecutable.stderr.toString());
+  await writeFile(path.join(f.root, "Linea POS.rpm"), nonExecutable.stdout);
+  await assert.rejects(f.run({ LC_ALL: "C" }), (error) => {
+    assert.equal(error.code, 1);
+    assert.match(error.stderr, /stage=rpm\.payload exit=1/);
+    assert.match(error.stderr, /type=regular file mode=644/);
+    return true;
+  });
+});
+
+test("Linux maintenance failure diagnostics identify extraction stages and preserve exit codes", async (t) => {
+  for (const format of ["appimage", "deb", "rpm"]) {
+    await t.test(format, async (t) => {
+      const f = await maintenanceFixture(t);
+      if (format !== "appimage") {
+        const tool = format === "deb" ? "dpkg-deb" : "rpm2cpio";
+        await writeFile(path.join(f.root, "tools", tool), "#!/usr/bin/env bash\nexit 37\n");
+        if (format === "rpm") {
+          await writeFile(path.join(f.root, "tools", "cpio"), "#!/usr/bin/env bash\ncat >/dev/null\n");
+        }
+      }
+      await assert.rejects(f.run({ LC_ALL: "C", APPIMAGE_EXTRACT_STATUS: format === "appimage" ? "37" : "0" }), (error) => {
+        assert.equal(error.code, 37);
+        assert.match(error.stderr, new RegExp(`stage=${format}\\.extract exit=37`));
+        assert.match(error.stderr, /type=regular file mode=/);
+        assert.match(error.stderr, /command=/);
+        return true;
+      });
+    });
+  }
 });
 
 test("Windows GUI payload capture waits and rejects inexact output, stderr, and failure codes", async (t) => {
@@ -426,7 +462,7 @@ test("Linux maintenance verifier requires exact AppImage stdout", async (t) => {
 
 test("Linux maintenance verifier retains regular executable payload checks for every format", async (t) => {
   for (const format of ["appimage", "deb", "rpm"]) {
-    for (const defect of ["missing", "symlink", "not executable", "extra output", "nonzero"]) {
+    for (const defect of ["missing", "symlink", "dangling symlink", "directory", "not executable", "extra output", "nonzero"]) {
       await t.test(`${format}: ${defect}`, async (t) => {
         const f = await maintenanceFixture(t);
         const binary = path.join(f.root, format, "usr", "bin", "pos_tauri");
@@ -437,11 +473,33 @@ test("Linux maintenance verifier retains regular executable payload checks for e
           await rm(binary);
           await symlink(target, binary);
         }
+        if (defect === "dangling symlink") {
+          await rm(binary);
+          await symlink("missing-target", binary);
+        }
+        if (defect === "directory") {
+          await rm(binary);
+          await mkdir(binary);
+        }
         if (defect === "not executable") await chmod(binary, 0o644);
         if (defect === "extra output" || defect === "nonzero") {
           await writeFile(binary, `${await readFile(binary, "utf8")}\n${defect === "extra output" ? "printf 'extra\\n'" : "exit 42"}\n`);
         }
-        await assert.rejects(f.run());
+        await assert.rejects(f.run({ LC_ALL: "C" }), (error) => {
+          assert.match(error.stderr, new RegExp(`stage=${format}\\.(launcher|payload) exit=`));
+          assert.match(error.stderr, format === "appimage" && defect !== "symlink" ? /path=.*POS\.AppImage/ : /path=.*pos_tauri/);
+          if (defect === "symlink" || (defect === "dangling symlink" && format !== "appimage")) {
+            assert.match(error.stderr, /type=symbolic link mode=/);
+            assert.match(error.stderr, /symlink target:/);
+          }
+          if (format !== "appimage" && defect === "not executable") assert.match(error.stderr, /type=regular file mode=644/);
+          if (format !== "appimage" && defect === "directory") assert.match(error.stderr, /type=directory mode=/);
+          if (defect === "nonzero") assert.equal(error.code, 42);
+          if (defect === "extra output" || defect === "nonzero") {
+            assert.match(error.stderr, /maintenance stdout bytes/);
+          }
+          return true;
+        });
       });
     }
   }
