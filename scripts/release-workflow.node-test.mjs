@@ -781,6 +781,17 @@ test("scopes GH_TOKEN only to steps that invoke gh or the GitHub API", () => {
   assert.doesNotMatch(jobSection(release, "assemble"), /GH_TOKEN/);
 });
 
+test("publish explicitly disables setup-node package-manager caching without installing or building", () => {
+  const publish = jobSection(release, "publish");
+  const setupNodeSteps = [...publish.matchAll(/^      - uses: actions\/setup-node@[^\n]+\n(?:(?!      - )[^\n]*\n)*/gm)];
+  assert.equal(setupNodeSteps.length, 1);
+  const setupNode = setupNodeSteps[0][0];
+  assert.match(setupNode, /^        with:\n          node-version: 24\.15\.0\n          package-manager-cache: false$/m);
+  assert.doesNotMatch(setupNode, /^          cache:/m);
+  assert.doesNotMatch(publish, /pnpm\/action-setup|corepack|\bpnpm\s+(?:install|i|add|(?:run\s+)?build|tauri)\b/);
+  assert.doesNotMatch(publish, /\b(?:npm|yarn)\s+(?:ci|install|(?:run\s+)?build)\b|cargo\s+build|tauri-apps\/tauri-action/);
+});
+
 test("publish promotes a QA-approved candidate and cannot rebuild bundles", () => {
   const publish = jobSection(release, "publish");
   assert.match(release, /candidate_run_id:[\s\S]*?required: false/);
