@@ -24,26 +24,30 @@ Los artefactos actuales son:
 
 Credenciales ficticias: `admin@pos.local` / `PosDemo123!`.
 
-El fixture v12 incluye costos conocidos y desconocidos y una cronología apta para corregir una compra: compra, ajuste de entrada, venta, ajuste de salida y valoración posterior. La migración debe preservar literalmente:
+Los fixtures v8 y v12 contienen historia representativa. El fixture v12 incluye costos conocidos, desconocidos e incorrectos, una compra cuyo precio por kilo fue capturado como precio por gramo, ajustes, venta, una valoración histórica y huecos de secuencia. Esos datos financieros solo existen para demostrar su eliminación intencional al migrar.
+
+SQLite 13 no mantiene valoración de inventario. La migración elimina las columnas financieras antiguas, no copia precios históricos a los campos de compra v3 y elimina las filas históricas de valoración, conservando el high-water mark de la secuencia. Debe preservar literalmente:
 
 - IDs, relaciones, secuencias, timestamps, tokens y fingerprints.
-- Stock y `inventory_cost_cents`, incluidos los valores `NULL`.
-- Precio y costo de cada movimiento, además de los saldos de costo antes y después.
-- `movement_cost_cents` de los detalles de venta.
+- Stock, cantidades capturadas y cantidades base.
 - Precio de catálogo, precio aplicado, subtotal, descuento y total cobrado.
 - Presentaciones, conversiones, proveedor, documento y nota.
 
-El único cambio estructural permitido en SQLite 13 es admitir `centimeter` en `products`, `sale_details` e `inventory_movements`. El ensayo confirma ese dominio, rechaza unidades desconocidas y versiones intermedias `9`-`11` y, para ambas rutas, compara el snapshot completo al reabrir la base migrada, comprueba que una segunda apertura no altera ni duplica el backup o el manifiesto, y valida el contenido del manifiesto completado. Tambien restaura por la ruta de produccion, valida el manifiesto y la cuarentena, confirma la ausencia de marcadores pendientes, conserva intacto el backup original y reabre en solo lectura el esquema restaurado para comparar nuevamente el snapshot completo.
+El ensayo comprueba la ausencia de todo campo financiero retirado y de filas de valoración, confirma que los campos de compra quedan `NULL` para historia v1/v2 y admite `centimeter` en `products`, `sale_details` e `inventory_movements`. También rechaza unidades desconocidas y versiones intermedias `9`-`11`; compara el snapshot retenido al reabrir, comprueba que una segunda apertura no duplica backup ni manifiesto y valida el manifiesto completado. La restauración usa la ruta de producción, valida manifiesto y cuarentena, conserva intacto el backup original y reabre el esquema 8 o 12 restaurado para compararlo literalmente con su fuente, incluidos los datos financieros que contenía antes de migrar.
+
+El gate transversal se ejecuta con `pnpm test:retired-costs` y también forma parte de `pnpm test`. Rechaza nombres financieros retirados fuera de la allowlist por símbolo y ruta; el precio específico de compra permanece permitido.
 
 ### Smoke funcional y rollback
 
+El gate de release sanea y reempaqueta primero el AppImage final; despues extrae ese AppImage y los DEB/RPM y ejecuta `maintenance-info` desde cada payload, antes de firmar o publicar. En Windows ejecuta `pos_tauri.exe maintenance-info`, inspecciona NSIS/MSI y corre Rust en debug y release; los tests de integracion mantienen por separado `pos-application.lock` y `pos-schema-v13-migration.lock` en un proceso y comprueban que otro proceso rechaza la restauracion con codigo 4.
+
 Antes de publicar, ejecutar sobre un perfil QA desechable migrado desde una copia cerrada:
 
-1. Crear un producto por longitud con presentación `Metro`, confirmar stock y costo acumulado cero y ausencia de movimiento inicial.
-2. Registrar una compra en centímetros con precio de compra, proveedor y documento; comprobar stock, costo acumulado e historial.
-3. Registrar un ajuste de entrada, uno de salida y una valoración; comprobar costo promedio y valor total a costo.
-4. Vender centímetros con precio personalizado y descuento; comprobar total comercial, stock, costo retirado y detalle de venta.
-5. Cotizar y confirmar la corrección de una compra en otra copia desechable; comprobar el replay posterior y que cantidades, precios cobrados, descuentos y totales comerciales no cambian.
+1. Crear un producto por longitud con presentación `Metro`; confirmar stock y ausencia de movimiento inicial.
+2. Registrar una compra en centímetros con precio, proveedor y factura; comprobar stock, importe propio e historial.
+3. Registrar un conteo mayor y uno menor; comprobar diferencia, dirección, motivo y stock resultante, sin campos comerciales.
+4. Vender centímetros con precio personalizado y descuento; comprobar total comercial, stock y detalle de venta sin datos de costo.
+5. Cotizar y confirmar la corrección de una compra en otra copia desechable; comprobar que solo cambian el precio y el importe de esa compra, sin replay de ventas, stock ni movimientos posteriores.
 6. Inyectar o reproducir un fallo controlado y confirmar rollback transaccional sin escrituras parciales.
 7. Cerrar el candidato, restaurar el backup indicado por el manifiesto y abrirlo con la versión compatible con el esquema de origen.
 
@@ -51,7 +55,7 @@ Estos artefactos son deliberadamente temporales y no deben utilizarse como datos
 
 ### Copia cerrada de producción
 
-El ensayo sintético no sustituye la prueba obligatoria sobre una copia externa, cerrada, consistente, anonimizada cuando corresponda y protegida de la base de producción. Esa validación operativa sigue pendiente hasta que un operador la ejecute conforme al runbook de releases. No adjuntar la copia, backups, costos, datos personales ni manifiestos con rutas sensibles a CI, issues o artefactos compartidos.
+El ensayo sintético no sustituye la prueba obligatoria sobre una copia externa, cerrada, consistente, anonimizada cuando corresponda y protegida de la base de producción. Esa validación operativa sigue pendiente hasta que un operador la ejecute conforme al runbook de releases. No adjuntar la copia, backups, datos financieros, datos personales ni manifiestos con rutas sensibles a CI, issues o artefactos compartidos.
 
 ## Comprobación manual de modales
 

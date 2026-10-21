@@ -4,13 +4,25 @@ import { currentUser, initializeOwner, isAuthenticated, login, logout, ownerExis
 import { createBrand, listBrands, updateBrand } from "./brands";
 import { addCartItem, checkoutCart, clearCart, decrementCartItem, getCart, incrementCartItem, quoteCartDiscount, quoteCashChange, removeCartDiscount, removeCartItem, resetCartItemUnitPrice, setCartDiscount, setCartItemQuantity, setCartItemUnitPrice } from "./cart";
 import { createCategory, listCategories, updateCategory } from "./categories";
-import { confirmPurchaseCostCorrection, createInventoryMovement, getInventoryView, getProductInventoryDetail, listInventoryMovements, quoteInventoryMovement, quotePurchaseCostCorrection, searchInventoryProducts } from "./inventory";
+import { confirmPurchasePriceCorrection, createPurchase, createStockCount, getInventoryView, getProductInventoryDetail, listInventoryMovements, lookupInventoryMovement, quotePurchase, quotePurchasePriceCorrection, quoteStockCount, searchInventoryProducts } from "./inventory";
 import { createProductWithPresentations, findProductByCode, findProductBySku, getProductsView, listProductSelector, listProducts, updateProductWithPresentations } from "./products";
 import { getSaleHistoryDetail, getSalesView, listSales } from "./sales";
 
 beforeEach(() => invokeMock.mockReset().mockResolvedValue(undefined));
 
 describe("Tauri API adapters", () => {
+  it("returns a movement for a lost response and null when the token is absent", async () => {
+    const movement = { id: 41, operation_token: "lost-response" };
+    invokeMock.mockResolvedValueOnce(movement).mockResolvedValueOnce(null);
+
+    await expect(lookupInventoryMovement({ operation_token: "lost-response" })).resolves.toBe(movement);
+    await expect(lookupInventoryMovement({ operation_token: "absent" })).resolves.toBeNull();
+    expect(invokeMock.mock.calls).toEqual([
+      ["lookup_inventory_movement", { input: { operation_token: "lost-response" } }],
+      ["lookup_inventory_movement", { input: { operation_token: "absent" } }],
+    ]);
+  });
+
   it("maps auth and cart operations to command names and payloads", async () => {
     const credentials = { email: "ada@example.com", password: "secret" };
     const owner = { ...credentials, first_name: "Ada", last_name: "Lovelace", confirm_password: "secret" };
@@ -32,10 +44,12 @@ describe("Tauri API adapters", () => {
     const presentation = { name: "Kilogramo", mode: "measured" as const, base_quantity: 1000, price: "120.00", barcode: null, is_default: true, is_active: true };
     const productWithPresentations = { name: "Cafe", sku: "CAFE", brand_id: 1, category_id: 2, base_unit: "gram" as const, presentations: [presentation] };
     const productWithPresentationsUpdate = { name: "Cafe", sku: "CAFE", brand_id: 1, category_id: 2, base_unit: "gram" as const, presentations: [{ ...presentation, id: 8 }] };
-    const quote = { product_id: 4, presentation_id: 8, reason: "compra" as const, type: "entrada" as const, quantity: "2", supplier: "Proveedor", document_reference: "FAC-1", note: "Recepcion" };
-    const movement = { ...quote, operation_token: "movement-token", quote_fingerprint: "inventory-quote-v3:test" };
-    const correctionQuote = { movement_id: 12, new_unit_price: "4.50" };
-    const correctionConfirm = { ...correctionQuote, quote_fingerprint: "purchase-cost-correction:test" };
+    const purchaseQuote = { product_id: 4, presentation_id: 8, quantity: "2", purchase_unit_price: "4.50", supplier: "Proveedor", document_reference: "FAC-1", note: "Recepcion" };
+    const purchase = { ...purchaseQuote, operation_token: "purchase-token", quote_fingerprint: "purchase-quote-v3:test" };
+    const stockCountQuote = { product_id: 4, counted_stock: "1800", adjustment_reason: "Conteo mensual" };
+    const stockCount = { ...stockCountQuote, operation_token: "count-token", quote_fingerprint: "stock-count-quote-v3:test" };
+    const correctionQuote = { movement_id: 12, new_purchase_unit_price: "5.00" };
+    const correctionConfirm = { ...correctionQuote, quote_fingerprint: "purchase-price-correction-v3:test" };
     await Promise.all([
       getProductsView({ search: "caf", brand_id: 1, category_id: 2 }), listProductSelector({ search: "caf", category_id: 2 }),
       listProducts(), findProductBySku("CAFE"), findProductByCode("750123"),
@@ -44,7 +58,7 @@ describe("Tauri API adapters", () => {
       listCategories(), createCategory({ name: "Bebidas" }), updateCategory(2, { name: "Calientes" }),
       getInventoryView({ product_search: "caf", product_page: 2, base_unit: "gram", movement_search: "FAC-1", movement_page: 3, reason: "compra", type: "entrada" }),
       getProductInventoryDetail(4, { movement_search: "FAC-1", reason: "compra", type: "entrada", date_from: "2026-09-01", date_to: "2026-09-30", page: 2 }),
-       listInventoryMovements(), searchInventoryProducts("caf", 2), quoteInventoryMovement(quote), createInventoryMovement(movement), quotePurchaseCostCorrection(correctionQuote), confirmPurchaseCostCorrection(correctionConfirm),
+       listInventoryMovements(), lookupInventoryMovement({ operation_token: "lost-response" }), searchInventoryProducts("caf", 2), quotePurchase(purchaseQuote), createPurchase(purchase), quoteStockCount(stockCountQuote), createStockCount(stockCount), quotePurchasePriceCorrection(correctionQuote), confirmPurchasePriceCorrection(correctionConfirm),
       getSalesView({ search: "0001", payment_method: "efectivo" }), getSaleHistoryDetail(9), listSales(),
     ]);
 
@@ -55,10 +69,12 @@ describe("Tauri API adapters", () => {
       ["list_brands"], ["create_brand", { input: { name: "Origen" } }], ["update_brand", { id: 1, input: { name: "Nuevo origen" } }],
       ["list_categories"], ["create_category", { input: { name: "Bebidas" } }], ["update_category", { id: 2, input: { name: "Calientes" } }],
       ["get_inventory_view", { filters: { product_search: "caf", product_page: 2, base_unit: "gram", movement_search: "FAC-1", movement_page: 3, reason: "compra", type: "entrada" } }],
-        ["get_product_inventory_detail", { productId: 4, filters: { movement_search: "FAC-1", reason: "compra", type: "entrada", date_from: "2026-09-01", date_to: "2026-09-30", page: 2 } }], ["list_inventory_movements"], ["search_inventory_products", { search: "caf", page: 2 }], ["quote_inventory_movement", { input: quote }],
-      ["create_inventory_movement", { input: movement }],
-      ["quote_purchase_cost_correction", { input: correctionQuote }],
-      ["confirm_purchase_cost_correction", { input: correctionConfirm }],
+        ["get_product_inventory_detail", { productId: 4, filters: { movement_search: "FAC-1", reason: "compra", type: "entrada", date_from: "2026-09-01", date_to: "2026-09-30", page: 2 } }], ["list_inventory_movements"], ["lookup_inventory_movement", { input: { operation_token: "lost-response" } }], ["search_inventory_products", { search: "caf", page: 2 }], ["quote_purchase", { input: purchaseQuote }],
+      ["create_purchase", { input: purchase }],
+      ["quote_stock_count", { input: stockCountQuote }],
+      ["create_stock_count", { input: stockCount }],
+      ["quote_purchase_price_correction", { input: correctionQuote }],
+      ["confirm_purchase_price_correction", { input: correctionConfirm }],
       ["get_sales_view", { filters: { search: "0001", payment_method: "efectivo" } }],
       ["get_sale_history_detail", { saleId: 9 }], ["list_sales"],
     ]);

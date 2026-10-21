@@ -55,9 +55,6 @@ pub struct Product {
     pub stock: i64,
     pub stock_base: i64,
     pub base_unit: BaseUnit,
-    pub inventory_cost_cents: Option<i64>,
-    pub inventory_cost_status: &'static str,
-    pub average_cost_cents: Option<i64>,
     pub sku: String,
     pub brand_id: i64,
     pub category_id: i64,
@@ -119,9 +116,6 @@ pub struct ProductViewRow {
     pub stock: i64,
     pub stock_base: i64,
     pub base_unit: BaseUnit,
-    pub inventory_cost_cents: Option<i64>,
-    pub inventory_cost_status: &'static str,
-    pub average_cost_cents: Option<i64>,
     pub sku: String,
     pub brand_id: i64,
     pub brand_name: String,
@@ -141,8 +135,6 @@ pub struct ProductViewStats {
     pub milliliter_stock: i64,
     pub centimeter_stock: i64,
     pub brand_count: i64,
-    pub inventory_value_cents: i64,
-    pub products_without_cost: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,9 +150,6 @@ pub struct InventoryProductRow {
     pub sku: String,
     pub stock: i64,
     pub base_unit: BaseUnit,
-    pub inventory_cost_cents: Option<i64>,
-    pub inventory_cost_status: &'static str,
-    pub average_cost_cents: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

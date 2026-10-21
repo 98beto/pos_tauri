@@ -38,7 +38,10 @@ pub(crate) fn run_to_v12(connection: &mut Connection) -> Result<(), rusqlite_mig
     MIGRATIONS.to_version(connection, 12)
 }
 
-#[cfg(test)]
+pub(crate) fn run_to_v8(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
+    MIGRATIONS.to_version(connection, 8)
+}
+
 pub(crate) fn run_to_v13(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
     MIGRATIONS.to_version(connection, 13)
 }
@@ -138,15 +141,15 @@ mod tests {
     }
 
     #[test]
-    fn v13_adds_centimeter_without_replacing_cost_columns() {
+    fn v13_adds_centimeter_and_retires_financial_columns() {
         let mut connection = Connection::open_in_memory().unwrap();
         super::run(&mut connection).unwrap();
 
         connection.execute_batch(
             "INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
              INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
-             INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents)
-             VALUES('Cable','cable',100,0,'CABLE','cable',1,1,'centimeter',0);
+             INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit)
+             VALUES('Cable','cable',100,0,'CABLE','cable',1,1,'centimeter');
              INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default)
              VALUES(1,'Metro','measured',100,100,1);
              INSERT INTO users(first_name,last_name,email,password_hash)
@@ -174,6 +177,18 @@ mod tests {
                         |row| row.get::<_, i64>(0),
                     )
                     .unwrap(),
+                0
+            );
+        }
+        for column in ["purchase_unit_price_cents", "purchase_total_cents"] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('inventory_movements') WHERE name=?1",
+                        [column],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
                 1
             );
         }
@@ -183,6 +198,176 @@ mod tests {
             "UPDATE inventory_movements SET base_unit='unknown' WHERE id=1",
         ] {
             assert!(connection.execute(statement, []).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn v13_enforces_the_v3_purchase_count_and_sale_matrix() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        super::run(&mut connection).unwrap();
+        connection.execute_batch(
+            "INSERT INTO users(first_name,last_name,email,password_hash) VALUES('Ada','Lovelace','ada@pos.local','hash');
+             INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
+             INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
+             INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit)
+             VALUES('Cable','cable',100,10,'CABLE','cable',1,1,'centimeter');
+             INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default)
+             VALUES(1,'Metro','measured',100,100,1);
+             INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method)
+             VALUES(1,'Ada Lovelace','ada@pos.local','sale-token','cart-v3',CURRENT_TIMESTAMP,100,'none',0,0,100,'tarjeta');
+             INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,catalog_unit_price,unit_price,entered_quantity,base_quantity,line_total)
+             VALUES(1,1,3,1,'Cable','CABLE','Metro','centimeter','measured',100,1,100,100,1,1,100);
+             INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint)
+             VALUES(1,'Cable','CABLE','cable','cable',3,1,'Metro','centimeter','measured',100,5000,50,'manual','compra','entrada',1,1,1,10,11,'Proveedor','proveedor','FAC-1','fac-1','purchase-v3','purchase-v3');
+             INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,note,note_search_key,operation_token,intent_fingerprint)
+             VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','manual','ajuste','entrada',2,2,2,11,13,'Conteo mayor','conteo mayor','count-in-v3','count-in-v3'),
+                   (1,'Cable','CABLE','cable','cable',3,'centimeter','manual','ajuste','salida',3,3,3,13,10,'Conteo menor','conteo menor','count-out-v3','count-out-v3');
+             INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after)
+             VALUES(1,'Cable','CABLE','cable','cable',1,3,1,1,'Metro','centimeter','measured',100,'sale','venta','salida',1,1,1,10,9);",
+        ).unwrap();
+
+        for statement in [
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',100,100,'manual','compra','entrada',1,1,1,0,1,'FAC','fac','bad-no-supplier','bad')",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',100,0,'manual','compra','entrada',1,1,1,0,1,'P','p','F','f','bad-zero-total','bad')",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,note,note_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','manual','ajuste','entrada',1,1,1,0,1,'P','p','Conteo','conteo','bad-count-supplier','bad')",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,note,note_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,1,'Metro','centimeter','measured',100,'manual','ajuste','entrada',1,1,1,0,1,'Conteo','conteo','bad-count-presentation','bad')",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',1,3,1,1,'Metro','centimeter','measured',100,100,100,'sale','venta','salida',1,1,1,1,0)",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','initial_stock','ajuste','entrada',1,1,1,0,1)",
+        ] {
+            assert!(connection.execute(statement, []).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn v13_enforces_v1_relationships_and_v2_v3_snapshot_conversions() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        super::run(&mut connection).unwrap();
+        connection.execute_batch(
+            "INSERT INTO users(first_name,last_name,email,password_hash) VALUES('Ada','Lovelace','ada@pos.local','hash');
+             INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
+             INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
+             INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit)
+             VALUES('Cable','cable',100,100,'CABLE','cable',1,1,'centimeter');
+             INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default)
+             VALUES(1,'Rollo','fixed',10,100,1),(1,'Metro','measured',100,100,0);
+             INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method)
+             VALUES(1,'Ada Lovelace','ada@pos.local','sale-token','cart-v3',CURRENT_TIMESTAMP,200,'none',0,0,200,'tarjeta');
+             INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,catalog_unit_price,unit_price,entered_quantity,base_quantity,line_total)
+             VALUES(1,1,2,1,'Cable','CABLE','Rollo','centimeter','fixed',10,2,100,100,2,20,200),
+                   (1,1,3,2,'Cable','CABLE','Metro','centimeter','measured',100,25,100,100,25,25,25);
+             INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint)
+             VALUES(1,'Cable','CABLE','cable','cable',2,1,'Rollo','centimeter','fixed',10,'manual','ajuste','entrada',20,2,20,80,100,'fixed-v2','fixed-v2'),
+                   (1,'Cable','CABLE','cable','cable',2,2,'Metro','centimeter','measured',100,'manual','ajuste','salida',25,25,25,100,75,'measured-v2','measured-v2'),
+                   (1,'Cable','CABLE','cable','cable',2,NULL,NULL,'centimeter',NULL,NULL,'initial_stock','ajuste','entrada',5,5,5,0,5,NULL,NULL);",
+        ).unwrap();
+
+        for statement in [
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,sale_detail_id,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,999,'sale','venta','salida',1)",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_detail_id,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,'initial_stock','ajuste','entrada',1)",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_detail_id,origin,reason,type,quantity,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',1,'manual','ajuste','entrada',1,'bad-v1-link','bad')",
+            "INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(1,1,2,1,'Cable','CABLE','Rollo','centimeter','fixed',10,2,100,2,2,200)",
+            "INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(1,1,2,2,'Cable','CABLE','Metro','centimeter','measured',100,2,100,2,200,200)",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,1,'Rollo','centimeter','fixed',10,'manual','ajuste','entrada',2,2,2,0,2,'bad-fixed','bad')",
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'Parcial','centimeter','fixed',10,'manual','ajuste','entrada',10,1,10,0,10,'bad-partial','bad')",
+        ] {
+            assert!(connection.execute(statement, []).is_err(), "{statement}");
+        }
+
+        connection.execute(
+            "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,origin,reason,type,quantity)
+             VALUES(1,'Cable histórico','CABLE-HIST','cable historico','cable-hist',1,'sale','venta','salida',1)",
+            [],
+        ).unwrap();
+    }
+
+    #[test]
+    fn v13_inventory_sql_case_matrix_covers_every_version_branch() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        super::run(&mut connection).unwrap();
+        connection.execute_batch(
+            "INSERT INTO users(id,first_name,last_name,email,password_hash) VALUES(1,'Ada','Lovelace','ada@pos.local','hash');
+             INSERT INTO brands(id,name,name_search_key) VALUES(1,'Marca','marca');
+             INSERT INTO categories(id,name,name_search_key) VALUES(1,'Categoria','categoria');
+             INSERT INTO products(id,name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit)
+             VALUES(1,'Cable','cable',100,100,'CABLE','cable',1,1,'centimeter'),
+                   (2,'Otro','otro',100,100,'OTRO','otro',1,1,'piece');
+             INSERT INTO product_presentations(id,product_id,name,mode,base_quantity,price,is_default)
+             VALUES(1,1,'Rollo','fixed',10,100,1),(2,1,'Metro','measured',100,100,0),(3,2,'Pieza','fixed',1,100,1);
+             INSERT INTO sales(id,user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method)
+             VALUES(1,1,'Ada Lovelace','ada@pos.local','sale-1','cart-1',CURRENT_TIMESTAMP,100,'none',0,0,100,'tarjeta'),
+                   (2,1,'Ada Lovelace','ada@pos.local','sale-2','cart-2',CURRENT_TIMESTAMP,100,'none',0,0,100,'tarjeta');
+             INSERT INTO sale_details(id,product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,catalog_unit_price,unit_price,entered_quantity,base_quantity,line_total)
+             VALUES(11,1,1,1,NULL,'Histórico','HIST',NULL,NULL,NULL,NULL,1,NULL,100,NULL,NULL,NULL),
+                   (12,1,1,1,1,'Cable','CABLE','Rollo','centimeter','fixed',10,1,NULL,100,1,10,100),
+                   (13,1,1,2,2,'Cable','CABLE','Metro','centimeter','measured',100,3,NULL,100,3,3,300),
+                   (14,1,2,3,1,'Cable','CABLE','Rollo','centimeter','fixed',10,2,100,100,2,20,200);",
+        ).unwrap();
+
+        let valid = [
+            ("v1 sale keeps both historical links nullable", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,1,'sale','venta','salida',1)"),
+            ("v1 sale accepts a complete legacy link", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,1,1,12,'sale','venta','salida',1)"),
+            ("v1 initial stock", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,'initial_stock','ajuste','entrada',1)"),
+            ("v1 manual purchase", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,origin,reason,type,quantity,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',1,'manual','compra','entrada',1,'v1-buy','v1-buy')"),
+            ("v1 manual adjustment in", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,origin,reason,type,quantity,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',1,'manual','ajuste','entrada',1,'v1-in','v1-in')"),
+            ("v1 manual adjustment out", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,origin,reason,type,quantity,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',1,'manual','ajuste','salida',1,'v1-out','v1-out')"),
+            ("v2 sale measured snapshot", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',1,2,2,13,'Metro','centimeter','measured',100,'sale','venta','salida',3,3,3,10,7)"),
+            ("v2 initial stock without presentation", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter','initial_stock','ajuste','entrada',4,4,4,0,4)"),
+            ("v2 manual purchase fixed snapshot", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,1,'Rollo','centimeter','fixed',10,'manual','compra','entrada',20,2,20,0,20,'v2-buy','v2-buy')"),
+            ("v2 manual adjustment in", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter','manual','ajuste','entrada',2,2,2,3,5,'v2-in','v2-in')"),
+            ("v2 manual adjustment out", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter','manual','ajuste','salida',2,2,2,5,3,'v2-out','v2-out')"),
+            ("v3 purchase", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,1,'Rollo','centimeter','fixed',10,50,100,'manual','compra','entrada',20,2,20,0,20,'Proveedor','proveedor','FAC-1','fac-1','v3-buy','v3-buy')"),
+            ("v3 purchase without presentation", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',50,100,'manual','compra','entrada',2,2,2,0,2,'Proveedor','proveedor','FAC-2','fac-2','v3-buy-base','v3-buy-base')"),
+            ("v3 count in", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,note,note_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','manual','ajuste','entrada',2,2,2,3,5,'Mayor','mayor','v3-in','v3-in')"),
+            ("v3 count out", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,note,note_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','manual','ajuste','salida',2,2,2,5,3,'Menor','menor','v3-out','v3-out')"),
+            ("v3 sale fixed snapshot", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',2,3,1,14,'Rollo','centimeter','fixed',10,'sale','venta','salida',20,2,20,20,0)"),
+        ];
+        for (case, statement) in valid {
+            assert!(
+                connection.execute(statement, []).is_ok(),
+                "valid case failed: {case}"
+            );
+        }
+
+        let invalid = [
+            ("v1 sale detail cannot dangle through a null presentation", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,sale_detail_id,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,1,999,'sale','venta','salida',1)"),
+            ("v1 complete link must exist", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,1,1,999,'sale','venta','salida',1)"),
+            ("v1 non-sale cannot reference a detail", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,sale_detail_id,origin,reason,type,quantity) VALUES(1,'Cable','CABLE','cable','cable',1,1,12,'initial_stock','ajuste','entrada',1)"),
+            ("v1 cannot use purchase fields", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,purchase_unit_price_cents,origin,reason,type,quantity,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',1,1,'manual','compra','entrada',1,'bad-v1-price','bad')"),
+            ("sale detail presentation must belong to its product", "INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(1,2,2,3,'Cable','CABLE','Pieza','piece','fixed',1,1,100,1,1,100)"),
+            ("v2 sale detail snapshot is mandatory", "INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(1,2,2,2,'Cable','CABLE',1,100,1,1,100)"),
+            ("sale detail quantity must equal entered quantity", "INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(1,2,2,2,'Cable','CABLE','Metro','centimeter','measured',100,2,100,1,1,100)"),
+            ("v3 sale detail requires catalog price", "INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(1,2,3,2,'Cable','CABLE','Metro','centimeter','measured',100,1,100,1,1,100)"),
+            ("presentation cannot belong to another product", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,3,'Pieza','piece','fixed',1,'manual','ajuste','entrada',1,1,1,0,1,'bad-product','bad')"),
+            ("sale detail tuple cannot be crossed", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',2,2,2,13,'Metro','centimeter','measured',100,'sale','venta','salida',3,3,3,10,7)"),
+            ("v2 snapshot cannot be partial", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'Rollo','centimeter','fixed',10,'manual','ajuste','entrada',10,1,10,0,10,'bad-partial','bad')"),
+            ("fixed conversion must multiply", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,1,'Rollo','centimeter','fixed',10,'manual','ajuste','entrada',2,2,2,0,2,'bad-fixed','bad')"),
+            ("measured conversion must preserve quantity", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,presentation_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,2,'Metro','centimeter','measured',100,'manual','ajuste','entrada',2,1,2,0,2,'bad-measured','bad')"),
+            ("quantity must equal base quantity", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter','manual','ajuste','entrada',1,2,2,0,2,'bad-quantity','bad')"),
+            ("entry stock must increase", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter','manual','ajuste','entrada',2,2,2,2,2,'bad-stock-in','bad')"),
+            ("exit stock must decrease", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter','manual','ajuste','salida',2,2,2,2,2,'bad-stock-out','bad')"),
+            ("v2 cannot use purchase fields", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',2,'centimeter',1,1,'manual','compra','entrada',1,1,1,0,1,'bad-v2-price','bad')"),
+            ("v3 purchase requires both prices", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',1,'manual','compra','entrada',1,1,1,0,1,'P','p','F','f','bad-buy-total','bad')"),
+            ("v3 purchase requires supplier", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',1,1,'manual','compra','entrada',1,1,1,0,1,'F','f','bad-buy-supplier','bad')"),
+            ("v3 purchase requires document", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',1,1,'manual','compra','entrada',1,1,1,0,1,'P','p','bad-buy-document','bad')"),
+            ("v3 count requires note", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','manual','ajuste','entrada',1,1,1,0,1,'bad-count-note','bad')"),
+            ("v3 count cannot use purchase fields", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,note,note_search_key,operation_token,intent_fingerprint) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter',1,1,'manual','ajuste','entrada',1,1,1,0,1,'Conteo','conteo','bad-count-price','bad')"),
+            ("v3 sale cannot use purchase fields", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,sale_id,record_version,presentation_id,sale_detail_id,presentation_name,base_unit,presentation_mode,presentation_base_quantity,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',2,3,1,14,'Rollo','centimeter','fixed',10,1,1,'sale','venta','salida',20,2,20,20,0)"),
+            ("v3 has no initial-stock branch", "INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after) VALUES(1,'Cable','CABLE','cable','cable',3,'centimeter','initial_stock','ajuste','entrada',1,1,1,0,1)"),
+        ];
+        for (case, statement) in invalid {
+            assert!(
+                connection.execute(statement, []).is_err(),
+                "invalid case passed: {case}"
+            );
         }
     }
 

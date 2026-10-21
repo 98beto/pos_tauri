@@ -38,11 +38,6 @@ pub struct SessionCart {
 pub type CartState = SessionCart;
 
 impl SessionCart {
-    #[cfg(test)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }

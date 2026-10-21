@@ -79,7 +79,6 @@ pub struct SaleHistoryLine {
     pub unit_price: i64,
     pub entered_quantity: i64,
     pub base_consumed: i64,
-    pub movement_cost_cents: Option<i64>,
     pub subtotal: Option<i64>,
 }
 

@@ -49,7 +49,7 @@ const measuredPresentation = {
 };
 
 const view: ProductView = {
-  stats: { product_count: 1, piece_stock: 0, gram_stock: 1250, milliliter_stock: 0, centimeter_stock: 0, brand_count: 1, inventory_value_cents: 6250, products_without_cost: 0 },
+  stats: { product_count: 1, piece_stock: 0, gram_stock: 1250, milliliter_stock: 0, centimeter_stock: 0, brand_count: 1 },
   items: [{
     id: 11,
     name: "Cafe molido",
@@ -58,9 +58,6 @@ const view: ProductView = {
     stock: 5,
     stock_base: 1250,
     base_unit: "gram",
-    inventory_cost_cents: 6250,
-    inventory_cost_status: "known",
-    average_cost_cents: 5,
     brand_id: 1,
     brand_name: "Origen",
     category_id: 2,
@@ -288,26 +285,12 @@ describe("ProductsView", () => {
     }));
   });
 
-  it("shows formatted stock and value at accumulated cost", async () => {
+  it("shows formatted stock and commercial presentation without inventory costs", async () => {
     await renderLoaded();
     expect(screen.getAllByText("1.25 kg").length).toBeGreaterThan(0);
     expect(screen.getByText("Bolsa 250 g")).toBeTruthy();
     expect(screen.getByText("$12.50 por 250 g")).toBeTruthy();
-    expect(screen.getAllByText("$62.50").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Valor a costo").length).toBeGreaterThan(0);
-    expect(screen.getByText("Promedio: $0.05")).toBeTruthy();
-  });
-
-  it("shows historical unknown cost without treating it as zero", async () => {
-    mockedGetProductsView.mockResolvedValueOnce({
-      ...view,
-      stats: { ...view.stats, inventory_value_cents: 0, products_without_cost: 1 },
-      items: [{ ...view.items[0], inventory_cost_cents: null, inventory_cost_status: "unknown", average_cost_cents: null }],
-    });
-    await renderLoaded();
-
-    expect(screen.getByText("Costo desconocido")).toBeTruthy();
-    expect(screen.getByText("1 sin costo conocido")).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/valor a costo|costo desconocido|sin costo conocido|promedio:/i);
   });
 
   it("ignores out-of-order list responses and completion after unmount", async () => {
@@ -340,13 +323,13 @@ describe("ProductsView", () => {
     mockedGetProductsView.mockReturnValueOnce(request.promise);
     fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "nuevo" } });
     expect(screen.getByText("Actualizando; se muestran temporalmente los resultados anteriores.")).toBeTruthy();
-    expect(screen.getAllByText("-")).toHaveLength(6);
+    expect(screen.getAllByText("-")).toHaveLength(5);
     expect(screen.getByText("Cafe molido")).toBeTruthy();
     await act(() => vi.advanceTimersByTimeAsync(250));
     await act(async () => request.reject(new Error("SQLITE details")));
     expect(screen.getByText("Se muestran los resultados anteriores; no corresponden a los filtros actuales.")).toBeTruthy();
     expect(screen.queryByText("No hay productos para mostrar")).toBeNull();
-    expect(screen.getAllByText("-")).toHaveLength(6);
+    expect(screen.getAllByText("-")).toHaveLength(5);
   });
 
   it("starts piece products with an active default Pieza and offers only Pieza or Paquete", async () => {

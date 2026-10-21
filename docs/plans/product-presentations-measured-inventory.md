@@ -1,8 +1,10 @@
 # Presentaciones de producto e inventario medido
 
+> **Documento historico y parcialmente reemplazado. No ejecutar sus comandos de rama, pasos de implementacion ni comprobaciones como instrucciones actuales.** El [plan vigente](./measured-presentations-inventory-cost-corrections.md) conserva las presentaciones medidas, pero reemplaza el modelo de costos, compras y ajustes descrito aqui.
+
 **Estado:** implementado.
 
-**Evolucion:** el modelo de costo de compra, costo promedio y valoracion sigue vigente. [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md) reemplaza la captura de stock y costo inicial, agrega centimetros y define la correccion segura de precios de compra.
+**Evolucion:** el modelo de costo promedio y valoracion queda reemplazado. [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md) conserva presentaciones medidas y centimetros, pero separa compras de conteos fisicos y retira el costo acumulado.
 
 **Referencia visual:** `demo.html` contiene el prototipo navegable acordado para Productos, POS, Inventario y Ventas. Sus datos son simulados y no representan funcionalidad ya implementada.
 

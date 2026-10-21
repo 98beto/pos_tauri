@@ -20,7 +20,6 @@ pub struct SaleDetail {
     pub entered_quantity: Option<i64>,
     pub base_quantity: Option<i64>,
     pub line_total: Option<i64>,
-    pub movement_cost_cents: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }

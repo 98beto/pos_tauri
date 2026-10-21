@@ -13,10 +13,8 @@ use crate::models::{
 };
 
 use super::{
-    allocate_grouped_cost,
     cart::{self, SessionCart},
-    checked_total, normalize_search, proportional_cost_withdrawal, search_key, validate_id,
-    CostAllocationLine, ServiceError, ServiceResult,
+    checked_total, normalize_search, search_key, validate_id, ServiceError, ServiceResult,
 };
 
 const CHECKOUT_TOKEN_MAX_LENGTH: usize = 128;
@@ -41,7 +39,6 @@ struct PricedLine {
 
 struct ProductDemand {
     stock_before: i64,
-    inventory_cost_before: Option<i64>,
     base_consumed: i64,
     line_indices: Vec<usize>,
 }
@@ -101,9 +98,8 @@ fn map_detail(row: &Row<'_>) -> rusqlite::Result<SaleDetail> {
         entered_quantity: row.get(15)?,
         base_quantity: row.get(16)?,
         line_total: row.get(17)?,
-        movement_cost_cents: row.get(18)?,
-        created_at: row.get(19)?,
-        updated_at: row.get(20)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
 }
 
@@ -211,7 +207,7 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
         "SELECT product_id, presentation_id, product_name, sku, presentation_name,
                 presentation_barcode, base_unit, presentation_mode, presentation_base_quantity,
                  quantity, catalog_unit_price, unit_price, entered_quantity, base_quantity,
-                 line_total, movement_cost_cents
+                 line_total
          FROM sale_details WHERE sale_id = ?1 ORDER BY id",
     )?;
     let raw_lines = statement
@@ -232,7 +228,6 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
                 row.get::<_, Option<i64>>(12)?,
                 row.get::<_, Option<i64>>(13)?,
                 row.get::<_, Option<i64>>(14)?,
-                row.get::<_, Option<i64>>(15)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -253,7 +248,6 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
             unit_price: line.11,
             entered_quantity: line.12.unwrap_or(line.9),
             base_consumed: line.13.unwrap_or(line.9),
-            movement_cost_cents: line.15,
             subtotal: line.14,
         });
     }
@@ -350,14 +344,13 @@ pub fn checkout(
         let demand = match demands.entry(resolved.product_id) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
-                let (stock_before, inventory_cost_before) = transaction.query_row(
-                    "SELECT stock,inventory_cost_cents FROM products WHERE id=?1",
+                let stock_before = transaction.query_row(
+                    "SELECT stock FROM products WHERE id=?1",
                     [resolved.product_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    |row| row.get::<_, i64>(0),
                 )?;
                 entry.insert(ProductDemand {
                     stock_before,
-                    inventory_cost_before,
                     base_consumed: 0,
                     line_indices: Vec::new(),
                 })
@@ -443,21 +436,9 @@ pub fn checkout(
 
     for (product_id, demand) in demands {
         let stock_after = demand.stock_before - demand.base_consumed;
-        let withdrawal = proportional_cost_withdrawal(
-            demand.inventory_cost_before,
-            demand.stock_before,
-            demand.base_consumed,
-        )?;
         let changed = transaction.execute(
-            "UPDATE products SET stock=?1,inventory_cost_cents=?2,updated_at=CURRENT_TIMESTAMP
-             WHERE id=?3 AND stock=?4 AND inventory_cost_cents IS ?5",
-            params![
-                stock_after,
-                withdrawal.inventory_cost_after_cents,
-                product_id,
-                demand.stock_before,
-                demand.inventory_cost_before
-            ],
+            "UPDATE products SET stock=?1,updated_at=CURRENT_TIMESTAMP WHERE id=?2 AND stock=?3",
+            params![stock_after, product_id, demand.stock_before],
         )?;
         if changed != 1 {
             return Err(ServiceError::conflict(
@@ -466,40 +447,16 @@ pub fn checkout(
             ));
         }
 
-        let allocations = withdrawal
-            .movement_cost_cents
-            .map(|total_cost| {
-                allocate_grouped_cost(
-                    total_cost,
-                    &demand
-                        .line_indices
-                        .iter()
-                        .map(|&line_index| CostAllocationLine {
-                            stable_id: lines[line_index].presentation_id,
-                            base_quantity: lines[line_index].base_consumed,
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .transpose()?;
         let mut movement_stock_before = demand.stock_before;
-        let mut movement_inventory_cost_before = demand.inventory_cost_before;
-        for (position, &line_index) in demand.line_indices.iter().enumerate() {
+        for &line_index in &demand.line_indices {
             let line = &lines[line_index];
-            let line_cost = allocations.as_ref().map(|costs| costs[position]);
             let movement_stock_after = movement_stock_before - line.base_consumed;
-            let movement_inventory_cost_after = match (movement_inventory_cost_before, line_cost) {
-                (Some(cost_before), Some(cost)) => Some(cost_before - cost),
-                (None, None) if movement_stock_after == 0 => Some(0),
-                (None, None) => None,
-                _ => unreachable!("known grouped cost has known line allocations"),
-            };
             transaction.execute(
                 "INSERT INTO sale_details (product_id, sale_id, record_version, presentation_id,
                      product_name, sku, presentation_name, presentation_barcode, base_unit,
                      presentation_mode, presentation_base_quantity, quantity, catalog_unit_price,
-                     unit_price, entered_quantity, base_quantity, line_total, movement_cost_cents)
-                  VALUES (?1, ?2, 2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?11, ?14, ?15, ?16)",
+                     unit_price, entered_quantity, base_quantity, line_total)
+                  VALUES (?1, ?2, 3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?11, ?14, ?15)",
                 params![
                     line.product_id,
                     sale_id,
@@ -516,7 +473,6 @@ pub fn checkout(
                     line.applied_unit_price,
                     line.base_consumed,
                     line.line_total,
-                    line_cost
                 ],
             )?;
             let sale_detail_id = transaction.last_insert_rowid();
@@ -525,11 +481,9 @@ pub fn checkout(
                      product_search_key, sku_search_key, sale_id, record_version, presentation_id,
                      sale_detail_id, presentation_name, presentation_barcode, base_unit,
                      presentation_mode, presentation_base_quantity, origin, reason, type, quantity,
-                     entered_quantity, base_quantity, unit_price_cents, movement_cost_cents,
-                     stock_before, stock_after, inventory_cost_before_cents,
-                     inventory_cost_after_cents)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 2, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                           'sale', 'venta', 'salida', ?14, ?15, ?14, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     entered_quantity, base_quantity, stock_before, stock_after)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 3, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                           'sale', 'venta', 'salida', ?14, ?15, ?14, ?16, ?17)",
                 params![
                     line.product_id,
                     line.product_name,
@@ -546,22 +500,13 @@ pub fn checkout(
                     line.presentation_base_quantity,
                     line.base_consumed,
                     line.entered_quantity,
-                    line.applied_unit_price,
-                    line_cost,
                     movement_stock_before,
                     movement_stock_after,
-                    movement_inventory_cost_before,
-                    movement_inventory_cost_after
                 ],
             )?;
             movement_stock_before = movement_stock_after;
-            movement_inventory_cost_before = movement_inventory_cost_after;
         }
         debug_assert_eq!(movement_stock_before, stock_after);
-        debug_assert_eq!(
-            movement_inventory_cost_before,
-            withdrawal.inventory_cost_after_cents
-        );
     }
 
     let persisted_total: i64 = transaction.query_row(
@@ -631,7 +576,7 @@ fn receipt_by_id(connection: &Connection, sale_id: i64) -> ServiceResult<SaleRec
         "SELECT id, product_id, sale_id, record_version, presentation_id, product_name, sku,
                 presentation_name, presentation_barcode, base_unit, presentation_mode,
                  presentation_base_quantity, quantity, catalog_unit_price, unit_price, entered_quantity, base_quantity,
-                 line_total, movement_cost_cents, created_at, updated_at
+                 line_total, created_at, updated_at
          FROM sale_details WHERE sale_id = ?1 ORDER BY id",
     )?;
     let details = statement
@@ -700,7 +645,7 @@ fn reconstruct_v5_fingerprint(receipt: &SaleReceipt) -> ServiceResult<String> {
         .details
         .iter()
         .map(|detail| {
-            if detail.record_version != 2 {
+            if !matches!(detail.record_version, 2 | 3) {
                 return Err(checkout_token_reused());
             }
             let mode = PresentationMode::try_from(
@@ -826,489 +771,181 @@ pub(crate) fn parse_money(value: &str) -> ServiceResult<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        sync::{Arc, Barrier},
-        thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    };
-
-    use rusqlite::{params, Connection};
-
+mod runtime_tests {
     use crate::{
         db::migrations,
-        models::cart::CheckoutCartInput,
+        models::{cart::CheckoutCartInput, sale::SalesViewFilters},
         services::cart::{self, SessionCart},
     };
+    use rusqlite::Connection;
 
-    fn database(stock: i64, cost: Option<i64>) -> (Connection, i64, i64) {
-        let mut connection = Connection::open_in_memory().unwrap();
-        let (piece, bag) = prepare(&mut connection, stock, cost);
-        (connection, piece, bag)
-    }
-
-    fn prepare(connection: &mut Connection, stock: i64, cost: Option<i64>) -> (i64, i64) {
+    fn seed_database(connection: &mut Connection) -> (i64, i64) {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
         migrations::run(connection).unwrap();
         connection.execute_batch(
-            "INSERT INTO users (first_name,last_name,email,password_hash) VALUES ('Admin','POS','admin@pos.local','hash');
-             INSERT INTO brands (name,name_search_key) VALUES ('Marca','marca');
-             INSERT INTO categories (name,name_search_key) VALUES ('Categoria','categoria');",
+            "INSERT INTO users(first_name,last_name,email,password_hash) VALUES('Ada','POS','ada@pos.local','hash');
+             INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
+             INSERT INTO categories(name,name_search_key) VALUES('Categoria','categoria');
+             INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit)
+             VALUES('Tornillo','tornillo',100,100,'TOR-1','tor-1',1,1,'piece');
+             INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default)
+             VALUES(1,'Pieza','fixed',1,100,1);
+             INSERT INTO product_presentations(product_id,name,mode,base_quantity,price)
+             VALUES(1,'Paquete','fixed',10,800);",
         ).unwrap();
-        connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES ('Tornillo','tornillo',100,?1,'TOR-1','tor-1',1,1,'piece',?2)", params![stock,cost]).unwrap();
-        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (1,'Pieza','fixed',1,100,1)", []).unwrap();
-        let piece = connection.last_insert_rowid();
-        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price) VALUES (1,'Bolsa 100','fixed',100,8000)", []).unwrap();
-        let bag = connection.last_insert_rowid();
-        (piece, bag)
+        (1, 2)
     }
 
-    fn input(connection: &Connection, cart: &SessionCart, token: &str) -> CheckoutCartInput {
-        payment_input(connection, cart, token, "tarjeta", None)
-    }
-
-    fn payment_input(
-        connection: &Connection,
-        cart: &SessionCart,
-        token: &str,
-        method: &str,
-        cash: Option<&str>,
-    ) -> CheckoutCartInput {
-        CheckoutCartInput {
-            checkout_token: token.into(),
-            cart_fingerprint: cart::get(connection, cart).unwrap().cart_fingerprint,
-            payment_method: method.into(),
-            cash_received: cash.map(Into::into),
-        }
-    }
-
-    fn temporary_database(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "pos-tauri-{name}-{}-{unique}.db",
-            std::process::id()
-        ))
-    }
-
-    fn open_database(path: &Path) -> Connection {
-        let connection = Connection::open(path).unwrap();
-        connection.busy_timeout(Duration::from_secs(5)).unwrap();
-        connection
+    fn database() -> (Connection, i64, i64) {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let (piece, pack) = seed_database(&mut connection);
+        (connection, piece, pack)
     }
 
     #[test]
-    fn checkout_persists_two_lines_with_exact_grouped_cost_sequence() {
-        let (mut connection, piece, bag) = database(250, Some(1001));
-        let cart: SessionCart = [(piece, 3), (bag, 1)].into();
-        let checkout_input = input(&connection, &cart, "two-lines");
-        let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-        assert_eq!(receipt.sale.total, 8300);
+    fn checkout_aggregates_demand_and_persists_v3_physical_rows_without_costs() {
+        let (mut connection, piece, pack) = database();
+        let cart = SessionCart::from([(piece, 2), (pack, 3)]);
+        let resolved = cart::get(&connection, &cart).unwrap();
+        let receipt = super::checkout(
+            &mut connection,
+            1,
+            &cart,
+            CheckoutCartInput {
+                checkout_token: "checkout-v3".into(),
+                cart_fingerprint: resolved.cart_fingerprint,
+                payment_method: "tarjeta".into(),
+                cash_received: None,
+            },
+        )
+        .unwrap();
+
         assert_eq!(receipt.details.len(), 2);
-        assert_eq!(
-            receipt
-                .details
-                .iter()
-                .map(|line| line.line_total.unwrap())
-                .sum::<i64>(),
-            8300
-        );
-        assert_eq!(
-            receipt
-                .details
-                .iter()
-                .map(|line| line.base_quantity.unwrap())
-                .sum::<i64>(),
-            103
-        );
+        assert!(receipt
+            .details
+            .iter()
+            .all(|detail| detail.record_version == 3));
         assert_eq!(
             connection
-                .query_row(
-                    "SELECT stock,inventory_cost_cents FROM products WHERE id=1",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
+                .query_row("SELECT stock FROM products WHERE id=1", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
-            (147, 589)
+            68
         );
-        let movements: Vec<[i64; 8]> = connection
-            .prepare(
-                "SELECT stock_before,stock_after,sale_id,sale_detail_id,unit_price_cents,
-                        movement_cost_cents,inventory_cost_before_cents,inventory_cost_after_cents
-                 FROM inventory_movements ORDER BY id",
-            )
+        let movement_shape: Vec<(i64, Option<i64>, Option<i64>)> = connection
+            .prepare("SELECT record_version,purchase_unit_price_cents,purchase_total_cents FROM inventory_movements ORDER BY id")
             .unwrap()
-            .query_map([], |row| {
-                Ok([
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ])
-            })
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(movements[0], [250, 247, 1, 1, 100, 12, 1001, 989]);
-        assert_eq!(movements[1], [247, 147, 1, 2, 8000, 400, 989, 589]);
-        assert_eq!(
-            receipt
-                .details
-                .iter()
-                .map(|line| line.movement_cost_cents.unwrap())
-                .collect::<Vec<_>>(),
-            movements
-                .iter()
-                .map(|movement| movement[5])
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            receipt
-                .details
-                .iter()
-                .map(|line| line.movement_cost_cents.unwrap())
-                .sum::<i64>(),
-            412
-        );
-        let foreign_key_errors: i64 = connection
-            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })
+        assert_eq!(movement_shape, vec![(3, None, None), (3, None, None)]);
+    }
+
+    #[test]
+    fn checkout_failure_rolls_back_sale_details_movements_and_stock() {
+        let (mut connection, piece, _) = database();
+        let cart = SessionCart::from([(piece, 1)]);
+        let fingerprint = cart::get(&connection, &cart).unwrap().cart_fingerprint;
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_v3_movement BEFORE INSERT ON inventory_movements
+             BEGIN SELECT RAISE(ABORT,'forced rollback'); END;",
+            )
             .unwrap();
-        assert_eq!(foreign_key_errors, 0);
-    }
 
-    #[test]
-    fn exhaustion_clears_known_and_unknown_inventory_cost() {
-        let (mut known, piece, _) = database(3, Some(10));
-        let cart = [(piece, 3)].into();
-        let checkout_input = input(&known, &cart, "known");
-        super::checkout(&mut known, 1, &cart, checkout_input).unwrap();
+        assert!(super::checkout(
+            &mut connection,
+            1,
+            &cart,
+            CheckoutCartInput {
+                checkout_token: "rollback-v3".into(),
+                cart_fingerprint: fingerprint,
+                payment_method: "tarjeta".into(),
+                cash_received: None,
+            },
+        )
+        .is_err());
         assert_eq!(
-            known
-                .query_row(
-                    "SELECT stock,inventory_cost_cents FROM products",
-                    [],
-                    |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)) }
-                )
-                .unwrap(),
-            (0, 0)
-        );
-
-        let (mut unknown, piece, _) = database(4, None);
-        let partial = [(piece, 1)].into();
-        let checkout_input = input(&unknown, &partial, "unknown-partial");
-        let receipt = super::checkout(&mut unknown, 1, &partial, checkout_input).unwrap();
-        assert_eq!(receipt.details[0].movement_cost_cents, None);
-        assert_eq!(
-            unknown
-                .query_row("SELECT inventory_cost_cents FROM products", [], |row| {
-                    row.get::<_, Option<i64>>(0)
-                })
-                .unwrap(),
-            None
-        );
-        let rest = [(piece, 3)].into();
-        let checkout_input = input(&unknown, &rest, "unknown-rest");
-        super::checkout(&mut unknown, 1, &rest, checkout_input).unwrap();
-        assert_eq!(
-            unknown
-                .query_row("SELECT inventory_cost_cents FROM products", [], |row| {
-                    row.get::<_, Option<i64>>(0)
-                })
-                .unwrap(),
-            Some(0)
+            connection.query_row(
+                "SELECT stock,(SELECT COUNT(*) FROM sales),(SELECT COUNT(*) FROM sale_details) FROM products WHERE id=1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            ).unwrap(),
+            (100, 0, 0)
         );
     }
 
     #[test]
-    fn retry_does_not_duplicate_and_intermediate_failure_rolls_back_everything() {
-        let (mut connection, piece, _) = database(5, Some(11));
-        let cart = [(piece, 1)].into();
-        let checkout_input = input(&connection, &cart, "retry");
-        let first = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-        let empty = SessionCart::new();
+    fn checkout_retry_is_idempotent_and_conflicting_token_is_rejected() {
+        let (mut connection, piece, pack) = database();
+        let cart = SessionCart::from([(piece, 2)]);
+        let input = CheckoutCartInput {
+            checkout_token: "retry-v3".into(),
+            cart_fingerprint: cart::get(&connection, &cart).unwrap().cart_fingerprint,
+            payment_method: "tarjeta".into(),
+            cash_received: None,
+        };
+        let first = super::checkout(&mut connection, 1, &cart, input).unwrap();
         let retry = CheckoutCartInput {
-            checkout_token: "retry".into(),
+            checkout_token: "retry-v3".into(),
             cart_fingerprint: first.sale.cart_fingerprint.clone(),
             payment_method: "tarjeta".into(),
             cash_received: None,
         };
+
         assert_eq!(
-            super::checkout(&mut connection, 1, &empty, retry).unwrap(),
+            super::checkout(&mut connection, 1, &SessionCart::default(), retry).unwrap(),
             first
         );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-
-        connection.execute_batch("CREATE TRIGGER fail_movement BEFORE INSERT ON inventory_movements BEGIN SELECT RAISE(ABORT, 'fail'); END;").unwrap();
-        let cart = [(piece, 1)].into();
-        let checkout_input = input(&connection, &cart, "rollback");
-        assert!(super::checkout(&mut connection, 1, &cart, checkout_input).is_err());
-        assert_eq!(
-            connection
-                .query_row("SELECT stock FROM products", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT inventory_cost_cents FROM products", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .unwrap(),
-            9
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sale_details", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM inventory_movements", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn reads_legacy_receipt_from_persisted_snapshots_and_line_values() {
-        let (mut connection, _, _) = database(5, None);
-        connection.execute("INSERT INTO sales (user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method) VALUES (1,'Historico','old@local','legacy','cart-v2|1:2:125',CURRENT_TIMESTAMP,250,'none',0,0,250,'tarjeta')", []).unwrap();
-        connection.execute("INSERT INTO sale_details (product_id,sale_id,record_version,product_name,sku,quantity,unit_price,movement_cost_cents) VALUES (1,1,1,'Nombre viejo','SKU-VIEJO',2,125,75)", []).unwrap();
-        connection
-            .execute("UPDATE products SET name='Nuevo',price=999 WHERE id=1", [])
-            .unwrap();
-        let detail = super::history_detail(&connection, 1).unwrap();
-        assert_eq!(detail.line_count, 1);
-        assert_eq!(detail.total, 250);
-        assert_eq!(detail.lines[0].product_name, "Nombre viejo");
-        assert_eq!(detail.lines[0].subtotal, None);
-        assert_eq!(detail.lines[0].movement_cost_cents, Some(75));
-
-        let retry = CheckoutCartInput {
-            checkout_token: "legacy".into(),
-            cart_fingerprint: "cart-v2|1:2:125".into(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-        let receipt = super::checkout(&mut connection, 1, &SessionCart::new(), retry).unwrap();
-        assert_eq!(receipt.sale.id, 1);
-        assert_eq!(receipt.details[0].movement_cost_cents, Some(75));
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn cart_v2_retry_requires_an_empty_cart_and_never_reinterprets_presentations() {
-        let (mut connection, _, _) = database(5, None);
-        connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit) VALUES ('Tuerca','tuerca',50,20,'TUE-1','tue-1',1,1,'piece')", []).unwrap();
-        let product_id = connection.last_insert_rowid();
-        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (?1,'Unidad','fixed',1,50,1)", [product_id]).unwrap();
-        let unit = connection.last_insert_rowid();
-        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price) VALUES (?1,'Paquete','fixed',5,200)", [product_id]).unwrap();
-        let pack = connection.last_insert_rowid();
-        assert_ne!(product_id, unit);
-        assert_ne!(product_id, pack);
-
-        connection.execute("INSERT INTO sales (user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method) VALUES (1,'Historico','old@local','legacy-presentations','cart-v2|2:3:50',CURRENT_TIMESTAMP,150,'none',0,0,150,'tarjeta')", []).unwrap();
-        connection.execute("INSERT INTO sale_details (product_id,sale_id,record_version,product_name,sku,quantity,unit_price) VALUES (?1,1,1,'Tuerca','TUE-1',3,50)", [product_id]).unwrap();
-
-        let cart = [(unit, 1), (pack, 2)].into();
-        let retry = CheckoutCartInput {
-            checkout_token: "legacy-presentations".into(),
-            cart_fingerprint: "cart-v2|2:3:50".into(),
+        let conflicting_cart = SessionCart::from([(pack, 1)]);
+        let conflict = CheckoutCartInput {
+            checkout_token: "retry-v3".into(),
+            cart_fingerprint: cart::get(&connection, &conflicting_cart)
+                .unwrap()
+                .cart_fingerprint,
             payment_method: "tarjeta".into(),
             cash_received: None,
         };
         assert_eq!(
-            super::checkout(&mut connection, 1, &cart, retry)
+            super::checkout(&mut connection, 1, &conflicting_cart, conflict)
                 .unwrap_err()
                 .code,
             "CHECKOUT_TOKEN_REUSED"
         );
-
-        let empty_retry = CheckoutCartInput {
-            checkout_token: "legacy-presentations".into(),
-            cart_fingerprint: "cart-v2|2:3:50".into(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-        let receipt =
-            super::checkout(&mut connection, 1, &SessionCart::new(), empty_retry).unwrap();
-        assert_eq!(receipt.sale.id, 1);
-    }
-
-    #[test]
-    fn cart_v4_retry_accepts_the_exact_populated_cart_without_duplicate_sale() {
-        let (mut connection, piece, _) = database(5, Some(500));
-        let fingerprint = format!("cart-v4|{piece}:2:fixed:1:2:100:200");
-        connection.execute(
-            "INSERT INTO sales (user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method)
-             VALUES (1,'Historico','old@local','legacy-v4',?1,CURRENT_TIMESTAMP,200,'none',0,0,200,'tarjeta')",
-            [&fingerprint],
-        ).unwrap();
-        connection.execute(
-            "INSERT INTO sale_details (product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,catalog_unit_price,unit_price,entered_quantity,base_quantity,line_total)
-             VALUES (1,1,2,?1,'Tornillo','TOR-1','Pieza','piece','fixed',1,2,100,100,2,2,200)",
-            [piece],
-        ).unwrap();
-        let cart = [(piece, 2)].into();
-        let retry = CheckoutCartInput {
-            checkout_token: "legacy-v4".into(),
-            cart_fingerprint: fingerprint,
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-
-        let receipt = super::checkout(&mut connection, 1, &cart, retry).unwrap();
-
-        assert_eq!(receipt.sale.id, 1);
         assert_eq!(
             connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM sales),(SELECT COUNT(*) FROM sale_details),stock FROM products WHERE id=1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                )
                 .unwrap(),
-            1
+            (1, 1, 98)
         );
     }
 
     #[test]
-    fn checkout_supports_payments_and_validates_cash_without_writes() {
-        for (method, cash, expected_cash, expected_change) in [
-            ("efectivo", Some("2.00"), Some(200), Some(100)),
-            ("tarjeta", None, None, None),
-            ("transferencia", None, None, None),
-        ] {
-            let (mut connection, piece, _) = database(5, Some(500));
-            let cart = [(piece, 1)].into();
-            let checkout_input = payment_input(&connection, &cart, method, method, cash);
-            let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-            assert_eq!(receipt.sale.total, 100);
-            assert_eq!(receipt.sale.payment_method, method);
-            assert_eq!(receipt.sale.cash_received, expected_cash);
-            assert_eq!(receipt.sale.change_amount, expected_change);
-        }
-
-        let (mut connection, piece, _) = database(5, Some(500));
-        let cart = [(piece, 1)].into();
-        let insufficient =
-            payment_input(&connection, &cart, "insufficient", "efectivo", Some("0.99"));
-        assert_eq!(
-            super::checkout(&mut connection, 1, &cart, insufficient)
-                .unwrap_err()
-                .code,
-            "INSUFFICIENT_CASH"
-        );
-        for method in ["tarjeta", "transferencia"] {
-            let invalid = payment_input(&connection, &cart, method, method, Some("2.00"));
-            assert_eq!(
-                super::checkout(&mut connection, 1, &cart, invalid)
-                    .unwrap_err()
-                    .code,
-                "CASH_NOT_ALLOWED"
-            );
-        }
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn cash_quote_does_not_write() {
-        let (connection, piece, _) = database(5, Some(500));
-        let cart = [(piece, 2)].into();
-        let quote = super::quote_cash_change(&connection, &cart, "3.00").unwrap();
-        assert_eq!(
-            (quote.cash_received, quote.total, quote.change),
-            (300, 200, 100)
-        );
-        assert_eq!(
-            super::quote_cash_change(&connection, &cart, "1.99")
-                .unwrap_err()
-                .code,
-            "INSUFFICIENT_CASH"
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn checkout_rejects_changed_presentation_price_and_fingerprint() {
-        let (mut connection, piece, _) = database(5, Some(500));
-        let cart = [(piece, 1)].into();
-        let checkout_input = input(&connection, &cart, "stale-price");
-        connection
-            .execute(
-                "UPDATE product_presentations SET price = 101 WHERE id = ?1",
-                [piece],
-            )
-            .unwrap();
-        assert_eq!(
-            super::checkout(&mut connection, 1, &cart, checkout_input)
-                .unwrap_err()
-                .code,
-            "CART_FINGERPRINT_MISMATCH"
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn custom_price_and_discount_do_not_change_inventory_cost() {
-        let (mut connection, piece, _) = database(10, Some(1000));
+    fn checkout_persists_commercial_and_identity_snapshots() {
+        let (mut connection, piece, _) = database();
         let mut cart = SessionCart::from([(piece, 2)]);
         cart::set_unit_price(&connection, &mut cart, piece, "0.75").unwrap();
-        let resolved = cart::set_discount(&connection, &mut cart, "percentage", "10.00").unwrap();
-        let checkout_input = CheckoutCartInput {
-            checkout_token: "priced-discounted".into(),
-            cart_fingerprint: resolved.cart_fingerprint.clone(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
+        let resolved = cart::set_discount(&connection, &mut cart, "percentage", "10").unwrap();
+        let receipt = super::checkout(
+            &mut connection,
+            1,
+            &cart,
+            CheckoutCartInput {
+                checkout_token: "snapshots-v3".into(),
+                cart_fingerprint: resolved.cart_fingerprint,
+                payment_method: "tarjeta".into(),
+                cash_received: None,
+            },
+        )
+        .unwrap();
 
-        let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
         assert_eq!(
             (
                 receipt.sale.subtotal,
@@ -1316,586 +953,307 @@ mod tests {
                 receipt.sale.discount_amount,
                 receipt.sale.total,
             ),
-            (150, 1000, 15, 135)
+            (150, 1_000, 15, 135)
         );
         assert_eq!(
             (
-                receipt.details[0].record_version,
                 receipt.details[0].catalog_unit_price,
                 receipt.details[0].unit_price,
                 receipt.details[0].line_total,
-                receipt.details[0].movement_cost_cents,
             ),
-            (2, Some(100), 75, Some(150), Some(200))
+            (Some(100), 75, Some(150))
+        );
+        connection.execute_batch(
+            "UPDATE products SET name='Nuevo',sku='NUEVO',name_search_key='nuevo',sku_search_key='nuevo' WHERE id=1;
+             UPDATE product_presentations SET name='Nueva presentacion' WHERE id=1;
+             UPDATE users SET first_name='Otro',last_name='Usuario',email='otro@pos.local' WHERE id=1;",
+        ).unwrap();
+        let history = super::history_detail(&connection, receipt.sale.id).unwrap();
+        assert_eq!(
+            (history.user_name.as_str(), history.user_email.as_str()),
+            ("Ada POS", "ada@pos.local")
         );
         assert_eq!(
-            connection
-                .query_row(
-                    "SELECT unit_price_cents,movement_cost_cents FROM inventory_movements WHERE sale_id=?1",
-                    [receipt.sale.id],
-                    |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?)),
-                )
-                .unwrap(),
-            (75, 200)
+            (
+                history.lines[0].product_name.as_str(),
+                history.lines[0].sku.as_str()
+            ),
+            ("Tornillo", "TOR-1")
         );
-
-        let retry = CheckoutCartInput {
-            checkout_token: "priced-discounted".into(),
-            cart_fingerprint: resolved.cart_fingerprint,
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
+        assert_eq!(history.lines[0].presentation_name.as_deref(), Some("Pieza"));
         assert_eq!(
-            super::checkout(&mut connection, 1, &SessionCart::new(), retry).unwrap(),
-            receipt
+            (history.subtotal, history.discount_amount, history.total),
+            (150, 15, 135)
         );
     }
 
     #[test]
-    fn catalog_change_invalidates_checkout_even_with_a_price_override() {
-        let (mut connection, piece, _) = database(5, Some(500));
-        let mut cart = SessionCart::from([(piece, 1)]);
-        cart::set_unit_price(&connection, &mut cart, piece, "0.75").unwrap();
-        let checkout_input = input(&connection, &cart, "stale-overridden-catalog");
-        connection
-            .execute(
-                "UPDATE product_presentations SET price=101 WHERE id=?1",
-                [piece],
+    fn checkout_prices_centimeters_and_rejects_aggregate_demand() {
+        let (mut connection, piece, pack) = database();
+        connection.execute_batch(
+            "INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit)
+             VALUES('Cable','cable',2500,200,'CAB-1','cab-1',1,1,'centimeter');
+             INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default)
+             VALUES(2,'Metro','measured',100,2500,1);",
+        ).unwrap();
+        let meter = connection.last_insert_rowid();
+        let cable = SessionCart::from([(meter, 75)]);
+        let cable_fingerprint = cart::get(&connection, &cable).unwrap().cart_fingerprint;
+        let receipt = super::checkout(
+            &mut connection,
+            1,
+            &cable,
+            CheckoutCartInput {
+                checkout_token: "centimeters-v3".into(),
+                cart_fingerprint: cable_fingerprint,
+                payment_method: "tarjeta".into(),
+                cash_received: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.sale.total, 1_875);
+        assert_eq!(receipt.details[0].base_quantity, Some(75));
+        assert_eq!(
+            connection
+                .query_row("SELECT stock FROM products WHERE id=2", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            125
+        );
+
+        let excessive = SessionCart::from([(piece, 1), (pack, 10)]);
+        let resolved = cart::get(&connection, &excessive).unwrap();
+        assert!(resolved.lines.iter().all(|line| !line.available));
+        let error = super::checkout(
+            &mut connection,
+            1,
+            &excessive,
+            CheckoutCartInput {
+                checkout_token: "aggregate-v3".into(),
+                cart_fingerprint: resolved.cart_fingerprint,
+                payment_method: "tarjeta".into(),
+                cash_received: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "INSUFFICIENT_STOCK");
+        assert_eq!(
+            connection
+                .query_row("SELECT stock FROM products WHERE id=1", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            100
+        );
+    }
+
+    #[test]
+    fn checkout_covers_payment_cash_filters_and_current_statistics() {
+        let (mut connection, piece, _) = database();
+
+        for (index, method, cash, expected_change) in [
+            (1, "efectivo", Some("2.00"), Some(100)),
+            (2, "tarjeta", None, None),
+            (3, "transferencia", None, None),
+        ] {
+            let cart = SessionCart::from([(piece, 1)]);
+            let fingerprint = cart::get(&connection, &cart).unwrap().cart_fingerprint;
+            let receipt = super::checkout(
+                &mut connection,
+                1,
+                &cart,
+                CheckoutCartInput {
+                    checkout_token: format!("payment-{index}"),
+                    cart_fingerprint: fingerprint,
+                    payment_method: method.into(),
+                    cash_received: cash.map(str::to_owned),
+                },
             )
             .unwrap();
+            assert_eq!(receipt.sale.payment_method, method);
+            assert_eq!(receipt.sale.change_amount, expected_change);
+            assert!(receipt
+                .details
+                .iter()
+                .all(|detail| detail.record_version == 3));
+        }
 
+        let cash_cart = SessionCart::from([(piece, 1)]);
+        let quote = super::quote_cash_change(&connection, &cash_cart, "1.50").unwrap();
         assert_eq!(
-            super::checkout(&mut connection, 1, &cart, checkout_input)
+            (quote.total, quote.cash_received, quote.change),
+            (100, 150, 50)
+        );
+        assert_eq!(
+            super::quote_cash_change(&connection, &cash_cart, "0.99")
                 .unwrap_err()
                 .code,
-            "CART_FINGERPRINT_MISMATCH"
+            "INSUFFICIENT_CASH"
         );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn idempotent_retry_returns_original_receipt_after_reopen() {
-        let path = temporary_database("checkout-reopen");
-        let cart: SessionCart = [(1, 2)].into();
-        let original = {
-            let mut connection = open_database(&path);
-            prepare(&mut connection, 5, Some(500));
-            let checkout_input = payment_input(
-                &connection,
-                &cart,
-                "persistent-token",
-                "efectivo",
-                Some("3.00"),
-            );
-            super::checkout(&mut connection, 1, &cart, checkout_input).unwrap()
-        };
-
-        let mut reopened = open_database(&path);
-        reopened.pragma_update(None, "foreign_keys", true).unwrap();
-        let retry = CheckoutCartInput {
-            checkout_token: "persistent-token".into(),
-            cart_fingerprint: original.sale.cart_fingerprint.clone(),
-            payment_method: "efectivo".into(),
-            cash_received: Some("3.00".into()),
-        };
-        let retried = super::checkout(&mut reopened, 1, &SessionCart::new(), retry).unwrap();
-        assert_eq!(retried, original);
-        assert_eq!(
-            reopened
-                .query_row("SELECT stock FROM products WHERE id = 1", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            3
-        );
-        drop(reopened);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn v5_retry_after_reopen_canonicalizes_interleaved_product_presentations() {
-        let path = temporary_database("checkout-reopen-interleaved");
-        let original = {
-            let mut connection = open_database(&path);
-            let (_, first_product_bag) = prepare(&mut connection, 200, Some(2000));
-            connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit) VALUES ('Tuerca','tuerca',200,20,'TUE-1','tue-1',1,1,'piece')", []).unwrap();
-            let second_product = connection.last_insert_rowid();
-            connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (?1,'Pieza','fixed',1,200,1)", [second_product]).unwrap();
-            let second_product_piece = connection.last_insert_rowid();
-            connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price) VALUES (1,'Caja 5','fixed',5,450)", []).unwrap();
-            let first_product_box = connection.last_insert_rowid();
-            assert!(first_product_bag < second_product_piece);
-            assert!(second_product_piece < first_product_box);
-            let cart: SessionCart = [
-                (first_product_bag, 1),
-                (second_product_piece, 1),
-                (first_product_box, 1),
-            ]
-            .into();
-            let checkout_input = input(&connection, &cart, "interleaved-token");
-            let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-            assert_eq!(
-                receipt
-                    .details
-                    .iter()
-                    .map(|detail| detail.presentation_id.unwrap())
-                    .collect::<Vec<_>>(),
-                vec![first_product_bag, first_product_box, second_product_piece]
-            );
-            receipt
-        };
-
-        let mut reopened = open_database(&path);
-        reopened.pragma_update(None, "foreign_keys", true).unwrap();
-        let retry = CheckoutCartInput {
-            checkout_token: "interleaved-token".into(),
-            cart_fingerprint: original.sale.cart_fingerprint.clone(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-        let retried = super::checkout(&mut reopened, 1, &SessionCart::new(), retry).unwrap();
-        assert_eq!(retried, original);
-        drop(reopened);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn retry_rejects_different_user_cart_payment_fingerprint_and_unknown_version() {
-        let (mut connection, piece, bag) = database(200, Some(1000));
-        connection.execute("INSERT INTO users (first_name,last_name,email,password_hash) VALUES ('Otra','Persona','other@pos.local','hash')", []).unwrap();
-        let cart = [(piece, 1)].into();
-        let original_input = input(&connection, &cart, "same-token");
-        let original = super::checkout(&mut connection, 1, &cart, original_input).unwrap();
-
-        let different_cart = [(bag, 1)].into();
-        let different_cart_input = input(&connection, &different_cart, "same-token");
-        assert_eq!(
-            super::checkout(&mut connection, 1, &different_cart, different_cart_input)
-                .unwrap_err()
-                .code,
-            "CHECKOUT_TOKEN_REUSED"
-        );
-        let different_payment = CheckoutCartInput {
-            checkout_token: "same-token".into(),
-            cart_fingerprint: original.sale.cart_fingerprint.clone(),
-            payment_method: "transferencia".into(),
-            cash_received: None,
-        };
-        assert_eq!(
-            super::checkout(&mut connection, 1, &SessionCart::new(), different_payment,)
-                .unwrap_err()
-                .code,
-            "CHECKOUT_TOKEN_REUSED"
-        );
-        let different_user = CheckoutCartInput {
-            checkout_token: "same-token".into(),
-            cart_fingerprint: original.sale.cart_fingerprint.clone(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-        assert_eq!(
-            super::checkout(&mut connection, 2, &SessionCart::new(), different_user)
-                .unwrap_err()
-                .code,
-            "CHECKOUT_TOKEN_REUSED"
-        );
-        let different_fingerprint = CheckoutCartInput {
-            checkout_token: "same-token".into(),
-            cart_fingerprint: "cart-v4|999:1:fixed:1:1:100:100".into(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
+        let cash_fingerprint = cart::get(&connection, &cash_cart).unwrap().cart_fingerprint;
         assert_eq!(
             super::checkout(
                 &mut connection,
                 1,
-                &SessionCart::new(),
-                different_fingerprint,
+                &cash_cart,
+                CheckoutCartInput {
+                    checkout_token: "cash-not-allowed".into(),
+                    cart_fingerprint: cash_fingerprint,
+                    payment_method: "tarjeta".into(),
+                    cash_received: Some("1.00".into()),
+                },
             )
             .unwrap_err()
             .code,
-            "CHECKOUT_TOKEN_REUSED"
+            "CASH_NOT_ALLOWED"
         );
 
-        let historical_v3 = format!("cart-v3|{piece}:1:1:100:100");
-        connection
-            .execute(
-                "UPDATE sales SET cart_fingerprint = ?1 WHERE id = ?2",
-                params![historical_v3, original.sale.id],
-            )
-            .unwrap();
-        let v3_retry = CheckoutCartInput {
-            checkout_token: "same-token".into(),
-            cart_fingerprint: historical_v3,
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-        assert!(super::checkout(&mut connection, 1, &cart, v3_retry).is_ok());
-
-        connection
-            .execute(
-                "UPDATE sales SET cart_fingerprint = 'cart-v1|1:1' WHERE id = ?1",
-                [original.sale.id],
-            )
-            .unwrap();
-        let v1_retry = CheckoutCartInput {
-            checkout_token: "same-token".into(),
-            cart_fingerprint: "cart-v1|1:1".into(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-        assert!(super::checkout(&mut connection, 1, &SessionCart::new(), v1_retry).is_ok());
-
-        connection
-            .execute(
-                "UPDATE sales SET cart_fingerprint = 'cart-v99|opaque' WHERE id = ?1",
-                [original.sale.id],
-            )
-            .unwrap();
-        let unknown_retry = CheckoutCartInput {
-            checkout_token: "same-token".into(),
-            cart_fingerprint: "cart-v99|opaque".into(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
+        let all = super::view(&connection, SalesViewFilters::default()).unwrap();
         assert_eq!(
-            super::checkout(&mut connection, 1, &SessionCart::new(), unknown_retry)
-                .unwrap_err()
-                .code,
-            "CHECKOUT_TOKEN_REUSED"
+            (
+                all.stats.sale_count,
+                all.stats.total_sold,
+                all.stats.average_sale,
+                all.stats.lines_sold,
+            ),
+            (3, 300, 100, 3)
         );
-    }
-
-    #[test]
-    fn checkout_rejects_empty_cart_and_stale_stock_without_writes() {
-        let (mut connection, piece, _) = database(1, Some(100));
-        let empty = SessionCart::new();
-        let empty_input = input(&connection, &empty, "empty");
-        assert_eq!(
-            super::checkout(&mut connection, 1, &empty, empty_input)
-                .unwrap_err()
-                .code,
-            "EMPTY_CART"
-        );
-        let cart = [(piece, 1)].into();
-        let stale_input = input(&connection, &cart, "stale");
-        connection
-            .execute("UPDATE products SET stock = 0 WHERE id = 1", [])
-            .unwrap();
-        assert_eq!(
-            super::checkout(&mut connection, 1, &cart, stale_input)
-                .unwrap_err()
-                .code,
-            "INSUFFICIENT_STOCK"
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn checkout_rejects_aggregate_quantity_overflow_without_writes() {
-        let (mut connection, piece, bag) = database(crate::services::JS_MAX_SAFE_INTEGER, Some(1));
-        connection
-            .execute(
-                "UPDATE product_presentations SET price=1 WHERE id=?1",
-                [piece],
-            )
-            .unwrap();
-        let cart = SessionCart::from([(piece, crate::services::JS_MAX_SAFE_INTEGER), (bag, 1)]);
-        let checkout_input = CheckoutCartInput {
-            checkout_token: "overflow".into(),
-            cart_fingerprint: "unreachable".into(),
-            payment_method: "tarjeta".into(),
-            cash_received: None,
-        };
-
-        assert_eq!(
-            super::checkout(&mut connection, 1, &cart, checkout_input)
-                .unwrap_err()
-                .code,
-            "CART_AMOUNT_OVERFLOW"
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT stock,inventory_cost_cents FROM products",
-                    [],
-                    |row| { Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)) }
-                )
-                .unwrap(),
-            (crate::services::JS_MAX_SAFE_INTEGER, 1)
-        );
-    }
-
-    #[test]
-    fn sales_view_filters_stats_and_overflow_are_preserved() {
-        let (mut connection, piece, bag) = database(200, Some(1000));
-        let empty = super::view(&connection, Default::default()).unwrap();
-        assert!(empty.items.is_empty());
-        assert_eq!(empty.stats.average_sale, 0);
-
-        let first_cart = [(piece, 2)].into();
-        let first = input(&connection, &first_cart, "first-view");
-        super::checkout(&mut connection, 1, &first_cart, first).unwrap();
-        let second_cart = [(bag, 1)].into();
-        let second = payment_input(
-            &connection,
-            &second_cart,
-            "second-view",
-            "efectivo",
-            Some("100.00"),
-        );
-        super::checkout(&mut connection, 1, &second_cart, second).unwrap();
-
-        let all = super::view(&connection, Default::default()).unwrap();
-        assert_eq!(all.stats.sale_count, 2);
-        assert_eq!(all.stats.total_sold, 8200);
-        assert_eq!(all.stats.average_sale, 4100);
-        assert_eq!(all.stats.lines_sold, 2);
         let filtered = super::view(
             &connection,
-            crate::models::sale::SalesViewFilters {
-                search: Some(" pos-00000001 ".into()),
-                payment_method: Some("TARJETA".into()),
+            SalesViewFilters {
+                search: Some("pos-00000003".into()),
+                payment_method: Some(" TRANSFERENCIA ".into()),
             },
         )
         .unwrap();
         assert_eq!(filtered.items.len(), 1);
-        assert_eq!(filtered.items[0].line_count, 1);
-        assert_eq!(filtered.stats.total_sold, 200);
+        assert_eq!(filtered.items[0].payment_method, "transferencia");
+        assert_eq!(filtered.stats.total_sold, 100);
         assert_eq!(
             super::view(
                 &connection,
-                crate::models::sale::SalesViewFilters {
+                SalesViewFilters {
+                    search: None,
                     payment_method: Some("cheque".into()),
-                    ..Default::default()
                 },
             )
             .unwrap_err()
             .code,
             "INVALID_PAYMENT_METHOD"
         );
-        connection.execute(
-            "INSERT INTO sales (user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method)
-             VALUES (1,'Admin POS','admin@pos.local','huge','cart-v2',CURRENT_TIMESTAMP,?1,'none',0,0,?1,'tarjeta')",
-            [crate::services::JS_MAX_SAFE_INTEGER],
-        ).unwrap();
-        assert_eq!(
-            super::view(&connection, Default::default())
-                .unwrap_err()
-                .code,
-            "SALES_STATS_OVERFLOW"
-        );
-        assert_eq!(
-            super::history_detail(&connection, 999).unwrap_err().code,
-            "SALE_NOT_FOUND"
-        );
-    }
-
-    #[test]
-    fn historical_snapshots_survive_product_presentation_user_rename_and_reopen() {
-        let path = temporary_database("history-reopen");
-        {
-            let mut connection = open_database(&path);
-            let (piece, _) = prepare(&mut connection, 5, Some(500));
-            let cart = [(piece, 2)].into();
-            let checkout_input =
-                payment_input(&connection, &cart, "history", "efectivo", Some("3.00"));
-            super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-            connection.execute_batch(
-                "UPDATE products SET name='Renombrado',name_search_key='renombrado',sku='NEW-SKU',sku_search_key='new-sku' WHERE id=1;
-                 UPDATE product_presentations SET name='Unidad nueva' WHERE id=1;
-                 UPDATE users SET first_name='Otro',last_name='Nombre',email='otro@example.com' WHERE id=1;",
-            ).unwrap();
-        }
-
-        let reopened = open_database(&path);
-        let detail = super::history_detail(&reopened, 1).unwrap();
-        assert_eq!(detail.user_name, "Admin POS");
-        assert_eq!(detail.user_email, "admin@pos.local");
-        assert_eq!(detail.lines[0].product_name, "Tornillo");
-        assert_eq!(detail.lines[0].sku, "TOR-1");
-        assert_eq!(detail.lines[0].presentation_name.as_deref(), Some("Pieza"));
-        assert_eq!(detail.lines[0].entered_quantity, 2);
-        assert_eq!(detail.lines[0].base_consumed, 2);
-        let inventory = crate::services::inventory::view(
-            &reopened,
-            crate::models::inventory_movement::InventoryViewFilters {
-                movement_search: Some("tor-1".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(inventory.items[0].product_name, "Renombrado");
-        assert_eq!(inventory.items[0].sku, "NEW-SKU");
-        assert_eq!(inventory.items[0].product_name_snapshot, "Tornillo");
-        assert_eq!(inventory.items[0].sku_snapshot, "TOR-1");
-        drop(reopened);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn concurrent_checkout_from_two_connections_is_idempotent() {
-        let path = temporary_database("checkout-concurrent");
-        let fingerprint = {
-            let mut connection = open_database(&path);
-            prepare(&mut connection, 5, Some(500));
-            cart::get(&connection, &[(1, 1)].into())
-                .unwrap()
-                .cart_fingerprint
-        };
-        let barrier = Arc::new(Barrier::new(2));
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let path = path.clone();
-            let barrier = Arc::clone(&barrier);
-            let fingerprint = fingerprint.clone();
-            handles.push(thread::spawn(move || {
-                let mut connection = open_database(&path);
-                connection
-                    .pragma_update(None, "foreign_keys", true)
-                    .unwrap();
-                let cart = [(1, 1)].into();
-                let checkout_input = CheckoutCartInput {
-                    checkout_token: "concurrent-token".into(),
-                    cart_fingerprint: fingerprint,
-                    payment_method: "tarjeta".into(),
-                    cash_received: None,
-                };
-                barrier.wait();
-                super::checkout(&mut connection, 1, &cart, checkout_input)
-                    .unwrap()
-                    .sale
-                    .id
-            }));
-        }
-        let ids: Vec<i64> = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect();
-        assert_eq!(ids, vec![1, 1]);
-        let connection = open_database(&path);
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM sales", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            3
         );
-        assert_eq!(
-            connection
-                .query_row("SELECT stock FROM products WHERE id=1", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            4
-        );
-        drop(connection);
-        fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn measured_volume_persists_cost_snapshots_and_movement_foreign_keys() {
-        let (mut connection, _, _) = database(5, Some(500));
-        connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES ('Aceite','aceite',12000,2000,'ACE-1','ace-1',1,1,'milliliter',1000)", []).unwrap();
-        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (2,'Litro','measured',1000,12000,1)", []).unwrap();
-        let liter = connection.last_insert_rowid();
-        let cart = [(liter, 250)].into();
-        let checkout_input = input(&connection, &cart, "measured-volume");
-        let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-        assert_eq!(receipt.sale.total, 3000);
-        assert_eq!(receipt.details[0].entered_quantity, Some(250));
-        assert_eq!(receipt.details[0].base_quantity, Some(250));
-        assert_eq!(receipt.details[0].movement_cost_cents, Some(125));
+    fn checkout_rejects_stale_fingerprint_without_partial_writes() {
+        let (mut connection, piece, _) = database();
+        let cart = SessionCart::from([(piece, 2)]);
+        let stale = cart::get(&connection, &cart).unwrap().cart_fingerprint;
+        connection
+            .execute(
+                "UPDATE product_presentations SET price=125 WHERE id=?1",
+                [piece],
+            )
+            .unwrap();
+
+        let error = super::checkout(
+            &mut connection,
+            1,
+            &cart,
+            CheckoutCartInput {
+                checkout_token: "stale-cart".into(),
+                cart_fingerprint: stale,
+                payment_method: "efectivo".into(),
+                cash_received: Some("10.00".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CART_FINGERPRINT_MISMATCH");
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT stock,inventory_cost_cents FROM products WHERE id=2",
+                    "SELECT stock,(SELECT COUNT(*) FROM sales),(SELECT COUNT(*) FROM inventory_movements) FROM products WHERE id=1",
                     [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
                 )
                 .unwrap(),
-            (1750, 875)
+            (100, 0, 0)
         );
-        let transition: (i64, i64, i64, i64, i64, i64, i64) = connection
-            .query_row(
-                "SELECT stock_before,stock_after,movement_cost_cents,inventory_cost_before_cents,
-                        inventory_cost_after_cents,sale_id,sale_detail_id
-                 FROM inventory_movements WHERE product_id=2",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
+    }
+
+    #[test]
+    fn checkout_retry_survives_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sales-reopen.db");
+        let (first, fingerprint) = {
+            let mut connection = Connection::open(&path).unwrap();
+            let (piece, _) = seed_database(&mut connection);
+            let cart = SessionCart::from([(piece, 2)]);
+            let fingerprint = cart::get(&connection, &cart).unwrap().cart_fingerprint;
+            let receipt = super::checkout(
+                &mut connection,
+                1,
+                &cart,
+                CheckoutCartInput {
+                    checkout_token: "reopen-sale".into(),
+                    cart_fingerprint: fingerprint.clone(),
+                    payment_method: "transferencia".into(),
+                    cash_received: None,
                 },
             )
             .unwrap();
-        assert_eq!(transition, (2000, 1750, 125, 1000, 875, 1, 1));
+            (receipt, fingerprint)
+        };
+
+        let mut reopened = Connection::open(&path).unwrap();
+        reopened.pragma_update(None, "foreign_keys", true).unwrap();
+        migrations::run(&mut reopened).unwrap();
+        let retry = super::checkout(
+            &mut reopened,
+            1,
+            &SessionCart::default(),
+            CheckoutCartInput {
+                checkout_token: "reopen-sale".into(),
+                cart_fingerprint: fingerprint,
+                payment_method: "transferencia".into(),
+                cash_received: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(retry, first);
         assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                    row.get::<_, i64>(0)
-                })
+            reopened
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM sales),(SELECT COUNT(*) FROM inventory_movements),stock FROM products WHERE id=1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                )
                 .unwrap(),
-            0
+            (1, 1, 98)
         );
     }
 
     #[test]
-    fn checkout_75_centimeters_at_the_meter_price() {
-        let (mut connection, _, _) = database(5, None);
-        connection.execute("INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES ('Cable','cable',2500,200,'CAB-1','cab-1',1,1,'centimeter',1600)", []).unwrap();
-        connection.execute("INSERT INTO product_presentations (product_id,name,mode,base_quantity,price,is_default) VALUES (2,'Metro','measured',100,2500,1)", []).unwrap();
-        let meter = connection.last_insert_rowid();
-        let cart = [(meter, 75)].into();
-        let checkout_input = input(&connection, &cart, "measured-length");
+    fn sales_view_rejects_aggregate_overflow() {
+        let (connection, _, _) = database();
+        connection.execute_batch(
+            "INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,
+                 subtotal,discount_type,discount_value,discount_amount,total,payment_method)
+             VALUES(1,'Ada POS','ada@pos.local','overflow-1','legacy-1',CURRENT_TIMESTAMP,9007199254740991,'none',0,0,9007199254740991,'tarjeta');
+             INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,
+                 subtotal,discount_type,discount_value,discount_amount,total,payment_method)
+             VALUES(1,'Ada POS','ada@pos.local','overflow-2','legacy-2',CURRENT_TIMESTAMP,1,'none',0,0,1,'tarjeta');",
+        ).unwrap();
 
-        let receipt = super::checkout(&mut connection, 1, &cart, checkout_input).unwrap();
-
-        assert_eq!(receipt.sale.total, 1875);
-        assert_eq!(receipt.details[0].entered_quantity, Some(75));
-        assert_eq!(receipt.details[0].base_quantity, Some(75));
-        assert_eq!(receipt.details[0].line_total, Some(1875));
-        assert_eq!(receipt.details[0].movement_cost_cents, Some(600));
         assert_eq!(
-            connection
-                .query_row(
-                    "SELECT stock,inventory_cost_cents FROM products WHERE id=2",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                )
-                .unwrap(),
-            (125, 1000)
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT movement_cost_cents,inventory_cost_before_cents FROM inventory_movements WHERE product_id=2",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .unwrap(),
-            (600, 1600)
+            super::view(&connection, SalesViewFilters::default())
+                .unwrap_err()
+                .code,
+            "SALES_STATS_OVERFLOW"
         );
     }
 }

@@ -1,7 +1,9 @@
 mod commands;
 mod db;
 mod error;
+pub mod maintenance;
 mod models;
+mod process_lock;
 mod services;
 
 use std::sync::{Arc, Mutex};
@@ -55,6 +57,8 @@ pub fn run() {
                     .plugin(tauri_plugin_updater::Builder::new().build())?;
             }
 
+            let application_lock =
+                db::acquire_application_lock(app).map_err(Box::<dyn std::error::Error>::from)?;
             let connection = db::open_database(app).map_err(|error| {
                 if let Some(message) = error.recovery_startup_message() {
                     *setup_recovery_message.lock().unwrap() = Some(message);
@@ -63,6 +67,7 @@ pub fn run() {
             })?;
             #[cfg(debug_assertions)]
             services::auth::seed_debug_user(&connection)?;
+            app.manage(application_lock);
             app.manage(db::Database(Mutex::new(connection)));
             app.manage(commands::AuthSession(Mutex::new(
                 commands::SessionState::default(),
@@ -104,13 +109,16 @@ pub fn run() {
             commands::products::create_product_with_presentations,
             commands::products::update_product_with_presentations,
             commands::inventory::list_inventory_movements,
+            commands::inventory::lookup_inventory_movement,
             commands::inventory::get_inventory_view,
             commands::inventory::get_product_inventory_detail,
-            commands::inventory::create_inventory_movement,
-            commands::inventory::quote_inventory_movement,
+            commands::inventory::quote_purchase,
+            commands::inventory::create_purchase,
+            commands::inventory::quote_stock_count,
+            commands::inventory::create_stock_count,
             commands::inventory::search_inventory_products,
-            commands::inventory::quote_purchase_cost_correction,
-            commands::inventory::confirm_purchase_cost_correction,
+            commands::inventory::quote_purchase_price_correction,
+            commands::inventory::confirm_purchase_price_correction,
             commands::sales::list_sales,
             commands::sales::get_sales_view,
             commands::sales::get_sale_history_detail,

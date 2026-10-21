@@ -6,7 +6,7 @@ Esta guia corresponde al repositorio publico `98beto/pos_tauri`, la rama `main` 
 https://github.com/98beto/pos_tauri/releases/latest/download/latest.json
 ```
 
-El workflow admite `validate` y `publish`. `validate` compila el `HEAD` de `main`, firma y verifica todos los bundles y conserva durante siete dias un artifact candidato ligado a tag, commit y run ID, sin crear ni modificar releases. `publish` nunca recompila: descarga ese artifact ya ensamblado, verifica procedencia, hashes y firmas, crea o reutiliza una release en borrador y promueve exactamente los diez archivos que fueron aprobados.
+El workflow admite `validate` y `publish`. `validate` compila el SHA inmutable del dispatch desde `main` (`github.sha`), firma y verifica todos los bundles y conserva durante siete dias un artifact candidato ligado a tag, commit y run ID, sin crear ni modificar releases. `publish` nunca recompila: descarga ese artifact ya ensamblado, verifica procedencia, hashes y firmas, crea o reutiliza una release en borrador y promueve exactamente los diez archivos que fueron aprobados.
 
 ## Prerrequisitos locales
 
@@ -81,7 +81,7 @@ El ultimo comando se ejecuta despues de confirmar los cambios de version y locks
 
 ## Runbook de migracion al esquema 13
 
-SQLite 13 es una migracion conservadora: conserva literalmente el esquema y los datos de SQLite 12 y solo amplia a `centimeter` el dominio `base_unit` de productos, detalles de venta y movimientos. Las columnas de costo, sus valores conocidos o `NULL`, los importes comerciales, IDs, relaciones y secuencias no se recalculan ni se eliminan.
+SQLite 13 adopta un modelo sin valoracion de inventario. Elimina intencionalmente las columnas financieras antiguas y los movimientos historicos de valoracion, no traslada precios historicos a los campos de compra v3 y amplia a `centimeter` el dominio `base_unit`. Conserva literalmente stock, cantidades, importes comerciales, IDs, relaciones y secuencias; la secuencia de movimientos no retrocede aunque se elimine su fila de ID mas alto.
 
 Se admiten solamente `8 -> 13` y `12 -> 13`. Una base nueva se crea directamente en 13; una base 13 se valida y abre sin migrar; las versiones 9, 10 y 11 se rechazan sin escritura. Nunca ejecutar el primer ensayo sobre el archivo activo de produccion.
 
@@ -91,7 +91,7 @@ La prueba automatizada requerida por CI y release es:
 pnpm qa:migration-v8-v13
 ```
 
-El comando valida fixtures v8 y v12, costos conocidos y desconocidos, cronologia de compra/ajustes/venta/valoracion, preservacion literal, centimetros, rechazo de unidades desconocidas y versiones intermedias, backup, marcadores, reapertura y restauracion. No sustituye la prueba externa sobre una copia cerrada de produccion, que sigue pendiente hasta su ejecucion por un operador.
+El comando valida fixtures v8 y v12 con datos financieros conocidos, desconocidos e incorrectos, el caso de precio por kilo capturado como precio por gramo, compras, ajustes, ventas y valoraciones historicas. Comprueba su eliminacion intencional, preservacion literal de los campos retenidos, centimetros, rechazo de unidades desconocidas y versiones intermedias, backup, marcadores, reapertura y restauracion. No sustituye la prueba externa sobre una copia cerrada de produccion, que sigue pendiente hasta su ejecucion por un operador.
 
 ### Candidato y copia cerrada
 
@@ -102,7 +102,7 @@ El comando valida fixtures v8 y v12, costos conocidos y desconocidos, cronologia
 5. Crear una copia consistente mediante `.backup`; no usar `cp` si puede existir WAL pendiente.
 6. Mantener copia, backups y manifiestos en almacenamiento restringido y anonimizar antes de sacarlos del entorno autorizado.
 
-Antes de migrar una fuente 12, registrar en evidencia privada snapshots literales de todas las columnas de productos, presentaciones, ventas, detalles y movimientos, junto con `sqlite_sequence`. Incluir expresamente stock, costos conocidos y `NULL`, precios de compra, costos de movimiento, saldos de costo, precio de catalogo, precio aplicado, subtotales, descuentos y totales. No publicar esos datos.
+Antes de migrar una fuente 12, registrar en evidencia privada snapshots literales de productos, presentaciones, ventas, detalles y movimientos, junto con `sqlite_sequence`. Separar los campos y filas financieros que deben desaparecer de los campos retenidos que deben permanecer identicos: stock, cantidades, precio de catalogo, precio aplicado, subtotales, descuentos y totales. No publicar esos datos.
 
 ### Migrar solamente la copia
 
@@ -117,42 +117,71 @@ La aplicacion crea:
 - `pos-schema-v13-restore-pending.json` durante una restauracion.
 - `pos-schema-v13-restore-completed-<restore-id>.json` al completar la restauracion.
 
-Tras el primer inicio, comprobar `user_version=13`, `quick_check=ok`, cero violaciones de FK, exactamente un backup y un manifiesto completado, y ausencia del marcador pendiente. Leer siempre `backup_path`, `source_version` y `target_version` desde el manifiesto. Reabrir y confirmar que no se crean otro backup ni otro manifiesto.
+Tras el primer inicio, comprobar `user_version=13`, `quick_check=ok`, cero violaciones de FK, exactamente un backup y un manifiesto completado, y ausencia del marcador pendiente. Leer siempre `database_path`, `backup_path`, `source_version`, `target_version`, `backup_size_bytes`, `backup_sha256` y `backup_validation_completed` desde el manifiesto. Reabrir y confirmar que no se crean otro backup ni otro manifiesto.
 
-Para una fuente 12, comparar el snapshot completo antes y despues. La igualdad debe ser literal en todos los campos y secuencias; la unica diferencia de esquema permitida es `centimeter` en los tres `CHECK` de unidad.
+Para una fuente 12, comparar antes y despues todos los campos retenidos. Confirmar por separado que no quedan columnas financieras antiguas, precios historicos copiados ni filas de valoracion. Las demas diferencias de esquema se limitan a los campos de compra v3 y a `centimeter` en los tres dominios de unidad.
 
 ### Smoke funcional
 
-1. Productos: crear una longitud con presentacion `Metro`; confirmar stock y costo acumulado cero y ausencia de movimiento inicial.
-2. Inventario: registrar una compra en centimetros con precio, proveedor y documento; comprobar stock, costo acumulado, costo promedio y valor total a costo.
-3. Inventario: registrar ajustes de entrada/salida y una valoracion; comprobar cantidades y saldos de costo.
-4. POS: vender centimetros con precio personalizado y descuento; comprobar total comercial, stock y costo retirado.
-5. Ventas: comprobar snapshots, `movement_cost_cents`, precio aplicado, subtotal, descuento y total historico.
-6. Correccion: sobre otra copia desechable, cotizar y corregir una compra con movimientos posteriores; comprobar replay de costos y que cantidades, stock historico y campos comerciales no cambian.
+1. Productos: crear una longitud con presentacion `Metro`; confirmar stock y ausencia de movimiento inicial.
+2. Compras: registrar una compra en centimetros con precio, proveedor y factura; comprobar stock, precio e importe propios.
+3. Conteos: capturar existencias reales mayores y menores; comprobar diferencia, motivo y stock resultante sin datos comerciales.
+4. POS: vender centimetros con precio personalizado y descuento; comprobar total comercial y stock.
+5. Ventas: comprobar snapshots, precio aplicado, subtotal, descuento y total historico, sin datos de costo.
+6. Correccion: sobre otra copia desechable, cotizar y corregir una compra con movimientos posteriores; comprobar que solo cambian el precio y el importe de esa compra y que cantidades, stock, ventas y movimientos posteriores permanecen iguales.
 7. Rollback transaccional: provocar un rechazo seguro, por ejemplo fingerprint obsoleto, y confirmar que no hay escrituras parciales.
 
 ### Restauracion y rollback
 
 Ensayar el rollback antes de publicar. Cerrar completamente el candidato, conservar una copia diagnostica de SQLite 13 y tomar el backup exacto desde el manifiesto completado o el marcador pendiente. Validar que conserva el `source_version` y el snapshot de origen.
 
-Usar el mecanismo durable del backend: marcador de restauracion, cuarentena de la base y sidecars de SQLite 13, promocion de un temporal validado y manifiesto completado. No reemplazar manualmente `pos.db` con la aplicacion abierta.
+Leer `database_path` y `backup_path` del manifiesto `pos-schema-v13-migration-completed-<attempt-id>.json` o, si la migracion quedo pendiente, de `pos-schema-v13-migration-pending.json`. Cerrar Linea POS por completo. El comando real depende del artefacto instalado; sustituir las rutas por los dos valores exactos del manifiesto:
 
-Abrir y reabrir el resultado con la version compatible con el esquema 8 o 12 restaurado. Comparar productos, stock, costos, ventas, detalles, movimientos y secuencias. Toda operacion creada despues de migrar a 13 se pierde al restaurar el backup.
+```bash
+# AppImage descargado
+./Linea.POS_0.2.1_amd64.AppImage restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/pos-v12-before-v13-ID.db
+
+# DEB o RPM instalado
+/usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/pos-v12-before-v13-ID.db
+```
+
+```powershell
+# NSIS instalado por usuario (Start-Process espera al ejecutable GUI y conserva ExitCode)
+# ArgumentList recibe una sola cadena con comillas dobles literales para las rutas con espacios.
+$restoreArgs = 'restore-migration-backup --database "C:\ruta con espacios\pos.db" --backup "C:\ruta con espacios\pos-v12-before-v13-ID.db"'
+$result = Start-Process -FilePath "$env:LOCALAPPDATA\Linea POS\pos_tauri.exe" -ArgumentList $restoreArgs -Wait -PassThru
+$result.ExitCode
+
+# MSI instalado para el equipo
+$result = Start-Process -FilePath "$env:ProgramFiles\Linea POS\pos_tauri.exe" -ArgumentList $restoreArgs -Wait -PassThru
+$result.ExitCode
+```
+
+El CLI adquiere `pos-application.lock` antes de resolver los archivos y el lock de migracion antes de validarlos. Rechaza symlinks/reparse points, exige que backup, manifiesto y `pos.db` pertenezcan al mismo directorio canonico, comprueba esquema, atestaciones, tamaño y SHA-256, y repite identidad/hash bajo lock inmediatamente antes del primer movimiento. Si Linea POS esta ejecutandose, un lock no puede adquirirse o su archivo es sustituido, falla con codigo 4 sin restaurar; los fallos de rutas, manifiestos o datos conservan su categoria propia. No borrar los locks manualmente: son locks del sistema operativo y sus archivos pueden permanecer normalmente en disco.
+
+El comando usa el mecanismo durable del backend: solo acepta el esquema canónico completo v8 o v12 declarado por ese manifiesto, crea el marcador de restauracion, pone en cuarentena la base y los sidecars de SQLite 13, promociona un temporal validado, persiste el manifiesto completado y cierra SQLite. Debe terminar con `Restauracion durable completada`; cualquier otro resultado se considera fallo. Códigos estables: `0` éxito, `2` sintaxis, `3` ruta/archivo, `4` lock o aplicación activa, `5` restauración rechazada/fallida y `6` cierre SQLite fallido. No reemplazar manualmente `pos.db`.
+
+Despues, confirmar `PRAGMA user_version` igual al `source_version`, `quick_check=ok`, cero filas de `foreign_key_check` y la presencia de `pos-schema-v13-restore-completed-<restore-id>.json`. Abrir y reabrir el resultado con la version compatible con el esquema 8 o 12 restaurado. Comparar literalmente productos, stock, historia financiera de origen, ventas, detalles, movimientos y secuencias. Toda operacion creada despues de migrar a 13 se pierde al restaurar el backup.
+
+Este procedimiento corresponde a `v0.2.1`. Su implementacion local no acredita por si sola la prueba sobre una copia cerrada real, `mode=validate`, smoke de artefactos, rollback operativo, tag ni publicacion.
 
 ### Checklist
 
 No publicar hasta que migracion, reapertura, smoke y rollback pasen sobre los archivos del mismo run ID de `validate`. La evidencia debe registrar `SHA256SUMS`; el tag se crea despues de aprobar esos bytes y `publish` debe recibir ese run ID, no generar otro candidato.
 
 - [ ] `pnpm qa:migration-v8-v13` termina correctamente en CI y en el candidato.
+- [ ] `pnpm test:retired-costs` confirma que no reaparecen simbolos financieros retirados.
 - [ ] Copia externa cerrada y consistente de produccion creada; las pruebas del repositorio no completan este paso.
 - [ ] Fuente 8 o 12 integra, preflight aprobado y snapshot privado registrado.
 - [ ] Commit, validate run ID, plataforma, instalador y `SHA256SUMS` registrados.
 - [ ] Esquema 13 integro, reapertura idempotente y manifiesto apuntando al backup exacto.
-- [ ] Costos, campos comerciales, IDs, relaciones y secuencias preservados literalmente.
-- [ ] Smoke de productos, compras, valoracion, checkout, ventas y correccion completado con centimetros.
+- [ ] Campos y filas financieros antiguos eliminados intencionalmente; stock, campos comerciales, IDs, relaciones y secuencias retenidos literalmente.
+- [ ] Compras historicas v1/v2 no reciben precio ni importe de compra v3.
+- [ ] Smoke de productos, compras, conteos, checkout, ventas y correccion local completado con centimetros.
 - [ ] Rechazo o fallo controlado revierte sin escrituras parciales.
 - [ ] Restauracion durable devuelve el esquema 8 o 12 y la version compatible lo abre.
-- [ ] No hay bases, backups, costos, rutas sensibles, datos personales, tokens ni secretos en evidencia compartida.
+- [ ] `maintenance-info` y el rollback se ejecutan desde el AppImage o instalación DEB/RPM/NSIS/MSI del candidato, sin checkout ni toolchain.
+- [ ] No hay bases, backups, datos financieros, rutas sensibles, datos personales, tokens ni secretos en evidencia compartida.
 - [ ] Tag y `publish` cuentan con aprobacion explicita.
 
 Crear un commit normal mediante pull request. Cuando este en `main`, crear el tag anotado sobre el commit exacto y publicarlo:
@@ -174,7 +203,7 @@ Un push de `v*` ejecuta primero `Release request`, que no tiene secrets ni permi
 
 `workflow_dispatch` solo puede lanzarse seleccionando `main`:
 
-- `mode=validate` usa el `HEAD` de `origin/main`, deriva el tag desde `package.json`, construye el candidato completo y deja omitido el job con `contents: write`.
+- `mode=validate` fija `github.sha` del evento/run y comprueba que pertenece a la historia de `origin/main`. Usa ese mismo SHA para los checkouts, el tag derivado de `package.json`, los metadatos y el artifact candidato, aunque `main` avance despues del dispatch o antes de un reintento. El `head_sha` del run coincide asi con el candidato seleccionable mediante `candidate_run_id`. Deja omitido el job con `contents: write`.
 - `mode=publish` requiere un tag `vX.Y.Z` existente y `candidate_run_id` con el run ID de `validate` aprobado. Sirve para la publicacion normal, recuperacion o reintento y no ejecuta tests, Vite, Cargo ni Tauri.
 
 Cada job de compilacion genera `dist` con `pnpm build` antes de cualquier acceso a secrets. Linux compila sin la clave privada, sanea el AppImage y expone la clave solamente al paso que firma los tres instaladores finales. NSIS tambien compila sin la clave y la expone solo al firmador posterior. MSI no recibe secretos ni configuracion del updater. El overlay efimero anula `build.beforeBuildCommand`, por lo que Vite o sus plugins no heredan credenciales de firma.

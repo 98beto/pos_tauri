@@ -305,11 +305,11 @@ fn load_product(
     active_presentations_only: bool,
 ) -> ServiceResult<Product> {
     let data = connection.query_row(
-        "SELECT id, name, price, stock, sku, brand_id, category_id, created_at, updated_at, base_unit, inventory_cost_cents
+        "SELECT id, name, price, stock, sku, brand_id, category_id, created_at, updated_at, base_unit
          FROM products WHERE id = ?1", [id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?, row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?, parse_base_unit(row.get(9)?)?, row.get::<_, Option<i64>>(10)?))
+                row.get::<_, String>(8)?, parse_base_unit(row.get(9)?)?))
         },
     ).map_err(|error| match error {
         rusqlite::Error::QueryReturnedNoRows => ServiceError::not_found("PRODUCT_NOT_FOUND", "Producto no encontrado"),
@@ -326,21 +326,6 @@ fn load_product(
                 "El producto no tiene presentacion predeterminada",
             )
         })?;
-    let average_cost_cents = match (data.10, data.3) {
-        (Some(cost), stock) if stock > 0 => Some(super::divide_half_up_positive(
-            i128::from(cost),
-            i128::from(stock),
-            "AVERAGE_COST_OVERFLOW",
-        )?),
-        (Some(_), 0) => Some(0),
-        (None, _) => None,
-        _ => {
-            return Err(ServiceError::internal(
-                "INVALID_STOCK",
-                "El stock guardado no es valido",
-            ))
-        }
-    };
     Ok(Product {
         id: data.0,
         name: data.1,
@@ -353,13 +338,6 @@ fn load_product(
         created_at: data.7,
         updated_at: data.8,
         base_unit: data.9,
-        inventory_cost_cents: data.10,
-        inventory_cost_status: if data.10.is_some() {
-            "known"
-        } else {
-            "unknown"
-        },
-        average_cost_cents,
         presentations,
         default_presentation,
     })
@@ -555,7 +533,7 @@ pub fn create_with_presentations(
     ensure_codes(&transaction, &sku, None, &values)?;
     let default_price = values.iter().find(|value| value.is_default).unwrap().price;
     let changed = transaction.execute(
-        "INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit,inventory_cost_cents) VALUES (?1,?2,?3,0,?4,?5,?6,?7,?8,0)",
+        "INSERT INTO products (name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit) VALUES (?1,?2,?3,0,?4,?5,?6,?7,?8)",
         params![name, search_key(&name), default_price, sku, search_key(&sku), input.brand_id, input.category_id, input.base_unit.as_str()],
     )?;
     require_one_row(changed)?;
@@ -717,9 +695,6 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
             stock: product.stock,
             stock_base: product.stock_base,
             base_unit: product.base_unit,
-            inventory_cost_cents: product.inventory_cost_cents,
-            inventory_cost_status: product.inventory_cost_status,
-            average_cost_cents: product.average_cost_cents,
             sku: product.sku,
             brand_id: product.brand_id,
             brand_name,
@@ -735,8 +710,6 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
     let mut gram_stock = 0;
     let mut milliliter_stock = 0;
     let mut centimeter_stock = 0;
-    let mut inventory_value_cents = 0;
-    let mut products_without_cost = 0;
     let mut brands = BTreeSet::new();
     for item in &items {
         let target = match item.base_unit {
@@ -746,16 +719,6 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
             BaseUnit::Centimeter => &mut centimeter_stock,
         };
         *target = checked_total(*target, item.stock, "PRODUCT_STATS_OVERFLOW")?;
-        match item.inventory_cost_cents {
-            Some(cost) => {
-                inventory_value_cents =
-                    checked_total(inventory_value_cents, cost, "PRODUCT_STATS_OVERFLOW")?
-            }
-            None => {
-                products_without_cost =
-                    checked_total(products_without_cost, 1, "PRODUCT_STATS_OVERFLOW")?
-            }
-        }
         brands.insert(item.brand_id);
     }
     Ok(ProductView {
@@ -766,8 +729,6 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
             milliliter_stock,
             centimeter_stock,
             brand_count: i64::try_from(brands.len()).unwrap_or(JS_MAX_SAFE_INTEGER),
-            inventory_value_cents,
-            products_without_cost,
         },
         items,
     })
@@ -996,7 +957,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!((p.stock_base, p.price, p.presentations.len()), (0, 100, 2));
-        assert_eq!(p.inventory_cost_cents, Some(0));
         let counts: (i64, i64) = c
             .query_row(
                 "SELECT stock, (SELECT COUNT(*) FROM inventory_movements WHERE product_id=?1)
@@ -1006,43 +966,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (0, 0));
-    }
-
-    #[test]
-    fn zero_cost_is_preserved_when_stock_is_changed_outside_product_creation() {
-        let mut c = db();
-        let product =
-            super::create_with_presentations(&mut c, product_input("RETAIL-VALUE")).unwrap();
-        c.execute("UPDATE products SET stock=250 WHERE id=?1", [product.id])
-            .unwrap();
-        let loaded = super::load_product(&c, product.id, false).unwrap();
-        assert_eq!(loaded.inventory_cost_cents, Some(0));
-
-        let view = super::view(&c, Default::default()).unwrap();
-        assert_eq!(view.items[0].inventory_cost_cents, Some(0));
-        assert_eq!(view.stats.inventory_value_cents, 0);
-        assert_eq!(view.stats.centimeter_stock, 0);
-    }
-
-    #[test]
-    fn historical_unknown_cost_stays_unknown_in_reads_and_stats() {
-        let mut c = db();
-        let product =
-            super::create_with_presentations(&mut c, product_input("UNKNOWN-COST")).unwrap();
-        c.execute(
-            "UPDATE products SET stock=3,inventory_cost_cents=NULL WHERE id=?1",
-            [product.id],
-        )
-        .unwrap();
-
-        let loaded = super::load_product(&c, product.id, false).unwrap();
-        assert_eq!(loaded.inventory_cost_cents, None);
-        assert_eq!(loaded.inventory_cost_status, "unknown");
-        assert_eq!(loaded.average_cost_cents, None);
-
-        let view = super::view(&c, Default::default()).unwrap();
-        assert_eq!(view.stats.inventory_value_cents, 0);
-        assert_eq!(view.stats.products_without_cost, 1);
     }
 
     #[test]

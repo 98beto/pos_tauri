@@ -73,7 +73,6 @@ export interface SaleHistoryLine {
   unit_price: number;
   entered_quantity: number;
   base_consumed: number;
-  movement_cost_cents: number | null;
   subtotal: number | null;
 }
 

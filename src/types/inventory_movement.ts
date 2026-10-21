@@ -1,12 +1,8 @@
-import type { BaseUnit, InventoryCostStatus, InventoryProductRow } from "./product";
+import type { BaseUnit, InventoryProductRow } from "./product";
 import type { PresentationMode } from "./product_presentation";
 
-export type InventoryMovementReason =
-  | "compra"
-  | "venta"
-  | "ajuste"
-  | "valoracion";
-export type InventoryMovementType = "entrada" | "salida" | "valoracion";
+export type InventoryMovementReason = "compra" | "venta" | "ajuste";
+export type InventoryMovementType = "entrada" | "salida";
 
 export interface InventoryMovement {
   id: number;
@@ -25,7 +21,8 @@ export interface InventoryMovement {
   base_unit: BaseUnit | null;
   presentation_mode: PresentationMode | null;
   presentation_base_quantity: number | null;
-  unit_price_cents: number | null;
+  purchase_unit_price_cents: number | null;
+  purchase_total_cents: number | null;
   reason: InventoryMovementReason;
   type: InventoryMovementType;
   quantity: number;
@@ -33,9 +30,6 @@ export interface InventoryMovement {
   base_quantity: number | null;
   stock_before: number | null;
   stock_after: number | null;
-  movement_cost_cents: number | null;
-  inventory_cost_before_cents: number | null;
-  inventory_cost_after_cents: number | null;
   supplier: string | null;
   document_reference: string | null;
   note: string | null;
@@ -44,44 +38,70 @@ export interface InventoryMovement {
   updated_at: string;
 }
 
-export interface CreateInventoryMovementInput {
-  product_id: number;
-  presentation_id?: number | null;
-  reason: "compra" | "ajuste" | "valoracion";
-  type: "entrada" | "salida" | "valoracion";
-  quantity: string;
-  unit_price?: string | null;
-  supplier?: string | null;
-  document_reference?: string | null;
-  note?: string | null;
+export interface LookupInventoryMovementInput {
   operation_token: string;
-  quote_fingerprint?: string | null;
 }
 
-export type QuoteInventoryMovementInput = Omit<
-  CreateInventoryMovementInput,
-  "operation_token" | "quote_fingerprint"
->;
+export interface QuotePurchaseInput {
+  product_id: number;
+  presentation_id?: number | null;
+  quantity: string;
+  purchase_unit_price: string;
+  supplier: string;
+  document_reference: string;
+  note?: string | null;
+}
 
-export interface InventoryMovementQuote {
+export interface CreatePurchaseInput extends QuotePurchaseInput {
+  operation_token: string;
+  quote_fingerprint: string;
+}
+
+export interface QuoteStockCountInput {
+  product_id: number;
+  counted_stock: string;
+  adjustment_reason: string;
+}
+
+export interface CreateStockCountInput extends QuoteStockCountInput {
+  operation_token: string;
+  quote_fingerprint: string;
+}
+
+export interface PurchaseQuote {
   product_id: number;
   product_name: string;
   product_sku: string;
-  reason: InventoryMovementReason;
-  type: InventoryMovementType;
   presentation_id: number | null;
   presentation_name: string | null;
   capture_name: string;
   presentation_mode: PresentationMode | null;
   presentation_base_quantity: number;
   entered_quantity: number;
-  entered_quantity_description: string;
   base_quantity: number;
-  base_quantity_description: string;
-  unit_price_cents: number | null;
-  unit_price_description: string | null;
-  total_cost_cents: number | null;
+  stock_before: number;
+  stock_after: number;
+  purchase_unit_price_cents: number;
+  purchase_total_cents: number;
+  purchase_price_description: string;
   base_unit: BaseUnit;
+  supplier: string;
+  document_reference: string;
+  note: string | null;
+  quote_fingerprint: string;
+}
+
+export interface StockCountQuote {
+  product_id: number;
+  product_name: string;
+  product_sku: string;
+  base_unit: BaseUnit;
+  stock_before: number;
+  counted_stock: number;
+  difference: number;
+  type: InventoryMovementType;
+  base_quantity: number;
+  adjustment_reason: string;
   quote_fingerprint: string;
 }
 
@@ -109,7 +129,6 @@ export interface InventoryViewFilters {
   product_search?: string;
   product_page?: number;
   base_unit?: BaseUnit;
-  cost_status?: InventoryCostStatus;
   movement_search?: string;
   movement_page?: number;
   reason?: InventoryMovementReason;
@@ -131,20 +150,19 @@ export interface InventoryViewStats {
   gram_stock: number;
   milliliter_stock: number;
   centimeter_stock: number;
-  inventory_value_cents: number;
-  products_without_cost: number;
 }
 
-export interface QuotePurchaseCostCorrectionInput {
+export interface QuotePurchasePriceCorrectionInput {
   movement_id: number;
-  new_unit_price: string;
+  new_purchase_unit_price: string;
 }
 
-export interface ConfirmPurchaseCostCorrectionInput extends QuotePurchaseCostCorrectionInput {
+export interface ConfirmPurchasePriceCorrectionInput
+  extends QuotePurchasePriceCorrectionInput {
   quote_fingerprint: string;
 }
 
-export interface PurchaseCostCorrectionQuote {
+export interface PurchasePriceCorrectionQuote {
   movement_id: number;
   product_id: number;
   product_name: string;
@@ -157,16 +175,10 @@ export interface PurchaseCostCorrectionQuote {
   presentation_base_quantity: number | null;
   entered_quantity: number;
   base_quantity: number;
-  previous_unit_price_cents: number;
-  new_unit_price_cents: number;
-  previous_movement_cost_cents: number;
-  new_movement_cost_cents: number;
-  current_inventory_cost_cents: number | null;
-  corrected_inventory_cost_cents: number | null;
-  affected_movement_count: number;
-  affected_sale_count: number;
-  first_affected_at: string;
-  last_affected_at: string;
+  previous_purchase_unit_price_cents: number;
+  new_purchase_unit_price_cents: number;
+  previous_purchase_total_cents: number;
+  new_purchase_total_cents: number;
   quote_fingerprint: string;
 }
 

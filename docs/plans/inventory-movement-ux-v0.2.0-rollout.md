@@ -1,8 +1,10 @@
 # Selector de inventario y despliegue seguro de v0.2.0
 
-**Estado:** implementacion local hasta el bloque 12 preparada para `v0.2.0`. El bloque 11 y la documentacion operativa de los bloques 13-14 estan completados; siguen pendientes la validacion con una copia cerrada real, `mode=validate`, la prueba de artefactos y rollback, el tag y `mode=publish`. No se ha migrado produccion ni publicado esta version.
+> **Documento historico y reemplazado. No ejecutar sus bloques, comandos, runbook de migracion, despliegue ni rollback.** La migracion a SQLite 12 y la publicacion de `v0.2.0` que describe no son el procedimiento actual. Use el [plan vigente](./measured-presentations-inventory-cost-corrections.md) para inventario y SQLite 13, y [`../releases.md`](../releases.md) para cualquier operacion de release.
 
-**Evolucion:** las decisiones de costo y valoracion siguen siendo la base funcional. El runbook de migracion al esquema 12 es historico y fue reemplazado por [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md) y por el runbook vigente de [`../releases.md`](../releases.md).
+**Estado registrado al cerrar este plan:** implementacion local hasta el bloque 12 preparada para `v0.2.0`. El bloque 11 y la documentacion operativa de los bloques 13-14 estaban completados; quedaban pendientes la validacion con una copia cerrada real, `mode=validate`, la prueba de artefactos y rollback, el tag y `mode=publish`. Esta frase conserva el estado de aquel momento y no enumera trabajo vigente.
+
+**Evolucion:** las decisiones de costo y valoracion son historicas y quedan reemplazadas. El plan vigente [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md) conserva inventario fisico, separa compras de conteos y retira el costo acumulado.
 
 ## Objetivo
 

@@ -48,7 +48,7 @@ jobs:
       # actions/checkout v5.1.0; update this SHA when renewing the action.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: main
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || 'main' }}
           fetch-depth: 0
           persist-credentials: false
       - name: Resolve trusted release mode, tag, and immutable commit
@@ -58,6 +58,7 @@ jobs:
           DISPATCH_TAG: ${{ inputs.tag }}
           DISPATCH_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           REQUEST_EVENT: ${{ github.event.workflow_run.event }}
           REQUEST_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
@@ -82,7 +83,11 @@ jobs:
                 echo "Validate mode does not accept candidate_run_id" >&2
                 exit 1
               fi
-              sha="$(git rev-parse origin/main^{commit})"
+              if [[ ! "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "Validate dispatch has an invalid SHA" >&2
+                exit 1
+              fi
+              sha="$DISPATCH_SHA"
               version="$(git show "$sha:package.json" | jq -er .version)"
               tag="v$version"
               if [[ -n "$DISPATCH_TAG" && "$DISPATCH_TAG" != "$tag" ]]; then
@@ -230,7 +235,7 @@ jobs:
       - name: Install Linux bundle and signature dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm minisign
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm cpio minisign
       - run: pnpm install --frozen-lockfile
       - name: Build frontend without signing secrets
         env:
@@ -289,6 +294,12 @@ jobs:
           APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
         run: |
           scripts/sanitize-appimage.sh "$APPIMAGE"
+      - name: Prove maintenance mode is executable from final Linux bundles
+        env:
+          APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
+          DEB: ${{ steps.linux-assets.outputs.deb }}
+          RPM: ${{ steps.linux-assets.outputs.rpm }}
+        run: scripts/verify-linux-maintenance-bundles.sh "$APPIMAGE" "$DEB" "$RPM"
       - name: Sign final Linux installer bytes
         env:
           APPIMAGE: ${{ steps.linux-assets.outputs.appimage }}
@@ -404,6 +415,28 @@ jobs:
           }
           Remove-Item -Force -ErrorAction SilentlyContinue "$($installer.FullName).sig"
           "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+      - name: Prove maintenance mode is in the NSIS payload
+        env:
+          NSIS_INSTALLER: ${{ steps.nsis-asset.outputs.installer }}
+        shell: pwsh
+        run: |
+          $installer = Get-Item -LiteralPath $env:NSIS_INSTALLER -ErrorAction Stop
+          if ($installer.PSIsContainer -or $installer.Length -eq 0) {
+            throw "NSIS installer must contain bytes"
+          }
+          $payload = Join-Path $env:RUNNER_TEMP "nsis-maintenance-payload"
+          Remove-Item -LiteralPath $payload -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $payload -ErrorAction Stop | Out-Null
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @("/S", "/D=$payload") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Silent NSIS install failed" }
+          $executables = @(Get-ChildItem -LiteralPath $payload -Recurse -File -Filter "pos_tauri.exe")
+          if ($executables.Count -ne 1 -or $executables[0].Length -eq 0) {
+            throw "NSIS payload must contain exactly one non-empty pos_tauri.exe"
+          }
+          $maintenance = & $executables[0].FullName maintenance-info
+          if ($LASTEXITCODE -ne 0 -or $maintenance -ne "Linea POS 0.2.1: mantenimiento local disponible") {
+            throw "NSIS payload maintenance-info failed"
+          }
       - name: Sign final NSIS installer bytes
         env:
           NSIS_INSTALLER: ${{ steps.nsis-asset.outputs.installer }}
@@ -471,6 +504,26 @@ jobs:
         with:
           projectPath: .
           args: --bundles msi --config "${{ runner.temp }}/tauri.release.conf.json" -- --locked
+      - name: Prove maintenance mode is in the MSI payload
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "src-tauri/target/release/bundle/msi" -File -Filter "*.msi")
+          if ($installers.Count -ne 1) { throw "Expected exactly one MSI" }
+          if ($installers[0].Length -eq 0) { throw "MSI installer must contain bytes" }
+          $payload = Join-Path $env:RUNNER_TEMP "msi-maintenance-payload"
+          Remove-Item -LiteralPath $payload -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $payload -ErrorAction Stop | Out-Null
+          $arguments = @("/a", "`"$($installers[0].FullName)`"", "/qn", "/norestart", "TARGETDIR=`"$payload`"")
+          $install = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Silent MSI extraction failed" }
+          $executables = @(Get-ChildItem -LiteralPath $payload -Recurse -File -Filter "pos_tauri.exe")
+          if ($executables.Count -ne 1 -or $executables[0].Length -eq 0) {
+            throw "MSI payload must contain exactly one non-empty pos_tauri.exe"
+          }
+          $maintenance = & $executables[0].FullName maintenance-info
+          if ($LASTEXITCODE -ne 0 -or $maintenance -ne "Linea POS 0.2.1: mantenimiento local disponible") {
+            throw "MSI payload maintenance-info failed"
+          }
       - run: git diff --exit-code -- src-tauri/Cargo.lock
       # actions/upload-artifact v7.0.1; update this SHA when renewing the action.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

@@ -4,7 +4,7 @@ import { createCategory, listCategories, updateCategory } from "../../api/catego
 import { createProductWithPresentations, getProductsView, updateProductWithPresentations } from "../../api/products";
 import { Button, EmptyState, Field, Modal, Spinner, StatCard } from "../../components/ui";
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
-import { centsToDecimal, formatBaseQuantity, formatMoney, presentationPriceLabel } from "../../lib/format";
+import { centsToDecimal, formatBaseQuantity, presentationPriceLabel } from "../../lib/format";
 import type { Brand } from "../../types/brand";
 import type { Category } from "../../types/category";
 import type { BaseUnit, ProductView, ProductViewRow } from "../../types/product";
@@ -421,25 +421,24 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     : viewError
       ? "No disponible por el error actual"
       : "Segun filtros actuales";
-  const statValue = (value: number | undefined, money = false) =>
-    statsUnavailable || value === undefined ? "-" : money ? formatMoney(value) : value;
+  const statValue = (value: number | undefined) =>
+    statsUnavailable || value === undefined ? "-" : value;
 
   if (loading && !view) return <main id="main-content" tabIndex={-1} className="grid min-h-[calc(100dvh-88px)] place-items-center"><Spinner className="size-6 text-brand" /></main>;
 
   return (
     <main id="main-content" tabIndex={-1} className="p-4 outline-none sm:p-6 min-[900px]:p-8">
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <StatCard label="Productos" value={statValue(view?.stats.product_count)} detail={statsDetail} />
         <StatCard label="Existencia en piezas" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.piece_stock, "piece")} detail={statsDetail} />
         <StatCard label="Existencia por peso" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.gram_stock, "gram")} detail={statsDetail} />
         <StatCard label="Existencia por volumen" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.milliliter_stock, "milliliter")} detail={statsDetail} />
         <StatCard label="Existencia por longitud" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.centimeter_stock, "centimeter")} detail={statsDetail} />
-        <StatCard label="Valor a costo" value={statValue(view?.stats.inventory_value_cents, true)} detail={statsUnavailable ? statsDetail : view.stats.products_without_cost ? `${view.stats.products_without_cost} sin costo conocido` : "Todos los costos son conocidos"} />
       </div>
 
       <section className="mt-5 rounded-card border border-line bg-surface">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line p-4 sm:p-5">
-           <div><h2 id="products-table-title" className="font-heading text-xl font-bold">Catalogo de productos</h2><p className="mt-1 text-xs text-muted">Existencias, presentaciones y valoracion del negocio.</p></div>
+           <div><h2 id="products-table-title" className="font-heading text-xl font-bold">Catalogo de productos</h2><p className="mt-1 text-xs text-muted">Existencias y presentaciones disponibles para venta.</p></div>
           <div className="flex flex-wrap gap-2"><Button onClick={() => setCatalogOpen(true)}>Marcas y categorias</Button><Button variant="primary" onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button></div>
         </div>
         <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3 sm:p-5">
@@ -453,15 +452,14 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
         <div className="relative overflow-x-auto focus:outline-none focus:ring-3 focus:ring-brand/20" role="region" aria-busy={tableLoading} aria-label="Tabla de productos; desplaza horizontalmente para ver todas las columnas" tabIndex={0}>
           {tableLoading && <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}
           {!view && tableLoading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.items.length ? (
-            <table aria-labelledby="products-table-title" className="w-full min-w-[980px] text-left text-sm">
+            <table aria-labelledby="products-table-title" className="w-full min-w-[820px] text-left text-sm">
               <caption className="sr-only">Listado de productos del catalogo</caption>
-              <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Predeterminada</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3 text-right">Activas</th><th className="border-b border-line px-5 py-3 text-right">Valor a costo</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
+              <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Predeterminada</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3 text-right">Activas</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
               <tbody>{view.items.map((product) => <tr key={product.id} className="hover:bg-surface-soft/60">
                 <td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</span></td>
                 <td className="border-b border-line px-5 py-4"><span className="block font-semibold">{product.default_presentation.name}</span><span className="text-xs text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${product.stock_base === 0 ? "bg-danger-soft text-danger" : "bg-brand-soft text-brand"}`}>{formatBaseQuantity(product.stock_base, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</td>
-                <td className="border-b border-line px-5 py-4 text-right">{product.inventory_cost_status === "unknown" || product.inventory_cost_cents === null ? <span className="text-xs font-semibold text-muted">Costo desconocido</span> : <><span className="block font-semibold">{formatMoney(product.inventory_cost_cents)}</span><span className="text-xs text-muted">Promedio: {product.average_cost_cents === null ? "-" : formatMoney(product.average_cost_cents)}</span></>}</td>
                 <td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" aria-label={`Editar producto ${product.name}`} onClick={() => openEdit(product)}>Editar</Button></td>
               </tr>)}</tbody>
             </table>

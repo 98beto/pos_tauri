@@ -1,5 +1,7 @@
 # Plan de GitHub Actions y actualizaciones
 
+> **Documento historico y reemplazado. No ejecutar sus comandos ni usar sus etapas como runbook de CI, firma o publicacion.** Para operar releases use exclusivamente [`../releases.md`](../releases.md). El trabajo vigente de inventario y migracion se define en [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md).
+
 ## Objetivo
 
 Automatizar la validacion, compilacion y publicacion de Linea POS para Linux y Windows mediante GitHub Actions, y agregar actualizaciones firmadas con el plugin oficial de Tauri.

@@ -5,7 +5,6 @@ import type {
 } from "./product_presentation";
 
 export type BaseUnit = "piece" | "gram" | "milliliter" | "centimeter";
-export type InventoryCostStatus = "known" | "unknown";
 
 export interface Product {
   id: number;
@@ -14,9 +13,6 @@ export interface Product {
   stock: number;
   stock_base: number;
   base_unit: BaseUnit;
-  inventory_cost_cents: number | null;
-  inventory_cost_status: InventoryCostStatus;
-  average_cost_cents: number | null;
   sku: string;
   brand_id: number;
   category_id: number;
@@ -68,8 +64,6 @@ export interface ProductViewStats {
   milliliter_stock: number;
   centimeter_stock: number;
   brand_count: number;
-  inventory_value_cents: number;
-  products_without_cost: number;
 }
 
 export interface ProductView {
@@ -106,7 +100,4 @@ export interface InventoryProductRow {
   sku: string;
   stock: number;
   base_unit: BaseUnit;
-  inventory_cost_cents: number | null;
-  inventory_cost_status: InventoryCostStatus;
-  average_cost_cents: number | null;
 }

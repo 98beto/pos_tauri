@@ -1,5 +1,7 @@
 # Plan de migracion a rusqlite
 
+> **Documento historico de una migracion ya realizada. No ejecutar sus comandos de dependencias ni sus etapas como instrucciones actuales.** Las versiones y ejemplos se conservan solo como registro. Consulte el [plan vigente](./measured-presentations-inventory-cost-corrections.md) para el trabajo actual y [`README.md`](./README.md) para el indice de planes.
+
 Este documento describe como mover todo el acceso a SQLite y la logica de negocio al backend Rust de Tauri.
 
 ## Versiones

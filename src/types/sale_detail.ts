@@ -20,7 +20,6 @@ export interface SaleDetail {
   entered_quantity: number | null;
   base_quantity: number | null;
   line_total: number | null;
-  movement_cost_cents: number | null;
   created_at: string;
   updated_at: string;
 }

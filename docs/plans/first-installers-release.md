@@ -1,12 +1,14 @@
 # Plan para generar los primeros instaladores
 
+> **Documento historico y reemplazado. No ejecutar ninguno de sus comandos, pasos de firma, creacion de tags o publicacion.** Conserva el proceso usado para preparar `v0.1.0`; no describe el repositorio ni el proceso operativo actuales. Para una release use exclusivamente [`../releases.md`](../releases.md), y para el trabajo actual de inventario y SQLite consulte el [plan vigente](./measured-presentations-inventory-cost-corrections.md).
+
 ## Objetivo
 
 Corregir las advertencias de Actions que todavia usan Node.js 20, configurar la firma del updater y publicar la primera release `v0.1.0` de Linea POS para Linux y Windows.
 
 La primera release debe producir instaladores manuales, artefactos firmados para el updater y un `latest.json` valido. La prueba automatica N-1 a N se realizara posteriormente con `v0.1.0` instalada y una nueva version `v0.1.1`.
 
-## Estado actual
+## Estado registrado al redactar el plan
 
 - El repositorio publico es `98beto/pos_tauri`.
 - La rama principal es `main`.

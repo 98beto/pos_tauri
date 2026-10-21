@@ -1,5 +1,7 @@
 # Registro manual de movimientos de inventario
 
+> **Documento historico y reemplazado. No ejecutar sus pasos ni sus comandos de verificacion como instrucciones actuales.** Describe el modelo manual implementado en septiembre de 2026. El [plan vigente](./measured-presentations-inventory-cost-corrections.md) separa compras documentales de ajustes por conteo fisico y reemplaza este flujo.
+
 **Estado:** implementado y verificado, con idempotencia persistente, el 23 de septiembre de 2026.
 
 ## Objetivo

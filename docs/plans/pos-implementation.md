@@ -1,5 +1,7 @@
 # Plan de implementacion del POS
 
+> **Documento historico y no ejecutable. No usar sus etapas ni comandos como instrucciones para el estado actual.** Consulte el [plan vigente](./measured-presentations-inventory-cost-corrections.md) y el indice de [`README.md`](./README.md).
+
 **Evolucion:** este plan general es historico. La captura inicial de stock/costo fue reemplazada por [`measured-presentations-inventory-cost-corrections.md`](./measured-presentations-inventory-cost-corrections.md); el resto de la evolucion se conserva en los planes enlazados desde [`README.md`](./README.md).
 
 ## Objetivo

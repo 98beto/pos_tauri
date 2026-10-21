@@ -1,29 +1,47 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  CreateInventoryMovementInput,
-  ConfirmPurchaseCostCorrectionInput,
+  ConfirmPurchasePriceCorrectionInput,
+  CreatePurchaseInput,
+  CreateStockCountInput,
   InventoryMovement,
-  InventoryMovementQuote,
   InventoryProductSearchResult,
   InventoryView,
   InventoryViewFilters,
+  LookupInventoryMovementInput,
   ProductInventoryDetail,
   ProductInventoryDetailFilters,
-  PurchaseCostCorrectionQuote,
-  QuotePurchaseCostCorrectionInput,
-  QuoteInventoryMovementInput,
+  PurchasePriceCorrectionQuote,
+  PurchaseQuote,
+  QuotePurchaseInput,
+  QuotePurchasePriceCorrectionInput,
+  QuoteStockCountInput,
+  StockCountQuote,
 } from "../types/inventory_movement";
 
-export function createInventoryMovement(
-  input: CreateInventoryMovementInput,
-): Promise<InventoryMovement> {
-  return invoke<InventoryMovement>("create_inventory_movement", { input });
+export function lookupInventoryMovement(
+  input: LookupInventoryMovementInput,
+): Promise<InventoryMovement | null> {
+  return invoke<InventoryMovement | null>("lookup_inventory_movement", { input });
 }
 
-export function quoteInventoryMovement(
-  input: QuoteInventoryMovementInput,
-): Promise<InventoryMovementQuote> {
-  return invoke<InventoryMovementQuote>("quote_inventory_movement", { input });
+export function quotePurchase(input: QuotePurchaseInput): Promise<PurchaseQuote> {
+  return invoke<PurchaseQuote>("quote_purchase", { input });
+}
+
+export function createPurchase(
+  input: CreatePurchaseInput,
+): Promise<InventoryMovement> {
+  return invoke<InventoryMovement>("create_purchase", { input });
+}
+
+export function quoteStockCount(input: QuoteStockCountInput): Promise<StockCountQuote> {
+  return invoke<StockCountQuote>("quote_stock_count", { input });
+}
+
+export function createStockCount(
+  input: CreateStockCountInput,
+): Promise<InventoryMovement> {
+  return invoke<InventoryMovement>("create_stock_count", { input });
 }
 
 export function searchInventoryProducts(
@@ -56,14 +74,14 @@ export function listInventoryMovements(): Promise<InventoryMovement[]> {
   return invoke<InventoryMovement[]>("list_inventory_movements");
 }
 
-export function quotePurchaseCostCorrection(
-  input: QuotePurchaseCostCorrectionInput,
-): Promise<PurchaseCostCorrectionQuote> {
-  return invoke<PurchaseCostCorrectionQuote>("quote_purchase_cost_correction", { input });
+export function quotePurchasePriceCorrection(
+  input: QuotePurchasePriceCorrectionInput,
+): Promise<PurchasePriceCorrectionQuote> {
+  return invoke<PurchasePriceCorrectionQuote>("quote_purchase_price_correction", { input });
 }
 
-export function confirmPurchaseCostCorrection(
-  input: ConfirmPurchaseCostCorrectionInput,
-): Promise<PurchaseCostCorrectionQuote> {
-  return invoke<PurchaseCostCorrectionQuote>("confirm_purchase_cost_correction", { input });
+export function confirmPurchasePriceCorrection(
+  input: ConfirmPurchasePriceCorrectionInput,
+): Promise<PurchasePriceCorrectionQuote> {
+  return invoke<PurchasePriceCorrectionQuote>("confirm_purchase_price_correction", { input });
 }

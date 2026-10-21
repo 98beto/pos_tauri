@@ -826,9 +826,6 @@ describe("PosView", () => {
       presentation_id: fixedPresentation.id,
       product: {
         ...product,
-        inventory_cost_cents: 0,
-        inventory_cost_status: "known",
-        average_cost_cents: 0,
         created_at: "",
         updated_at: "",
         presentations: selectorProduct.presentations,
@@ -853,9 +850,6 @@ describe("PosView", () => {
       match_kind: "sku",
       product: {
         ...product,
-        inventory_cost_cents: 0,
-        inventory_cost_status: "known",
-        average_cost_cents: 0,
         created_at: "",
         updated_at: "",
         presentations: selectorProduct.presentations,
@@ -913,7 +907,6 @@ describe("PosView", () => {
         entered_quantity: 2,
         base_quantity: 500,
         line_total: 2_500,
-        movement_cost_cents: 1_000,
         created_at: "2026-01-01",
         updated_at: "2026-01-01",
       }],
@@ -926,7 +919,7 @@ describe("PosView", () => {
     expect(screen.getByText("Bolsa historica 250 g · CAFE-OLD")).toBeTruthy();
     expect(screen.getByText(/2 Bolsa historica 250 g/)).toBeTruthy();
     expect(screen.getByText("$25.00")).toBeTruthy();
-    expect(screen.getByText("Costo de inventario: $10.00")).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Venta completada" }).textContent).not.toMatch(/costo de inventario|costo desconocido/i);
   });
 
   it("keeps catalog and custom price snapshots while showing the global discount separately", async () => {
@@ -958,7 +951,6 @@ describe("PosView", () => {
         entered_quantity: 75,
         base_quantity: 75,
         line_total: 1_500,
-        movement_cost_cents: 600,
         created_at: "2026-01-01",
         updated_at: "2026-01-01",
       }],
@@ -970,7 +962,7 @@ describe("PosView", () => {
     const dialog = screen.getByRole("dialog", { name: "Venta completada" });
     expect(dialog.textContent).toContain("75 cm · Aplicado: $20.00 por metro");
     expect(dialog.textContent).toContain("Catalogo: $25.00 por metro");
-    expect(dialog.textContent).toContain("Costo de inventario: $6.00");
+    expect(dialog.textContent).not.toMatch(/costo de inventario|costo desconocido/i);
     expect(dialog.textContent).toContain("$15.00");
     expect(dialog.textContent).toContain("Subtotal$15.00");
     expect(dialog.textContent).toContain("Descuento-$1.50");
@@ -1005,7 +997,6 @@ describe("PosView", () => {
         entered_quantity: 75,
         base_quantity: null,
         line_total: 1_500,
-        movement_cost_cents: 600,
         created_at: "2026-01-01",
         updated_at: "2026-01-01",
       }],
@@ -1017,7 +1008,7 @@ describe("PosView", () => {
     const dialog = screen.getByRole("dialog", { name: "Venta completada" });
     expect(dialog.textContent).toContain("Aplicado: $20.00 · base no disponible");
     expect(dialog.textContent).toContain("Catalogo: $25.00 · base no disponible");
-    expect(dialog.textContent).toContain("Costo de inventario: $6.00");
+    expect(dialog.textContent).not.toMatch(/costo de inventario|costo desconocido/i);
     expect(dialog.textContent).toContain("$15.00");
     expect(dialog.textContent).not.toContain("por 1");
   });
@@ -1031,7 +1022,7 @@ describe("PosView", () => {
         presentation_name: null, presentation_barcode: null, base_unit: null,
         presentation_mode: null, presentation_base_quantity: null, quantity: 2,
         catalog_unit_price: null, unit_price: 625, entered_quantity: null,
-        base_quantity: null, line_total: null, movement_cost_cents: null,
+        base_quantity: null, line_total: null,
         created_at: "2026-01-01", updated_at: "2026-01-01",
       }],
     });
@@ -1039,7 +1030,7 @@ describe("PosView", () => {
     await enterValidCash();
     await settleMutation(screen.getByRole("button", { name: /Cobrar/ }));
     expect(screen.getByText("No representable")).toBeTruthy();
-    expect(screen.getByText("Costo de inventario: Desconocido")).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Venta completada" }).textContent).not.toMatch(/costo de inventario|costo desconocido/i);
   });
 
   it("labels the horizontally scrollable cart table", async () => {

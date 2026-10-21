@@ -1,560 +1,117 @@
-# Presentaciones medidas, centimetros y correccion de costos
+# Compras, conteo fisico y retiro del costo acumulado
 
-**Estado:** implementado en el repositorio. La suite sintetica esta disponible; sigue pendiente la validacion operativa sobre una copia cerrada y anonimizada de produccion, seguida del smoke y rollback del candidato exacto.
+**Estado:** implementacion local completada; gates operativos pendientes.
 
-**Esquema de origen:** SQLite 12.
+**Esquema de origen en produccion:** SQLite 12.
 
 **Esquema objetivo:** SQLite 13.
 
+## Motivo del reemplazo
+
+La captura inicial de costo de SQLite 12 permitio registrar precios con una base distinta a la esperada. En produccion existieron casos donde la interfaz esperaba un precio por gramo y el usuario capturo un precio por kilogramo. El costo acumulado resultante no es confiable y no existe informacion suficiente para corregirlo automaticamente.
+
+El equipo operativo confirmo que:
+
+- SQLite 13 no se ha usado con datos reales; solo existe en desarrollo y pruebas.
+- Los costos historicos de SQLite 12 no deben migrarse.
+- El sistema dejara de valorar inventario y de calcular costo de ventas.
+- El precio de compra se conservara solamente como dato de cada compra nueva.
+- Los ajustes se realizaran mediante conteo fisico en unidad base.
+- Proveedor, precio y factura pertenecen exclusivamente a una compra.
+
+Por ello, la migracion 013 puede reemplazarse antes de publicarse. No se creara SQLite 14.
+
 ## Objetivo
 
-Agregar longitud en centimetros, simplificar la configuracion de productos medidos y conservar el modelo de costos de compra existente.
+Convertir Inventario en un modulo operativo simple, separado en dos tareas:
+
+1. Registrar una compra con cantidad, precio, proveedor y factura.
+2. Ajustar existencias indicando el stock fisico contado.
 
 El resultado esperado es:
 
-- Los productos por peso, volumen y longitud usan presentaciones `measured`.
-- Las bases estandar `1 kg`, `1 L` y `1 m` se eligen mediante una opcion clara y no permiten editar su conversion.
-- Sigue siendo posible definir otra base de precio, por ejemplo `100 g`, `500 ml` o `25 cm`.
-- Los centimetros son la unidad base persistida para productos de longitud.
-- Los productos nuevos se crean con stock cero y costo acumulado cero.
-- Crear un producto no solicita stock inicial ni precio de compra y no genera un movimiento inicial.
-- Las compras y ajustes de entrada se registran desde Inventario con cantidad y precio de compra.
-- Se conservan el costo acumulado, costo promedio, valor a costo y costo retirado por ventas o ajustes.
-- Se puede corregir el precio de una compra existente sin modificar su cantidad.
-- Corregir una compra recalcula transaccionalmente todos los costos posteriores que dependan de ella.
-- La migracion 013 conserva literalmente la informacion financiera de SQLite 12 y solo amplia las unidades para admitir centimetros.
-- La actualizacion crea y valida un backup antes de modificar una base instalada.
+- El inventario controla cantidades fisicas, no valoracion contable.
+- Una compra aumenta stock y conserva su propio precio e importe documental.
+- Un ajuste establece el stock contado y calcula la diferencia automaticamente.
+- Un ajuste no solicita precio, proveedor ni factura.
+- Una venta descuenta stock sin calcular costo de venta.
+- No existen costo acumulado, costo promedio, valor a costo ni valoracion manual.
+- Corregir una compra cambia solamente el precio y el importe de esa compra.
+- La migracion elimina intencionalmente todos los costos historicos de SQLite 12.
+- Stock, ventas cobradas, cantidades, relaciones y metadatos no financieros se conservan literalmente.
+- La actualizacion crea y valida un backup SQLite 12 antes de eliminar datos financieros.
+
+## Principios de producto
+
+### Operacion antes que formulario
+
+No se usara un formulario generico con un selector de tipo de movimiento. La interfaz presentara acciones distintas:
+
+- `Registrar compra`.
+- `Ajustar existencias`.
+
+Cada accion mostrara solamente los campos que le corresponden.
+
+### Stock como fuente de verdad
+
+El stock se persiste en la unidad base del producto:
+
+- `piece`: piezas enteras.
+- `gram`: gramos enteros.
+- `milliliter`: mililitros enteros.
+- `centimeter`: centimetros enteros.
+
+Las presentaciones siguen sirviendo para vender y registrar compras. Los ajustes por conteo se capturan siempre en unidad base para evitar ambiguedad.
+
+### Sin valoracion de inventario
+
+El sistema no intentara inferir:
+
+- Costo promedio.
+- Costo acumulado.
+- Valor del inventario.
+- Costo retirado por una venta.
+- Margen bruto.
+
+El precio de una compra es un atributo documental de esa compra, no una entrada a un saldo contable derivado.
 
 ## Alcance
 
 Este plan modifica:
 
-- Modelo y validaciones de productos y presentaciones.
-- Formulario de alta y edicion de productos.
-- Unidad base, formateo y captura de longitud.
-- Alta manual, cotizacion e historial de inventario.
-- Correccion de precios de compras existentes.
-- Replay cronologico de costos de inventario.
-- Checkout y movimientos de inventario generados por ventas.
-- Estadisticas de productos e inventario.
-- Contratos Rust, TypeScript e IPC.
-- Esquema SQLite, migracion 013, backup y recuperacion.
-- Pruebas de frontend, backend y migracion.
-- Documentacion de QA, release y rollback.
+- Esquema SQLite 13 y migracion desde SQLite 8 y 12.
+- Apertura, backup, manifiestos y restauracion.
+- Contratos Rust, TypeScript e IPC de inventario.
+- Registro y correccion de compras.
+- Ajustes mediante conteo fisico.
+- Checkout y movimientos de venta.
+- Productos, estadisticas e historial de inventario.
+- Intents locales de operaciones pendientes.
+- Pruebas frontend, backend y migracion.
+- QA, release y rollback.
+- Documentacion historica de los planes de costo reemplazados.
 
 ## Fuera de alcance
 
-- Editar la cantidad de una compra historica.
-- Editar la presentacion, conversion, producto, fecha o tipo de un movimiento historico.
-- Borrar ventas, detalles o movimientos.
+- Valoracion contable del inventario.
+- Costo promedio ponderado.
+- Costo de ventas o margen bruto.
+- Reportes de utilidad.
+- Editar cantidad, producto, presentacion, proveedor, factura o fecha de una compra confirmada.
+- Borrar compras, ajustes, ventas o movimientos fisicos. La migracion 013 elimina como excepcion confirmada los movimientos historicos de valoracion, porque no representan un cambio de stock y su unica finalidad era establecer el saldo contable retirado.
 - Cambiar la unidad base de un producto existente.
-- Reabrir o cambiar los totales comerciales cobrados en una venta.
-- Agregar una tabla de auditoria para las correcciones de precio.
-- Conservar el precio anterior despues de confirmar una correccion.
+- Reabrir o modificar totales comerciales de ventas cerradas.
+- Auditoria de versiones anteriores del precio corregido.
 - Unidades base con decimales.
-- Paquetes `fixed` para productos por peso, volumen o longitud.
-- Calcular margen bruto como una nueva funcionalidad visible.
-- Agregar importes de inventario calculados con precios al cliente.
-- Valorar el inventario con precios de venta en vez de costos de compra.
-- Distribuir descuentos comerciales sobre costos de inventario.
-
-## Estado actual relevante
-
-SQLite 12 maneja:
-
-- `products.base_unit`: `piece`, `gram` o `milliliter`.
-- `product_presentations.mode`: `fixed` o `measured`.
-- `products.inventory_cost_cents`: costo acumulado del stock actual.
-- `sale_details.movement_cost_cents`: costo retirado por una linea de venta.
-- Snapshots de costo antes y despues en `inventory_movements`.
-- Precio de compra e importe de costo por movimiento manual.
-
-La semantica de presentaciones es:
-
-```text
-fixed:
-base_consumed = entered_quantity * base_quantity
-line_total = entered_quantity * price_cents
-
-measured:
-base_consumed = entered_quantity
-line_total = round_half_up(entered_quantity * price_cents / base_quantity)
-```
-
-`Kilogramo` y `Litro` no son unidades persistidas. Son presentaciones medidas con bases de precio de 1000 gramos o 1000 mililitros. `Metro` seguira el mismo modelo con una base de 100 centimetros.
-
-El costo acumulado representa el costo total del stock vigente. El costo promedio visible se deriva mediante:
-
-```text
-average_cost = round_half_up(inventory_cost_cents / stock)
-```
-
-El arbol de trabajo contenia una implementacion local anterior de SQLite 13 incompatible con este modelo. Esa direccion fue reemplazada antes de publicar o abrir una base de produccion.
+- Paquetes `fixed` para productos medidos.
+- Importar costos historicos de SQLite 12.
+- Intentar reparar costos antiguos mediante conversiones heuristicas.
 
 ## Decisiones confirmadas
 
 ### Version del esquema
 
-No se reducira `CURRENT_SCHEMA_VERSION` a 12.
-
-El objetivo seguira siendo SQLite 13 porque la estructura persistida admite una unidad adicional. Conceptualmente, el esquema objetivo sera:
-
-```text
-SQLite 13 = SQLite 12 + centimeter
-```
-
-La migracion 013 conserva todas las columnas de costo y no agrega columnas de importe comercial.
-
-### Modos por unidad base
-
-Las combinaciones admitidas para datos nuevos seran:
-
-| Unidad base | Modo admitido | Uso |
-| --- | --- | --- |
-| `piece` | `fixed` | Pieza o paquete de piezas |
-| `gram` | `measured` | Peso capturado en gramos |
-| `milliliter` | `measured` | Volumen capturado en mililitros |
-| `centimeter` | `measured` | Longitud capturada en centimetros |
-
-`PresentationMode` conserva las variantes `fixed | measured`.
-
-Rust valida la combinacion unidad/modo. La interfaz evita crear combinaciones invalidas, pero no es la autoridad de dominio.
-
-La migracion no convierte automaticamente presentaciones historicas ni cambia el significado de `entered_quantity`.
-
-### Selector de base de precio
-
-Para una presentacion medida, la interfaz mostrara:
-
-| Unidad | Opcion estandar | Base bloqueada | Opcion editable |
-| --- | --- | --- | --- |
-| Gramo | `Kilogramo` | `1000 g` | `Otra medida` |
-| Mililitro | `Litro` | `1000 ml` | `Otra medida` |
-| Centimetro | `Metro` | `100 cm` | `Otra medida` |
-
-La opcion se deriva de `base_unit` y `base_quantity`; no requiere una columna nueva.
-
-```text
-gram + 1000         -> Kilogramo
-milliliter + 1000   -> Litro
-centimeter + 100    -> Metro
-cualquier otra base -> Otra medida
-```
-
-Al elegir la opcion estandar:
-
-- La cantidad muestra la base canonica.
-- El campo queda deshabilitado.
-- El payload envia siempre la base canonica.
-
-Al elegir `Otra medida`:
-
-- La base debe ser un entero positivo.
-- Debe ser segura para JavaScript.
-- Puede coincidir posteriormente con una base estandar; al editar se mostrara como estandar.
-
-El nombre comercial sigue siendo editable. Las reglas no dependen de textos como `Kilogramo`, `Litro` o `Metro`.
-
-### Longitud
-
-La nueva unidad persistida es `centimeter`.
-
-- El stock se guarda como centimetros enteros.
-- Productos, Inventario y POS capturan centimetros enteros.
-- El precio por metro usa `mode = measured` y `base_quantity = 100`.
-- El formato visible puede convertir centimetros a metros sin usar punto flotante para reglas de negocio.
-- La unidad base permanece inmutable despues de crear el producto.
-
-Ejemplo comercial:
-
-```text
-Producto: Cable
-base_unit = centimeter
-stock = 850
-
-Presentacion: Metro
-mode = measured
-base_quantity = 100
-price = 2500 centavos
-
-Venta de 75 cm:
-base_consumed = 75
-line_total = round_half_up(75 * 2500 / 100)
-           = 1875 centavos
-```
-
-### Creacion de productos
-
-Productos deja de capturar stock inicial y precio de compra inicial.
-
-Todo producto nuevo se crea con:
-
-```text
-stock = 0
-inventory_cost_cents = 0
-```
-
-No se crea un movimiento `initial_stock`.
-
-Usar costo acumulado cero no significa que el usuario haya declarado un precio de compra. Es el saldo correcto de un inventario vacio y permite que la primera compra establezca un costo conocido.
-
-Los contratos de creacion dejan de contener:
-
-- `initial_stock`.
-- `initial_purchase_price_per_base`.
-
-No se mantendra compatibilidad IPC para esos campos.
-
-### Modelo de costos
-
-Se conserva la semantica de SQLite 12.
-
-Para una entrada con costo conocido:
-
-```text
-stock_after = stock_before + base_quantity
-movement_cost = costo de la cantidad capturada
-inventory_cost_after = inventory_cost_before + movement_cost
-```
-
-Para una salida con costo conocido:
-
-```text
-movement_cost = round_half_up(
-  inventory_cost_before * base_quantity / stock_before
-)
-inventory_cost_after = inventory_cost_before - movement_cost
-```
-
-Al retirar todo el stock conocido:
-
-```text
-stock_after = 0
-inventory_cost_after = 0
-```
-
-Si el costo acumulado es desconocido:
-
-- Se conserva `NULL` mientras quede stock.
-- Una compra puede conservar su costo individual, aunque el total siga siendo desconocido.
-- Agotar el stock normaliza el costo acumulado a cero.
-- Una valoracion establece un nuevo costo acumulado conocido.
-
-### Compras y ajustes
-
-Una compra o ajuste de entrada captura:
-
-- Producto.
-- Presentacion opcional.
-- Cantidad.
-- Precio de compra.
-- Proveedor opcional.
-- Documento opcional.
-- Nota opcional.
-
-El precio se interpreta segun la forma de captura seleccionada:
-
-```text
-fixed:
-base_quantity = entered_quantity * presentation.base_quantity
-movement_cost = entered_quantity * purchase_price
-
-measured:
-base_quantity = entered_quantity
-movement_cost = round_half_up(
-  entered_quantity * purchase_price / presentation.base_quantity
-)
-
-captura directa sin presentacion:
-base_quantity = entered_quantity
-movement_cost = entered_quantity * purchase_price_per_base
-```
-
-Un ajuste de salida no captura precio. Retira costo proporcional del saldo vigente.
-
-La valoracion manual permanece disponible y cambia el costo acumulado sin cambiar stock.
-
-### Ventas
-
-Checkout conserva dos dimensiones independientes:
-
-- Dimension comercial: precio de catalogo, precio aplicado, subtotal, descuento y total cobrado.
-- Dimension de costo: costo retirado del inventario y costo acumulado restante.
-
-El costo retirado no depende de:
-
-- Precio actual de venta.
-- Precio personalizado aplicado a la linea.
-- Descuento global.
-- Metodo de pago.
-
-Si una venta contiene varias lineas del mismo producto, el servicio calcula el costo total retirado una sola vez y distribuye los residuos de centavos deterministamente entre las lineas.
-
-### Correccion del precio de una compra
-
-Se podra corregir solamente un movimiento que cumpla:
-
-```text
-origin = manual
-reason = compra
-type = entrada
-record_version = 2
-```
-
-Solo se modifica el precio de compra.
-
-Permanecen inmutables:
-
-- Producto.
-- Presentacion y snapshots de conversion.
-- Cantidad capturada.
-- Cantidad base.
-- Stock antes y despues.
-- Fecha del movimiento.
-- Proveedor, documento y nota.
-- Token original.
-
-No se agrega una tabla de auditoria. Al confirmar, el precio anterior y los snapshots de costo derivados son reemplazados.
-
-La interfaz debe advertir esta consecuencia antes de confirmar.
-
-## Cotizacion de correccion
-
-La correccion usa dos pasos: cotizar y confirmar.
-
-La cotizacion recibe:
-
-- ID del movimiento de compra.
-- Nuevo precio de compra.
-
-Rust devuelve:
-
-- Identidad del producto y movimiento.
-- Cantidad y forma de captura originales.
-- Precio anterior y nuevo.
-- Costo original y nuevo de la compra.
-- Costo actual del producto antes y despues del replay.
-- Cantidad de movimientos posteriores afectados.
-- Cantidad de ventas cuyos costos cambian.
-- Fecha de la primera y ultima fila afectada.
-- Fingerprint opaco del estado cotizado.
-
-La cotizacion no escribe en la base.
-
-El fingerprint incluye como minimo:
-
-- Movimiento objetivo y precio original.
-- Nuevo precio normalizado.
-- Conversion y cantidades persistidas.
-- Stock y costo actuales del producto.
-- IDs, orden y snapshots de costo del rango afectado.
-- Costos de detalles de venta relacionados.
-
-Si cualquier movimiento, detalle, stock o costo cambia antes de confirmar, la confirmacion exige una nueva cotizacion.
-
-## Replay de costos
-
-La confirmacion abre una transaccion `IMMEDIATE` y bloquea escrituras concurrentes.
-
-El orden total del replay es:
-
-```text
-created_at ASC, id ASC
-```
-
-El backend:
-
-1. Vuelve a validar que el movimiento objetivo sea una compra v2 elegible.
-2. Compara el fingerprint cotizado con el estado vigente.
-3. Usa `inventory_cost_before_cents` de la compra como punto inicial.
-4. Recalcula `unit_price_cents` y `movement_cost_cents` de la compra.
-5. Recorre cronologicamente todos los movimientos posteriores del producto.
-6. Valida continuidad de stock antes y despues sin modificar cantidades.
-7. Recalcula costos de entradas, salidas y ventas.
-8. Actualiza `sale_details.movement_cost_cents` para ventas afectadas.
-9. Conserva totales, precios y descuentos comerciales de las ventas.
-10. Actualiza `products.inventory_cost_cents` con el saldo final.
-11. Confirma todo o revierte todo.
-
-### Entradas posteriores
-
-Las entradas posteriores conservan su precio y costo de movimiento originales. Solo se recalculan sus snapshots de costo acumulado antes y despues.
-
-### Salidas y ventas posteriores
-
-Las salidas se recalculan con el saldo vigente en ese punto del replay.
-
-Para ventas con varias lineas del mismo producto:
-
-- Se agrupan por venta y producto.
-- Se calcula el costo total retirado por la cantidad base agregada.
-- Se reutiliza el mismo algoritmo productivo de distribucion de residuos.
-- Se actualizan movimiento y detalle de venta de forma consistente.
-
-### Valoraciones posteriores
-
-Una valoracion establece un saldo absoluto y funciona como frontera del efecto financiero:
-
-- Su `inventory_cost_before_cents` se actualiza con el saldo recalculado.
-- Su valor establecido permanece igual.
-- Los movimientos posteriores parten del valor de la valoracion.
-
-### Costos desconocidos
-
-`NULL` nunca se interpreta como cero.
-
-El replay conserva las transiciones de costo desconocido de SQLite 12. Si el rango no contiene informacion suficiente para reproducir una transicion con seguridad, la correccion se rechaza.
-
-### Rechazos del replay
-
-La correccion aborta sin escrituras si:
-
-- El movimiento no es una compra manual v2.
-- El precio nuevo no es valido o excede el limite seguro.
-- El fingerprint esta obsoleto.
-- El rango contiene movimientos v1 que impiden reconstruir el costo con certeza.
-- La cadena de `stock_before` y `stock_after` ya es inconsistente.
-- Una venta no tiene sus movimientos y detalles relacionados completos.
-- El replay produciria costo negativo.
-- Cualquier calculo excede el limite seguro de JavaScript.
-- Una actualizacion concurrente cambia el producto o el historial.
-
-## Idempotencia de la correccion
-
-No se agrega una tabla ni un token persistido nuevo para correcciones.
-
-La operacion se hace segura ante reintentos mediante:
-
-- Fingerprint del estado previo.
-- Precio original esperado.
-- Precio nuevo solicitado.
-- Comparacion del estado actual antes de escribir.
-
-Si una confirmacion se aplico pero la respuesta se perdio, un reintento con el mismo objetivo y precio debe reconocer que la compra ya contiene el precio solicitado y devolver el resultado vigente si toda la cadena es consistente.
-
-Un precio distinto exige una nueva cotizacion.
-
-## Modelo objetivo
-
-### `BaseUnit`
-
-Rust y TypeScript admiten:
-
-```text
-piece | gram | milliliter | centimeter
-```
-
-Todos los `match` deben ser exhaustivos. No se permiten ternarios que interpreten cualquier unidad distinta de gramos como mililitros.
-
-### Producto
-
-El producto conserva:
-
-- Identidad y metadatos.
-- Unidad base inmutable.
-- Stock en unidad base.
-- Precio comercial legado sincronizado con la presentacion predeterminada.
-- `inventory_cost_cents`.
-- Estado de costo conocido o desconocido.
-- Costo promedio derivado.
-
-### Presentacion
-
-`product_presentations` mantiene la estructura de SQLite 12:
-
-- `mode` sigue siendo `fixed | measured`.
-- `base_quantity` conserva su significado.
-- `price` sigue siendo precio al cliente.
-- La presentacion predeterminada es unica y activa.
-- Una presentacion usada conserva bloqueados `mode` y `base_quantity`.
-
-### Movimiento de inventario
-
-`inventory_movements` mantiene versiones 1 y 2 y todas las columnas de SQLite 12:
-
-- Producto y snapshots de busqueda.
-- Presentacion y snapshots de conversion.
-- Cantidad capturada y cantidad base.
-- Precio de compra cuando corresponde.
-- Stock antes y despues.
-- Costo del movimiento.
-- Costo acumulado antes y despues.
-- Proveedor, documento y nota.
-- Token de operacion y fingerprint.
-
-No se agregan columnas de importes de inventario calculados con precios al cliente.
-
-### Detalle de venta
-
-`sale_details` conserva:
-
-- Precios comerciales y totales.
-- Snapshots de presentacion y conversion.
-- `movement_cost_cents`.
-
-## Migracion 013
-
-Crear o reemplazar antes de publicar:
-
-```text
-src-tauri/migrations/013_measured_presentations_centimeters.sql
-```
-
-No modificar las migraciones `001-012` ya publicadas.
-
-La implementacion local anterior de 013 no se considera publicada y debe ser reemplazada por completo.
-
-### Cambio estructural permitido
-
-El unico cambio de dominio persistido sera agregar `centimeter` a:
-
-- `products.base_unit`.
-- `sale_details.base_unit`.
-- `inventory_movements.base_unit`.
-
-SQLite obliga a reconstruir las tablas para cambiar sus `CHECK`.
-
-### Reconstruccion de tablas
-
-La migracion reconstruira en orden seguro:
-
-1. `products`.
-2. `product_presentations`, para mantener sus claves foraneas hacia la tabla reconstruida.
-3. `sale_details`.
-4. `inventory_movements`.
-
-Cada tabla conservara literalmente la definicion de SQLite 12 salvo por los tres `CHECK` de unidad.
-
-La copia usara listas explicitas de columnas, nunca `SELECT *`.
-
-Se recrearan todos los indices, claves foraneas, restricciones unicas y secuencias.
-
-### Columnas que deben preservarse
-
-`products` conserva:
-
-```text
-inventory_cost_cents
-```
-
-`sale_details` conserva:
-
-```text
-movement_cost_cents
-```
-
-`inventory_movements` conserva:
-
-```text
-unit_price_cents
-movement_cost_cents
-inventory_cost_before_cents
-inventory_cost_after_cents
-```
-
-La migracion no transforma, recalcula ni normaliza esos valores.
-
-### Versiones admitidas
+SQLite 13 no fue publicado ni usado con datos reales. Se reemplazara la migracion 013 existente.
 
 La politica de apertura sera:
 
@@ -567,273 +124,733 @@ La politica de apertura sera:
 otra    -> rechazar como incompatible
 ```
 
-Se conserva:
+Las bases SQLite 13 locales creadas por la implementacion descartada se consideran datos de desarrollo y deben recrearse. No se agregara compatibilidad con esa forma local del esquema 13.
 
-- Preflight read-only.
-- Comparacion canonica de estructuras 12 y 13.
-- Backup consistente antes de cualquier escritura.
-- Marcador pendiente durable.
-- Manifiesto completado.
-- Cuarentena y restauracion.
-- Compatibilidad con marcadores de migraciones anteriores.
+### Datos financieros historicos
 
-### Snapshot pre y post
+La migracion desde SQLite 12 eliminara intencionalmente:
 
-Para una migracion 12 a 13 se comparan literalmente:
+- `products.inventory_cost_cents`.
+- `sale_details.movement_cost_cents`.
+- `inventory_movements.unit_price_cents` historico.
+- `inventory_movements.movement_cost_cents` historico.
+- `inventory_movements.inventory_cost_before_cents`.
+- `inventory_movements.inventory_cost_after_cents`.
+- Todos los movimientos historicos con `reason = valoracion` o `type = valoracion`.
 
-- Todos los IDs y relaciones.
+No se copiaran esos valores a columnas nuevas, tablas auxiliares, notas ni manifiestos.
+
+El backup SQLite 12 previo a la migracion sera la unica copia conservada por el proceso de actualizacion. Un rollback restaura ese archivo completo, incluidos sus campos financieros antiguos.
+
+### Datos que deben preservarse
+
+La migracion conservara literalmente:
+
+- Usuarios.
+- Marcas y categorias.
+- Productos y unidad base.
 - Stock por producto.
-- Costo acumulado por producto, incluidos `NULL`.
-- Precios y costos de movimientos.
-- Costos antes y despues.
-- Costos de detalles de venta.
-- Precios, subtotales, descuentos y totales comerciales.
-- Presentaciones y conversiones.
-- Metadatos y timestamps.
-- Secuencias SQLite.
+- Presentaciones, conversiones, precios al cliente y codigos de barras.
+- Ventas, detalles, precios comerciales, descuentos, pagos y totales cobrados.
+- Cantidades capturadas y cantidades base.
+- Relaciones entre venta, detalle y movimiento.
+- Proveedor, documento y nota historicos como metadatos de movimientos.
+- Tokens, fingerprints y timestamps que sigan formando parte del esquema objetivo.
+- IDs de todas las filas retenidas y secuencias SQLite.
 
-La unica diferencia estructural aceptada es `centimeter` en los tres `CHECK`.
+La eliminacion de movimientos historicos de valoracion es la unica excepcion deliberada a la preservacion de filas e IDs. Sus IDs no se reutilizan y la secuencia de `inventory_movements` conserva el high-water mark de origen, incluso si la valoracion eliminada tenia el ID mas alto.
 
-## Cambios por capa
+Todos los metadatos y sus claves de busqueda en filas v1/v2 retenidas se copian literalmente, aunque proveedor o documento aparezcan en una operacion donde las reglas v3 ya no los admitirian. La exclusividad de proveedor y factura para compras aplica solo a escrituras v3.
 
-### SQLite y apertura
+### Presentaciones medidas
 
-- Reemplazar 013 por una migracion conservadora.
-- Mantener esquema objetivo 13.
-- Mantener rutas desde 8 y 12.
-- Validar que costos y relaciones se preserven literalmente.
-- Retirar validaciones que esperen ausencia de columnas de costo.
-- Mantener hashes de migraciones 001-012.
+Se mantienen las decisiones ya implementadas:
 
-### Modelos Rust
+| Unidad base | Modo para datos nuevos | Base estandar |
+| --- | --- | --- |
+| `piece` | `fixed` | 1 pieza |
+| `gram` | `measured` | 1000 g = 1 kg |
+| `milliliter` | `measured` | 1000 ml = 1 L |
+| `centimeter` | `measured` | 100 cm = 1 m |
 
-- Agregar `BaseUnit::Centimeter`.
-- Restaurar campos y estados de costo de SQLite 12.
-- Mantener fuera del alta stock y costo inicial.
-- Restaurar precio y costo en DTO de movimientos.
-- Agregar DTO de cotizacion y confirmacion de correccion.
+La migracion no reinterpreta presentaciones historicas. Una conversion historica usada permanece bloqueada.
 
-### Servicios Rust
+## Modelo objetivo
 
-- Mantener validacion unidad/modo.
-- Mantener bases estandar y aritmetica entera.
-- Crear productos con stock y costo cero.
-- Restaurar aritmetica de costo promedio.
-- Restaurar valoracion.
-- Restaurar retiro de costo en checkout.
-- Implementar replay de correcciones reutilizando las mismas funciones productivas.
-- Mantener transacciones inmediatas e idempotencia.
+### Producto
 
-### Contratos TypeScript e IPC
+`products` conserva:
 
-- Agregar `centimeter` a `BaseUnit`.
-- Mantener fuera del alta stock y costo inicial.
-- Restaurar campos de costo y precio de compra.
-- Versionar intents pendientes para incluir precio de compra.
-- Agregar contratos de cotizacion y confirmacion de correccion.
+- Identidad y metadatos.
+- Unidad base inmutable.
+- Stock actual en unidad base.
+- Precio comercial legado sincronizado con la presentacion predeterminada.
+- Marca, categoria y timestamps.
 
-### Productos
+`products` no contiene:
 
-- Retirar stock inicial y precio de compra inicial.
-- Mantener pieza/paquete solo para productos por pieza.
-- Usar opciones estandar u otra medida para unidades medidas.
-- Mantener estadisticas y columnas de costo.
-- Agregar longitud a filtros y estadisticas sin sumar unidades incompatibles.
+- Costo acumulado.
+- Costo promedio persistido.
+- Precio de compra.
+- Valor de inventario.
 
-### Inventario
+Un producto nuevo se crea con:
 
-- Restaurar captura de precio de compra.
-- Restaurar valoracion manual.
-- Restaurar filtros y mensajes de costo.
-- Agregar longitud a cantidades, detalle y estadisticas.
-- Agregar accion `Corregir precio de compra` a filas elegibles.
-- Mostrar impacto completo antes de confirmar una correccion.
+```text
+stock = 0
+```
 
-### POS y ventas
+No crea un movimiento inicial.
 
-- Mantener captura directa para presentaciones medidas.
-- No mostrar controles `+/-` en presentaciones medidas.
-- Agregar centimetros y formato en metros.
-- Restaurar costo retirado y costo por detalle.
-- Mantener snapshots y calculos comerciales actuales.
+### Detalle de venta
 
-### Intents locales
+`sale_details` conserva toda la dimension comercial:
 
-El intent manual avanzara a una nueva version que incluya:
+- Precio de catalogo.
+- Precio aplicado.
+- Cantidad capturada y cantidad base.
+- Presentacion y conversion historicas.
+- Subtotal de linea.
+
+`sale_details` no contiene costo retirado de inventario.
+
+### Movimiento de inventario
+
+`inventory_movements` conserva la identidad y trazabilidad fisica:
+
+- Producto y snapshots de busqueda.
+- Origen, motivo y tipo.
+- Presentacion y snapshots de conversion cuando corresponde.
+- Cantidad capturada y cantidad base.
+- Stock antes y despues.
+- Venta y detalle relacionados.
+- Proveedor, factura/referencia y nota segun la operacion.
+- Token de operacion y fingerprint.
+- Timestamps.
+
+Agrega nombres financieros exclusivos para compras nuevas:
+
+```text
+purchase_unit_price_cents
+purchase_total_cents
+```
+
+No usa nombres genericos como `unit_price_cents` o `movement_cost_cents` para datos nuevos.
+
+### Versiones de movimiento
+
+Los movimientos historicos v1 y v2 no relacionados con valoracion se conservan como historia fisica, sin las columnas de costo eliminadas. Sus campos nuevos de compra quedan en `NULL` y no se reinterpretan como compras nuevas.
+
+Todos los movimientos nuevos, manuales o generados por venta, usan `record_version = 3`. Las ventas v1/v2 se admiten solo como historia migrada; el runtime no crea nuevas filas de venta v1/v2.
+
+#### Compra v3
+
+```text
+origin = manual
+reason = compra
+type = entrada
+purchase_unit_price_cents > 0
+purchase_total_cents > 0
+supplier no vacio
+document_reference no vacio
+snapshots de presentacion completos y coherentes cuando se usa presentacion
+operation_token no vacio y unico
+intent_fingerprint no vacio
+stock_after = stock_before + base_quantity
+```
+
+Una compra cuyo importe redondeado half-up sea cero se rechaza. El usuario debe capturar una cantidad o precio que produzca al menos un centavo.
+
+#### Ajuste v3
+
+```text
+origin = manual
+reason = ajuste
+type = entrada | salida
+presentation_id = NULL
+purchase_unit_price_cents = NULL
+purchase_total_cents = NULL
+supplier = NULL
+document_reference = NULL
+note no vacia
+operation_token no vacio y unico
+intent_fingerprint no vacio
+stock_after = stock contado
+base_quantity = abs(stock_after - stock_before)
+```
+
+Un conteo igual al stock vigente no crea movimiento.
+
+#### Venta
+
+La venta conserva su version y snapshots comerciales actuales. El movimiento registra exclusivamente la salida fisica, usa `origin = sale`, `reason = venta`, `type = salida`, exige `sale_id` y `sale_detail_id` coherentes, deja los campos de compra en `NULL` y cumple `stock_before = stock_after + base_quantity`.
+
+#### Matriz exhaustiva de movimientos
+
+| Version y origen | Destino en SQLite 13 | Reglas principales |
+| --- | --- | --- |
+| v1 `initial_stock` | Retener | `ajuste/entrada`, sin relaciones de venta, snapshots parciales permitidos como en origen, campos de compra en `NULL` |
+| v1 `manual` | Retener salvo valoracion | `compra/entrada` o `ajuste/entrada|salida`, sin relaciones de venta, metadatos literales, campos de compra en `NULL` |
+| v1 `sale` | Retener | `venta/salida`, relaciones de venta coherentes, campos de compra en `NULL` |
+| v2 `initial_stock` | Retener | Misma forma fisica y continuidad de stock del origen, campos de compra en `NULL` |
+| v2 `manual` compra/ajuste | Retener | Forma, snapshots, token, fingerprint y metadatos no financieros literales; campos de compra en `NULL` |
+| v2 `manual` valoracion | Eliminar | Excepcion intencional; no cambia stock y solo representa el saldo contable retirado |
+| v2 `sale` | Retener | `venta/salida`, detalle y venta completos, snapshots coherentes, campos de compra en `NULL` |
+| v3 `manual` compra | Crear | Forma de compra v3 definida arriba |
+| v3 `manual` conteo | Crear | Forma de ajuste v3 definida arriba |
+| v3 `sale` | Crear | Forma de venta definida arriba; nunca contiene datos de compra |
+
+Reglas comunes del `CHECK` objetivo:
+
+- Ninguna fila retenida o nueva admite `reason = valoracion` o `type = valoracion`.
+- v1 conserva la nulabilidad historica permitida por SQLite 12.
+- v2 retenido conserva la forma estructural no financiera de SQLite 12.
+- v2/v3 con presentacion exigen snapshots todos nulos o todos completos y coherentes.
+- Stock y cantidades v2/v3 son enteros no negativos y cumplen su ecuacion de entrada o salida.
+- El conteo v3 no admite presentacion ni snapshots de presentacion.
+- Solo la compra v3 admite `purchase_unit_price_cents` y `purchase_total_cents`.
+- Combinaciones de origen, motivo y tipo no enumeradas se rechazan.
+- Se agregan pruebas SQL directas para cada rama valida e invalida.
+
+## Registro de compra
+
+### Campos
+
+Una compra solicita obligatoriamente:
+
+- Producto.
+- Forma de captura o presentacion.
+- Cantidad.
+- Precio de compra.
+- Proveedor.
+- Factura o referencia.
+
+La nota es opcional.
+
+### Interpretacion del precio
+
+La interfaz debe mostrar la base del precio sin ambiguedad:
+
+```text
+fixed:
+base_quantity = entered_quantity * presentation.base_quantity
+purchase_total = entered_quantity * purchase_unit_price
+
+measured:
+base_quantity = entered_quantity
+purchase_total = round_half_up(
+  entered_quantity * purchase_unit_price / presentation.base_quantity
+)
+
+captura directa:
+base_quantity = entered_quantity
+purchase_total = entered_quantity * purchase_unit_price_per_base
+```
+
+Ejemplos de etiquetas:
+
+- `Precio de compra por paquete de 12 piezas`.
+- `Precio de compra por 1 kg`.
+- `Precio de compra por 1 L`.
+- `Precio de compra por 1 m`.
+- `Precio de compra por gramo` para captura directa.
+
+Antes de confirmar se muestra:
+
+- Stock actual.
+- Cantidad capturada.
+- Cantidad base agregada.
+- Stock resultante.
+- Precio y base de precio.
+- Importe total de la compra.
+- Proveedor y factura.
+
+### Transaccion e idempotencia
+
+La confirmacion usa una transaccion `IMMEDIATE` y valida nuevamente:
+
+- Producto y presentacion vigentes.
+- Conversion.
+- Stock actual.
+- Precio normalizado.
+- Proveedor, factura y nota.
+- Fingerprint cotizado.
+
+El token de operacion evita duplicar una compra si la respuesta se pierde.
+
+## Ajuste por conteo fisico
+
+### Flujo
+
+El usuario selecciona un producto e ingresa el stock real contado en unidad base.
+
+La interfaz muestra:
+
+- Unidad de captura.
+- Stock registrado actualmente.
+- Stock contado.
+- Diferencia calculada.
+- Resultado `Entrada` o `Salida`.
+- Motivo obligatorio.
+
+No muestra:
+
+- Presentaciones.
+- Precio de compra.
+- Proveedor.
+- Factura.
+- Campos de costo.
+
+### Calculo
+
+```text
+difference = counted_stock - current_stock
+
+difference > 0 -> ajuste de entrada
+difference < 0 -> ajuste de salida
+difference = 0 -> rechazar sin escritura
+
+base_quantity = abs(difference)
+stock_before = current_stock
+stock_after = counted_stock
+```
+
+El conteo y la diferencia deben ser enteros seguros para JavaScript.
+
+La confirmacion usa una transaccion `IMMEDIATE`. Si el stock cambia despues de cotizar, exige una nueva cotizacion.
+
+## Correccion del precio de compra
+
+### Elegibilidad
+
+Solo una compra nueva y completa puede corregirse:
+
+```text
+origin = manual
+reason = compra
+type = entrada
+record_version = 3
+purchase_unit_price_cents IS NOT NULL
+purchase_total_cents IS NOT NULL
+```
+
+Las compras historicas de SQLite 12 no conservan precio y no son elegibles.
+
+### Comportamiento
+
+La correccion modifica solamente:
+
+- `purchase_unit_price_cents`.
+- `purchase_total_cents` derivado de la cantidad y conversion originales.
+
+Permanecen inmutables:
+
+- Producto.
+- Presentacion y conversion.
+- Cantidad capturada y cantidad base.
+- Stock antes y despues.
+- Proveedor.
+- Factura.
+- Nota.
+- Fecha.
+- Token original.
+
+No existe replay porque ninguna venta ni movimiento posterior depende del precio de compra.
+
+La operacion mantiene dos pasos:
+
+1. Cotizar el nuevo importe sin escribir.
+2. Confirmar dentro de una transaccion `IMMEDIATE` con fingerprint del movimiento vigente.
+
+El fingerprint canonico incluye:
+
+- ID del movimiento.
+- Precio anterior cotizado.
+- Precio nuevo solicitado.
+- Cantidad, presentacion y conversion originales.
+- Proveedor, factura, nota y timestamp vigentes.
+- `updated_at` del movimiento.
+
+La confirmacion tiene solamente dos rutas validas:
+
+1. Si el precio vigente coincide con el precio anterior cotizado, valida todo el fingerprint y aplica el cambio.
+2. Si el precio vigente ya coincide con el precio nuevo, reconstruye la misma transicion `anterior -> nuevo`; si los campos inmutables coinciden, devuelve exito sin escribir.
+
+Cualquier otro estado exige una nueva cotizacion. No se agrega token ni tabla de auditoria para la correccion.
+
+## Checkout y ventas
+
+Checkout mantiene exclusivamente la dimension comercial y fisica:
+
+- Valida stock agregado por producto.
+- Descuenta stock.
+- Conserva precio de catalogo, precio aplicado, descuento, pago y total.
+- Crea detalles y movimientos relacionados.
+- No consulta ni modifica costos de inventario.
+- No distribuye costos entre lineas.
+
+Varias lineas del mismo producto se agregan para validar stock, como en la implementacion actual.
+
+## Interfaz objetivo
+
+### Vista principal
+
+La cabecera de Inventario ofrece:
+
+- Boton primario `Registrar compra`.
+- Boton secundario `Ajustar existencias`.
+
+Se eliminan:
+
+- El boton generico `Registrar movimiento`.
+- El selector de operacion.
+- La opcion `Establecer costo acumulado`.
+- Tarjetas de valor a costo y costo desconocido.
+- Filtros de estado de costo.
+
+Las estadisticas muestran por separado:
+
+- Cantidad de productos.
+- Existencia en piezas.
+- Existencia por peso.
+- Existencia por volumen.
+- Existencia por longitud.
+
+No se suman unidades incompatibles.
+
+### Detalle de producto
+
+El detalle funciona como centro operativo del producto:
+
+- `Registrar compra` con producto preseleccionado.
+- `Ajustar existencias` con producto preseleccionado.
+- Stock actual y ultimo movimiento.
+- Historial fisico y documental.
+
+Se eliminan costo promedio y valor a costo.
+
+### Historial
+
+Una compra muestra:
+
+- Cantidad y presentacion.
+- Precio de compra y base del precio.
+- Importe total.
+- Proveedor y factura.
+- Nota.
+
+Un ajuste muestra:
+
+- Stock anterior.
+- Stock contado.
+- Diferencia.
+- Entrada o salida.
+- Motivo.
+
+Una venta muestra:
+
+- Cantidad retirada.
+- Ticket relacionado.
+
+En movil, los movimientos deben mostrarse como tarjetas o resumen expandible. Las acciones importantes no pueden depender de desplazarse hasta la ultima columna de una tabla ancha.
+
+## Intents locales
+
+Se introduce una nueva version con discriminante explicito:
+
+```text
+kind = purchase | stock_count
+```
+
+### Compra pendiente
+
+Conserva:
 
 - Usuario.
-- Token de operacion.
+- Token.
 - Producto y presentacion.
-- Motivo y tipo.
 - Cantidad.
-- Precio de compra cuando corresponda.
-- Proveedor, documento y nota.
-- Fingerprint de cotizacion.
+- Precio.
+- Proveedor.
+- Factura.
+- Nota.
+- Fingerprint.
 
-Los intents creados por la implementacion local incompatible no deben confirmarse directamente. Deben cargarse solo para contexto y exigir una nueva cotizacion con precio de compra.
+### Conteo pendiente
 
-### Documentacion
+Conserva:
 
-- Reemplazar referencias al plan local descartado.
-- Mantener los planes de SQLite 12 como historia y base del modelo de costo.
-- Marcar solamente la captura inicial de stock/costo como reemplazada.
-- Actualizar QA, release y rollback para SQLite 13 conservador.
+- Usuario.
+- Token.
+- Producto.
+- Stock contado.
+- `adjustmentReason`.
+- Fingerprint.
+
+No contiene campos comerciales.
+
+`adjustmentReason` es el nombre TypeScript e intent. El DTO Rust/IPC usa `adjustment_reason`. Al persistir se normaliza en `inventory_movements.note` y `note_search_key`; la columna enum `reason` permanece fija en `ajuste`. Fingerprints, respuestas de historial, errores de campo y pruebas usan esta misma correspondencia.
+
+Los intents de versiones anteriores nunca se confirman directamente bajo las reglas nuevas. Se cargan solo como contexto y exigen volver a capturar y cotizar. Si representan una respuesta perdida, el backend consulta primero el token para evitar duplicar una operacion ya aplicada.
+
+## Migracion 013
+
+Se reemplazara nuevamente, antes de publicar:
+
+```text
+src-tauri/migrations/013_measured_presentations_centimeters.sql
+```
+
+Las migraciones `001-012` no se modifican.
+
+### Reconstrucciones
+
+SQLite 13 reconstruira, en orden seguro:
+
+1. `products` para retirar costo acumulado y admitir centimetros.
+2. `product_presentations` para restablecer su FK.
+3. `sale_details` para retirar costo de movimiento y admitir centimetros.
+4. `inventory_movements` para retirar costos antiguos, agregar campos de compra y admitir centimetros.
+
+La copia usara listas explicitas de columnas. No se permite `SELECT *`.
+
+### Validacion pre y post
+
+La validacion usa proyecciones distintas por version de origen.
+
+#### Ruta SQLite 12 a 13
+
+`v12-before` y `v13-after-v12` comparan literalmente todos los campos retenidos de las filas no eliminadas:
+
+- IDs y secuencias.
+- Stock.
+- Productos y presentaciones.
+- Ventas, pagos, descuentos y totales.
+- Cantidades capturadas y base.
+- Relaciones.
+- Proveedores, documentos y notas.
+- Tokens y timestamps.
+
+Los movimientos de valoracion se fotografian y cuentan antes de migrar solamente para comprobar su eliminacion intencional. No participan en la igualdad de filas retenidas.
+
+#### Ruta SQLite 8 a 13
+
+`v8-before` compara literalmente las columnas nativas de SQLite 8. `v13-after-v8` valida por separado los valores que 009-012 generan deterministicamente, incluyendo presentaciones, unidades, snapshots y backfills comerciales. No se exige igualdad para columnas que no existian en v8.
+
+Las cuatro proyecciones son SQL explicito e independiente:
+
+- `v8-before`.
+- `v13-after-v8`.
+- `v12-before`.
+- `v13-after-v12`.
+
+No se reutiliza una forma unica que contenga columnas eliminadas.
+
+Los campos financieros eliminados no participan en la igualdad post-migracion. En su lugar se valida que:
+
+- Las columnas antiguas no existan.
+- Ningun valor antiguo haya sido copiado a los campos nuevos de compra.
+- Las compras historicas tengan campos nuevos de compra en `NULL`.
+- No permanezca ningun movimiento de valoracion.
+- La secuencia de movimientos conserve el high-water mark de origen.
+
+### Backup y rollback
+
+Antes de cualquier escritura:
+
+- Preflight read-only de SQLite 8 o 12.
+- Backup consistente mediante API SQLite.
+- Validacion del backup.
+- Marcador durable pendiente.
+- Migracion.
+- Validacion post-migracion.
+- Manifiesto completado.
+
+El manifiesto completado declara como minimo:
+
+- ID unico del intento.
+- Version de origen y version objetivo.
+- Ruta del backup validado.
+- Validacion del backup completada.
+- Validacion canonica del esquema objetivo completada.
+- Comparacion source-specific completada.
+- Verificacion de eliminacion financiera y de valoraciones completada.
+
+La publicacion atomica del manifiesto completado funciona como atestacion durable; no se promete un hash que la implementacion no verifique.
+
+Un rollback restaura exactamente la version y contenido logico de origen: SQLite 8 para una fuente v8 y SQLite 12 para una fuente v12. En produccion se espera la segunda ruta; esa restauracion recupera los costos antiguos porque pertenecen al backup, aunque no formen parte de SQLite 13.
+
+## Contratos e IPC
+
+Se reemplaza el DTO manual generico por contratos separados:
+
+- `QuotePurchaseInput` / `CreatePurchaseInput`.
+- `QuoteStockCountInput` / `CreateStockCountInput`.
+- `QuotePurchasePriceCorrectionInput` / `ConfirmPurchasePriceCorrectionInput`.
+
+Rust es autoridad de dominio:
+
+- Una compra rechaza proveedor, factura o precio vacios.
+- Un conteo rechaza cualquier campo comercial.
+- Una compra respeta modo y conversion de presentacion.
+- Un conteo no acepta presentacion.
+- Todos los calculos usan enteros comprobados y limite seguro de JavaScript.
+
+`QuoteStockCountInput` y `CreateStockCountInput` contienen `adjustment_reason`; no exponen el enum persistido `reason`, precio, proveedor, factura ni presentacion.
 
 ## Orden de implementacion
 
-### Bloque 1: reconciliacion del plan y contratos
+### Bloque 1: contratos y plan
 
-- Sustituir el plan descartado.
-- Definir contratos finales Rust y TypeScript.
-- Mantener `measured` para gramos, mililitros y centimetros.
-- Restaurar campos de costo sin recuperar stock/costo inicial en Productos.
+- Marcar el modelo de costo acumulado como reemplazado.
+- Definir DTO separados de compra y conteo.
+- Definir campos persistidos exclusivos de compra.
+- Definir nueva version de intents.
 
-### Bloque 2: migracion 013 conservadora
+### Bloque 2: migracion 013 destructiva controlada
 
-- Reescribir 013 desde la definicion canonica de SQLite 12.
-- Ampliar solo los `CHECK` de unidad.
-- Preservar costos, relaciones, indices y secuencias.
-- Adaptar validacion canonica y snapshots pre/post.
+- Reescribir 013 desde SQLite 12.
+- Eliminar costos historicos.
+- Preservar datos no financieros.
+- Adaptar validacion canonica, snapshots, backup y restauracion.
+- Invalidar bases locales SQLite 13 con la forma descartada.
 
-### Bloque 3: productos y presentaciones
+### Bloque 3: compras
 
-- Crear siempre con stock y costo cero.
-- No crear movimiento inicial.
-- Completar selectores kilogramo, litro, metro u otra medida.
-- Mantener edicion, default y bloqueos historicos.
+- Implementar cotizacion y confirmacion.
+- Exigir precio, proveedor y factura.
+- Mantener presentaciones medidas y bases claras.
+- Guardar precio e importe solo en la compra.
+- Implementar idempotencia.
 
-### Bloque 4: inventario con costos
+### Bloque 4: conteos fisicos
 
-- Restaurar DTO, cotizacion y confirmacion v12.
-- Restaurar compras, ajustes, valoracion y estadisticas.
-- Mantener centimetros extremo a extremo.
-- Versionar intents locales.
+- Capturar stock real en unidad base.
+- Calcular diferencia y direccion.
+- Exigir motivo.
+- Rechazar conteo sin cambio.
+- Mantener transaccion y cotizacion obsoleta.
 
-### Bloque 5: ventas y checkout
+### Bloque 5: ventas y lecturas
 
-- Restaurar retiro proporcional de costo.
-- Restaurar distribucion por linea.
-- Restaurar snapshots contables en detalles y movimientos.
-- Mantener centimetros y calculos comerciales.
+- Retirar costo de checkout y detalles.
+- Simplificar estadisticas.
+- Actualizar historial global y por producto.
+- Mantener cantidades medidas y centimetros.
 
-### Bloque 6: correccion de compras
+### Bloque 5A: retiro transversal del modelo de costo
 
-- Implementar cotizacion read-only.
-- Implementar fingerprint del rango.
-- Implementar replay transaccional.
-- Actualizar costos de detalles de venta.
-- Agregar UI de correccion y estados de error.
+- Retirar `inventory_cost_cents`, `average_cost_cents`, estados y estadisticas de costo de modelos Rust y TypeScript del runtime objetivo.
+- Retirar `movement_cost_cents` de detalles, recibos, historial y UI de ventas.
+- Retirar helpers de retiro proporcional, distribucion de costo y replay sin consumidores.
+- Retirar variantes de valoracion y comandos manuales genericos.
+- Simplificar respuestas de correccion para que no informen ventas afectadas ni valor de inventario.
+- Actualizar README, QA y release activos para el modelo sin valoracion.
+- Crear `scripts/validate-retired-inventory-costs.mjs` con una allowlist explicita por simbolo y ruta.
+- Permitir nombres antiguos solamente en migraciones inmutables 001-012, preflight y proyecciones de origen v8/v12, backup/restore, pruebas explicitas de eliminacion y planes historicos marcados como reemplazados.
+- Agregar `test:retired-costs` a `pnpm test`; cualquier coincidencia fuera de la allowlist falla localmente y en CI.
 
-### Bloque 7: QA, limpieza y documentacion
+### Bloque 6: correccion de compra
+
+- Reemplazar replay por actualizacion local de precio e importe.
+- Mantener cotizacion, fingerprint, transaccion e idempotencia.
+- Limitar la accion a compras v3.
+
+### Bloque 7: interfaz e intents
+
+- Separar formularios de compra y conteo.
+- Agregar acciones con producto preseleccionado.
+- Retirar valoracion y controles de costo.
+- Versionar y recuperar intents sin confirmar formatos antiguos.
+- Adaptar escritorio, movil, teclado y foco.
+
+### Bloque 8: QA y release
 
 - Actualizar fixtures v8 y v12.
-- Actualizar runbook de release y rollback.
-- Buscar campos comerciales descartados.
-- Ejecutar auditorias independientes.
-- Ejecutar validacion end-to-end.
+- Incluir fixture con precio kilo capturado como precio gramo.
+- Confirmar que ningun costo antiguo llega a SQLite 13.
+- Probar backup y rollback a SQLite 12.
+- Actualizar runbooks y candidato exacto.
 
 ## Pruebas requeridas
 
-### Dominio medido
+### Compras
 
-- `piece + fixed` es valido.
-- `piece + measured` se rechaza para datos nuevos.
-- `gram + measured` es valido.
-- `gram + fixed` se rechaza para datos nuevos.
-- `milliliter + measured` es valido.
-- `milliliter + fixed` se rechaza para datos nuevos.
-- `centimeter + measured` es valido.
-- `centimeter + fixed` se rechaza.
-- Bases estandar 1000, 1000 y 100.
-- Otra medida positiva y segura para JavaScript.
+- Precio obligatorio y positivo.
+- Proveedor obligatorio y no vacio.
+- Factura obligatoria y no vacia.
+- Nota opcional.
+- Compra fija calcula cantidad e importe.
+- Compra medida por kg, L y m calcula importe half-up.
+- Compra directa usa precio por unidad base.
+- Importe total redondeado a cero se rechaza en cotizacion, creacion y correccion.
+- Stock aumenta exactamente una vez.
+- Reintento no duplica compra.
+- Cambio de stock o conversion invalida cotizacion.
+- Overflow revierte toda la operacion.
 
-### Productos
+### Conteos
 
-- Alta no muestra ni envia stock inicial.
-- Alta no muestra ni envia precio de compra.
-- Producto se crea con stock cero.
-- Producto se crea con costo acumulado cero.
-- No se crea movimiento inicial.
-- Edicion conserva presentaciones no modificadas.
-- Conversiones usadas permanecen bloqueadas.
-
-### Calculos comerciales
-
-- 250 g a precio por kilo.
-- 500 ml a precio por litro.
-- 75 cm a precio por metro.
-- Base personalizada de 100 g.
-- Base personalizada de 25 cm.
-- Redondeo half-up.
-- Proteccion de overflow.
-
-### Costos de inventario
-
-- Compra aumenta stock y costo.
-- Ajuste de entrada aumenta stock y costo.
-- Salida retira costo proporcional.
-- Agotar stock deja costo cero.
-- Costo desconocido conserva `NULL` correctamente.
-- Valoracion cambia costo sin cambiar stock.
-- Presentacion fija y medida calculan costo correctamente.
-- Cotizacion obsoleta si cambia stock, costo, conversion o precio.
-- Movimiento conserva proveedor, documento y nota.
+- Conteo mayor crea ajuste de entrada.
+- Conteo menor crea ajuste de salida.
+- Conteo cero puede agotar stock.
+- Conteo igual se rechaza sin escritura.
+- `adjustment_reason` obligatorio, persistido en `note` y `note_search_key`.
+- Precio, proveedor, factura y presentacion se rechazan.
+- Stock concurrente exige recotizar.
+- Piezas, gramos, mililitros y centimetros funcionan.
+- Reintento no duplica ajuste.
 
 ### Ventas
 
-- Checkout descuenta stock y costo.
-- Precio personalizado no altera costo retirado.
-- Descuento global no altera costo retirado.
-- Varias lineas del mismo producto distribuyen residuos.
-- `sale_details.movement_cost_cents` coincide con movimientos.
-- Venta en centimetros conserva snapshots y costo.
-- Fallo intermedio revierte venta, stock y costo.
+- Checkout descuenta stock sin consultar costos.
+- Varias lineas del mismo producto validan demanda agregada.
+- Precio personalizado y descuento se conservan.
+- Detalles y movimientos no contienen costo de venta.
+- Venta en centimetros conserva snapshots.
+- Fallo intermedio revierte venta y stock.
 
-### Correccion de compras
+### Correccion de compra
 
+- Solo compra manual v3 es elegible.
 - Cotizacion no escribe.
-- Compra sin movimientos posteriores se corrige.
-- Compra con entradas posteriores recalcula saldos.
-- Compra con ajustes de salida recalcula costo retirado.
-- Compra con una venta posterior actualiza detalle y movimiento.
-- Compra con varias lineas de venta distribuye residuos igual que checkout.
-- Precio personalizado y descuento comercial permanecen intactos.
-- Valoracion posterior corta el efecto sobre el saldo final.
-- Costo desconocido no se convierte en cero.
-- Movimiento v1 no reconstruible se rechaza.
+- Precio nuevo recalcula importe con conversion original.
+- Cantidad, stock y metadatos nunca cambian.
+- No se modifican ventas ni movimientos posteriores.
 - Fingerprint obsoleto exige recotizar.
-- Reintento de una correccion aplicada no duplica efectos.
-- Overflow o inconsistencia revierte toda la transaccion.
-- Cantidad, stock y totales comerciales nunca cambian.
+- Reintento aplicado es idempotente.
+- Compras historicas sin precio no son elegibles.
 
 ### Migracion
 
 - Base nueva termina en version 13.
-- Fixture v8 migra hasta 13.
-- Fixture v12 migra hasta 13.
-- Base v13 se abre sin migrar.
+- Fixture v8 migra a 13.
+- Fixture v12 migra a 13.
+- Base 13 objetivo reabre sin migrar.
 - Versiones 9 a 11 se rechazan.
-- Todos los costos conocidos y desconocidos se preservan literalmente.
-- IDs, relaciones, stock, ventas y secuencias se preservan.
-- No aparecen columnas comerciales descartadas.
-- `centimeter` es valido en productos, detalles y movimientos.
+- Costos historicos conocidos y `NULL` se eliminan.
+- Movimientos historicos de valoracion se eliminan y su secuencia no retrocede, incluso si contenian el ID mas alto.
+- El caso kilo capturado como gramo no aparece en el esquema objetivo.
+- Campos nuevos de compra quedan `NULL` para historia migrada.
+- Stock, cantidades, ventas, pagos, relaciones e IDs se preservan.
+- Secuencias se preservan.
+- Centimetros son validos en productos, detalles y movimientos.
 - Unidades desconocidas se rechazan.
-- Falla posterior conserva backup y marcador recuperable.
+- Backup SQLite 12 conserva el archivo original completo.
+- Rollback restaura literalmente la version de origen, v8 o v12.
+- Constraints SQL aceptan solamente la matriz v1/v2/v3 documentada.
 
 ### Interfaz
 
-- Selector `Kilogramo / Otra medida`.
-- Selector `Litro / Otra medida`.
-- Selector `Metro / Otra medida`.
-- Campo estandar bloqueado.
-- Campo personalizado editable.
-- Precio de compra disponible en Inventario, no en Productos.
-- Valoracion disponible.
-- Filtros y mensajes de costo restaurados.
-- Accion de correccion solo en compras elegibles.
-- Vista correcta en escritorio y movil.
-- Flujo accesible con teclado y foco restaurado.
-- Formatos de gramos, kilogramos, mililitros, litros, centimetros y metros.
+- No existe selector generico de operacion.
+- Compra muestra precio, proveedor y factura obligatorios.
+- Conteo no muestra datos comerciales.
+- No existe valoracion manual.
+- No aparecen costo promedio, valor a costo ni costo desconocido.
+- Compra y conteo pueden iniciarse desde el producto.
+- Historial distingue compra, ajuste y venta.
+- Vista movil no depende de una tabla ancha para acciones.
+- Teclado, foco, errores y estados pendientes son accesibles.
 
 ## Verificacion
 
@@ -841,6 +858,7 @@ Ejecutar como minimo:
 
 ```bash
 pnpm test
+pnpm test:retired-costs
 pnpm build
 cargo fmt --check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
@@ -849,72 +867,74 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 pnpm qa:migration-v8-v13
 ```
 
-Tambien se debe ejecutar el QA actualizado sobre:
+Tambien se debe ejecutar QA sobre:
 
 - Fixture v8.
-- Fixture v12 con costos conocidos y desconocidos.
-- Fixture v12 con ventas, ajustes y valoraciones posteriores a una compra corregible.
-- Copia cerrada y anonimizada de la base de produccion.
+- Fixture v12 con costos correctos, incorrectos y desconocidos.
+- Fixture v12 con ventas, ajustes, presentaciones y huecos de secuencia.
+- Copia cerrada y anonimizada de produccion.
+- Restauracion completa a la version de origen: v8 para fixture v8 y v12 para fixture/produccion v12.
 
 ## Criterios de aceptacion
 
-- Gramos, mililitros y centimetros solo crean presentaciones `measured`.
-- Kilo, litro y metro fijan sus bases sin permitir edicion.
-- Otra medida permite una base entera personalizada.
-- Centimetros funcionan de extremo a extremo.
-- Crear un producto no solicita stock ni costo inicial.
-- Crear un producto guarda stock y costo acumulado cero sin movimiento inicial.
-- Inventario solicita precio de compra para entradas.
-- Costo promedio, valor a costo, valoracion y costo de ventas funcionan como en SQLite 12.
-- No se pierde ninguna columna ni valor de costo al migrar.
-- La migracion 013 solo amplia las unidades persistidas con `centimeter`.
-- Una compra v2 puede corregir su precio sin cambiar cantidad ni stock.
-- La correccion recalcula todos los costos posteriores dependientes.
-- Los totales comerciales de ventas nunca cambian durante un replay.
-- Un replay inseguro o inconsistente se rechaza sin escrituras parciales.
-- Backup, marcador y restauracion funcionan desde esquemas 8 y 12.
-- Suite frontend, backend, release y QA terminan correctamente.
+- Registrar compra y ajustar existencias son flujos separados.
+- Una compra exige precio, proveedor y factura.
+- Un ajuste usa stock contado en unidad base y motivo obligatorio.
+- Ningun ajuste solicita o persiste datos comerciales.
+- No existe costo acumulado ni valoracion en esquema, backend o interfaz.
+- Checkout no calcula costo de venta.
+- Los precios historicos de SQLite 12 no se migran.
+- Las compras nuevas conservan precio e importe propios.
+- Corregir una compra no afecta ningun otro movimiento.
+- Stock, ventas cobradas, cantidades y relaciones se preservan al migrar.
+- El backup permite recuperar literalmente la version de origen; en produccion, SQLite 12.
+- Centimetros y presentaciones medidas siguen funcionando extremo a extremo.
+- Suites frontend, backend, migracion y release terminan correctamente.
 
 ## Riesgos y mitigaciones
 
-### Mutacion de historia sin auditoria
+### Perdida intencional de datos financieros
 
-La decision confirmada es no agregar una tabla de auditoria. La interfaz debe advertir que el precio anterior sera reemplazado y limitar la accion a usuarios autenticados y movimientos elegibles.
+La eliminacion es una decision de producto confirmada porque los costos de origen no son confiables. Se mitiga mediante:
 
-### Recalculo de costos de ventas cerradas
+- Backup obligatorio antes de migrar.
+- Manifiesto con ruta, version de origen y validacion completada del backup.
+- Rollback ensayado.
+- Aprobacion operativa previa al despliegue.
 
-La correccion cambia solamente el costo contable asociado a las ventas. No cambia precios, descuentos, pagos ni totales cobrados.
+### Confusion entre precio de compra y precio al cliente
 
-### Historial insuficiente
+Los nombres persistidos y visibles incluiran `purchase`. La interfaz mostrara explicitamente la base del precio y el importe total antes de confirmar.
 
-Movimientos v1 o cadenas inconsistentes pueden impedir un replay seguro. En ese caso se rechaza la correccion y se usa una valoracion manual para corregir solo el saldo vigente.
+### Conteo capturado en unidad incorrecta
 
-### Redondeo acumulado
+El conteo muestra una sola unidad base, sin presentaciones. La confirmacion muestra stock anterior, contado y diferencia.
 
-El replay reutiliza exactamente los helpers productivos de retiro proporcional y distribucion de residuos. No se implementa una segunda formula aproximada.
+### Intents antiguos
 
-### Concurrencia
+Nunca se reinterpretan automaticamente. Se consultan por token para detectar operaciones ya aplicadas y, si no existen, se exige nueva captura.
 
-Cotizacion y confirmacion estan separadas. La transaccion inmediata y el fingerprint impiden confirmar sobre un historial modificado.
+### Migracion 013 local incompatible
 
-### Migracion destructiva local descartada
-
-La implementacion local anterior de 013 no debe abrir produccion. Como produccion sigue en SQLite 12, la migracion puede reemplazarse antes de publicar. Si se detectara una base real en version 13, se debe detener el despliegue y recuperar los costos desde su backup v12 antes de continuar.
+La forma anterior de SQLite 13 no se soporta porque nunca llego a produccion. Los entornos de desarrollo deben eliminar y recrear sus bases.
 
 ## Despliegue
 
-1. Reemplazar la migracion 013 antes de abrir cualquier copia de produccion.
-2. Ejecutar suites y QA sintetico v8 y v12.
-3. Obtener una copia cerrada y anonimizada de produccion.
-4. Confirmar `PRAGMA user_version = 12` en la copia.
-5. Comparar costos, stock, ventas, detalles, movimientos y secuencias antes de migrar.
-6. Ejecutar preflight, backup y migracion sobre la copia.
-7. Confirmar igualdad literal de costos y relaciones despues de migrar.
-8. Probar productos, centimetros, compras, valoracion, POS y ventas.
-9. Probar una correccion de compra sobre otra copia desechable.
-10. Probar rollback al backup v12 con la version anterior.
-11. Generar y validar el artefacto candidato.
-12. Cerrar la aplicacion de produccion antes de instalar.
-13. Conservar el backup v12 durante el periodo operativo definido.
+La version local objetivo es `v0.2.1`. Permanecen pendientes la copia cerrada real, los gates del candidato, el rollback operativo, el tag y la publicacion.
 
-La migracion nunca se probara por primera vez sobre el archivo activo de produccion.
+1. Reemplazar migracion 013 y validadores antes de abrir una copia de produccion.
+2. Ejecutar suites y QA sintetico v8/v12.
+3. Obtener copia cerrada y anonimizada de produccion.
+4. Confirmar `PRAGMA user_version = 12`.
+5. Tomar snapshot de todos los datos no financieros que deben preservarse.
+6. Identificar los campos financieros que se eliminaran y obtener aprobacion operativa.
+7. Ejecutar preflight, backup y migracion sobre la copia.
+8. Confirmar ausencia de columnas y valores financieros antiguos.
+9. Confirmar igualdad literal de stock, ventas, cantidades, relaciones y secuencias.
+10. Probar compra, conteo, correccion de compra, POS y centimetros.
+11. Restaurar el backup SQLite 12 y comparar literalmente el archivo logico restaurado.
+12. Validar el candidato exacto en escritorio y movil.
+13. Cerrar produccion antes de instalar.
+14. Conservar el backup SQLite 12 durante el periodo operativo acordado.
+
+La primera prueba sobre datos reales se realiza siempre en una copia desechable, nunca sobre el archivo activo de produccion.

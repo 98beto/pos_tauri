@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const release = await readFile(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
@@ -81,14 +82,111 @@ test("loads privileged release logic from main after an unprivileged request", (
   assert.doesNotMatch(release, /^  push:/m);
   assert.match(release, /^  workflow_run:\n    workflows: \["Release request"\]/m);
   assert.match(release, /github\.event\.workflow_run\.conclusion == 'success'/);
-  assert.match(release, /ref: main/);
+  assert.match(release, /ref: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.sha \|\| 'main' \}\}/);
   assert.match(release, /REQUEST_SHA: \$\{\{ github\.event\.workflow_run\.head_sha \}\}/);
   assert.match(release, /Expected exactly one vX\.Y\.Z tag at \$sha/);
   assert.match(release, /git merge-base --is-ancestor "\$sha" origin\/main/);
   assert.match(release, /DISPATCH_REF.*github\.ref/);
   assert.match(release, /refs\/heads\/main/);
-  assert.match(release, /sha="\$\(git rev-parse origin\/main\^\{commit\}\)"/);
+  assert.match(release, /DISPATCH_SHA: \$\{\{ github\.sha \}\}/);
+  assert.match(release, /sha="\$DISPATCH_SHA"/);
+  assert.doesNotMatch(jobSection(release, "release-source"), /sha=.*git rev-parse origin\/main/);
   assert.match(release, /version="\$\(git show "\$sha:package\.json" \| jq -er \.version\)"/);
+});
+
+test("validate pins the dispatch SHA after main advances and keeps candidate_run_id selectable", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pos-release-dispatch-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const origin = path.join(root, "origin.git");
+  const writer = path.join(root, "writer");
+  const checkout = path.join(root, "checkout");
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "Release test",
+    GIT_AUTHOR_EMAIL: "release@example.invalid",
+    GIT_COMMITTER_NAME: "Release test",
+    GIT_COMMITTER_EMAIL: "release@example.invalid",
+    RUNNER_TEMP: root,
+    GITHUB_REPOSITORY: "fixture/pos",
+    GITHUB_OUTPUT: path.join(root, "source-output"),
+    GITHUB_RUN_ID: "123",
+    EVENT_NAME: "workflow_dispatch",
+    DISPATCH_REF: "refs/heads/main",
+    DISPATCH_MODE: "validate",
+    DISPATCH_TAG: "",
+    DISPATCH_CANDIDATE_RUN_ID: "",
+  };
+  const git = async (cwd, ...args) => (await execFileAsync("git", args, { cwd, env })).stdout.trim();
+  await git(root, "init", "--bare", "--initial-branch=main", origin);
+  await git(root, "clone", origin, writer);
+  await writeFile(path.join(writer, "package.json"), JSON.stringify({ version: "1.2.3" }));
+  await git(writer, "add", "package.json");
+  await git(writer, "commit", "-m", "Dispatched release");
+  await git(writer, "push", "origin", "main");
+  const dispatchSha = await git(writer, "rev-parse", "HEAD");
+  await git(root, "clone", origin, checkout);
+  await git(checkout, "checkout", "--detach", dispatchSha);
+
+  // Advance remote main after dispatch, including metadata that must not leak into the candidate.
+  await writeFile(path.join(writer, "package.json"), JSON.stringify({ version: "1.2.4" }));
+  await git(writer, "commit", "-am", "Advance main after dispatch");
+  await git(writer, "push", "origin", "main");
+  const advancedSha = await git(writer, "rev-parse", "HEAD");
+  const resolve = (sha) => execFileAsync("bash", ["-c", stepRunBlock(jobSection(release, "release-source"), "Resolve trusted release mode, tag, and immutable commit")], {
+    cwd: checkout, env: { ...env, DISPATCH_SHA: sha },
+  });
+  await resolve(dispatchSha);
+  assert.equal(await git(checkout, "rev-parse", "origin/main"), advancedSha);
+  assert.equal(await git(checkout, "rev-parse", "HEAD"), dispatchSha);
+  assert.equal(await readFile(env.GITHUB_OUTPUT, "utf8"), `mode=validate\ntag=v1.2.3\nsha=${dispatchSha}\n`);
+
+  await mkdir(path.join(checkout, "release-assets"));
+  for (let index = 0; index < 10; index++) {
+    await writeFile(path.join(checkout, "release-assets", `asset-${index}`), `approved bytes ${index}`);
+  }
+  await execFileAsync("bash", ["-c", stepRunBlock(release, "Record candidate provenance and exact publication hashes")], {
+    cwd: checkout, env: { ...env, SHA: dispatchSha, TAG: "v1.2.3" },
+  });
+  const provenance = JSON.parse(await readFile(path.join(checkout, "release-assets", "candidate-provenance.json"), "utf8"));
+  assert.equal(provenance.sha, dispatchSha);
+  assert.equal(provenance.tag, "v1.2.3");
+  assert.equal(provenance.artifact_name, `release-candidate-${dispatchSha}`);
+  assert.equal(provenance.validate_run_id, 123);
+
+  const bin = path.join(root, "bin");
+  await mkdir(bin);
+  // Mock only the API boundary; execute the workflow's actual candidate selector and jq predicates.
+  await writeFile(path.join(bin, "gh"), `#!${process.execPath}
+import assert from "node:assert/strict";
+const args = process.argv.slice(2);
+if (args[1] === "--paginate") {
+  assert.equal(args[2], "/repos/fixture/pos/actions/artifacts?name=" + process.env.ARTIFACT_NAME + "&per_page=100");
+  process.stdout.write("456\\t123\\n789\\t124\\n");
+} else {
+  assert.deepEqual(args, ["api", "/repos/fixture/pos/actions/runs/123"]);
+  process.stdout.write(JSON.stringify({ name: "Release", event: "workflow_dispatch", conclusion: "success", head_sha: process.env.DISPATCH_SHA }));
+}
+`, { mode: 0o755 });
+  const select = (sha, runId = "123") => execFileAsync("bash", ["-c", stepRunBlock(release, "Resolve the QA-approved validate artifact")], {
+    cwd: checkout,
+    env: {
+      ...env, PATH: `${bin}:${process.env.PATH}`, DISPATCH_SHA: dispatchSha,
+      EXPECTED_SHA: sha, ARTIFACT_NAME: provenance.artifact_name, REQUESTED_RUN_ID: runId,
+      GITHUB_OUTPUT: path.join(root, "candidate-output"),
+    },
+  });
+  await select(dispatchSha);
+  assert.equal(await readFile(path.join(root, "candidate-output"), "utf8"), "artifact_id=456\nvalidate_run_id=123\n");
+  await assert.rejects(select(advancedSha), /found 0/);
+  await assert.rejects(select(dispatchSha, "999"), /found 0/);
+
+  await assert.rejects(resolve("not-a-sha"), /Validate dispatch has an invalid SHA/);
+  await git(writer, "checkout", "--orphan", "outside-main");
+  await git(writer, "commit", "-m", "Unrelated history");
+  const outsideSha = await git(writer, "rev-parse", "HEAD");
+  await git(writer, "push", "origin", "outside-main");
+  await git(checkout, "fetch", "origin", "outside-main");
+  await assert.rejects(resolve(outsideSha));
 });
 
 test("exposes validate and publish modes while deriving validate metadata without releases", () => {
@@ -150,7 +248,139 @@ test("builds frontend before exposing signing secrets and protects privileged jo
 
 test("runs locked release-mode Rust tests in CI and the release gate", () => {
   const command = /cargo test --locked --release --manifest-path src-tauri\/Cargo\.toml/g;
-  assert.equal(occurrences(`${ci}\n${release}`, command), 2);
+  assert.equal(occurrences(`${ci}\n${release}`, command), 3);
+  assert.match(jobSection(ci, "windows-rust"), command);
+});
+
+test("proves maintenance mode is present in every installer payload", () => {
+  const linux = jobSection(release, "linux");
+  const nsis = jobSection(release, "windows-nsis");
+  const msi = jobSection(release, "windows-msi");
+
+  assert.match(linux, /verify-linux-maintenance-bundles\.sh "\$APPIMAGE" "\$DEB" "\$RPM"/);
+  const sanitize = linux.indexOf("- name: Sanitize final AppImage bytes");
+  const maintenance = linux.indexOf("- name: Prove maintenance mode is executable from final Linux bundles");
+  const sign = linux.indexOf("- name: Sign final Linux installer bytes");
+  assert.ok(sanitize < maintenance && maintenance < sign);
+  assert.match(linux, /sudo apt-get install[^\n]*rpm cpio/);
+  for (const windowsJob of [nsis, msi]) {
+    assert.doesNotMatch(windowsJob, /target\/release\/pos_tauri\.exe[^\n]*maintenance-info/);
+    assert.match(windowsJob, /Get-ChildItem[^\n]*\$payload[^\n]*-Recurse[^\n]*pos_tauri\.exe/);
+    assert.match(windowsJob, /\$executables\[0\]\.Length -eq 0/);
+    assert.match(windowsJob, /& \$executables\[0\]\.FullName maintenance-info/);
+  }
+  assert.match(nsis, /Start-Process[^\n]*\$installer\.FullName[^\n]*\/S[^\n]*\/D=\$payload[^\n]*-Wait -PassThru/);
+  assert.match(msi, /Start-Process[^\n]*msiexec\.exe[^\n]*-Wait -PassThru/);
+  assert.match(msi, /@\("\/a"[^\n]*"\/qn"[^\n]*"\/norestart"[^\n]*TARGETDIR/);
+});
+
+const maintenanceVerifier = fileURLToPath(new URL("./verify-linux-maintenance-bundles.sh", import.meta.url));
+const maintenanceOutput = "Linea POS 0.2.1: mantenimiento local disponible\n";
+
+async function maintenanceFixture(t) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pos maintenance bundles "));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, "tools");
+  await mkdir(bin);
+  async function executable(file, contents) {
+    await writeFile(file, `#!/usr/bin/env bash\nset -euo pipefail\n${contents}\n`, { mode: 0o755 });
+  }
+  for (const format of ["appimage", "deb", "rpm"]) {
+    await mkdir(path.join(root, format, "usr", "bin"), { recursive: true });
+    await executable(path.join(root, format, "usr", "bin", "pos_tauri"), `[[ $# == 1 && $1 == maintenance-info ]]
+printf '%s\\n' 'Linea POS 0.2.1: mantenimiento local disponible'`);
+  }
+  await executable(path.join(root, "appimage", "AppRun"), `printf 'AppRun\\n' >> "$FIXTURE_ROOT/launches"
+printf '%s' "\${LAUNCHER_PREFIX-}"
+"$FIXTURE_ROOT/appimage/usr/bin/pos_tauri" "$@"
+printf '%s' "\${LAUNCHER_SUFFIX-}"
+exit "\${LAUNCHER_STATUS-0}"`);
+  const appimage = path.join(root, "Linea POS.AppImage");
+  await executable(appimage, `case "\${1-}" in
+  --appimage-extract-and-run) shift; exec "$FIXTURE_ROOT/appimage/AppRun" "$@" ;;
+  --appimage-extract) mkdir squashfs-root; cp -a "$FIXTURE_ROOT/appimage/." squashfs-root/ ;;
+  *) exit 90 ;;
+esac`);
+  const deb = path.join(root, "Linea POS.deb");
+  const rpm = path.join(root, "Linea POS.rpm");
+  await writeFile(deb, "deb");
+  await writeFile(rpm, "rpm");
+  await executable(path.join(bin, "dpkg-deb"), `[[ $# == 3 && $1 == --extract && $2 == "$FIXTURE_ROOT/Linea POS.deb" ]]
+cp -a "$FIXTURE_ROOT/deb/." "$3/"`);
+  await executable(path.join(bin, "rpm2cpio"), `[[ $# == 1 && $1 == "$FIXTURE_ROOT/Linea POS.rpm" ]]
+printf 'rpm payload'`);
+  await executable(path.join(bin, "cpio"), `[[ $# == 2 && $1 == --extract && $2 == --quiet ]]
+[[ $(cat) == 'rpm payload' ]]
+cp -a "$FIXTURE_ROOT/rpm/." ./`);
+  return {
+    root,
+    run: (env = {}) => execFileAsync("bash", [maintenanceVerifier, appimage, deb, rpm], {
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_ROOT: root, ...env },
+    }),
+  };
+}
+
+test("Linux maintenance verifier executes the final AppImage through AppRun and checks all payloads", async (t) => {
+  const f = await maintenanceFixture(t);
+  await f.run();
+  assert.equal(await readFile(path.join(f.root, "launches"), "utf8"), "AppRun\n");
+});
+
+test("Linux maintenance verifier rejects a broken launcher even when its payload binary works", async (t) => {
+  const f = await maintenanceFixture(t);
+  const binary = path.join(f.root, "appimage", "usr", "bin", "pos_tauri");
+  assert.equal((await execFileAsync(binary, ["maintenance-info"])).stdout, maintenanceOutput);
+  await assert.rejects(f.run({ LAUNCHER_STATUS: "42" }), { code: 42 });
+  assert.equal(await readFile(path.join(f.root, "launches"), "utf8"), "AppRun\n");
+});
+
+test("Linux maintenance verifier requires exact AppImage stdout", async (t) => {
+  const f = await maintenanceFixture(t);
+  for (const env of [{ LAUNCHER_PREFIX: "unexpected\n" }, { LAUNCHER_SUFFIX: "\n" }]) {
+    await assert.rejects(f.run(env));
+  }
+});
+
+test("Linux maintenance verifier retains regular executable payload checks for every format", async (t) => {
+  for (const format of ["appimage", "deb", "rpm"]) {
+    for (const defect of ["missing", "symlink", "not executable", "extra output", "nonzero"]) {
+      await t.test(`${format}: ${defect}`, async (t) => {
+        const f = await maintenanceFixture(t);
+        const binary = path.join(f.root, format, "usr", "bin", "pos_tauri");
+        if (defect === "missing") await rm(binary);
+        if (defect === "symlink") {
+          const target = path.join(f.root, "payload executable");
+          await writeFile(target, await readFile(binary), { mode: 0o755 });
+          await rm(binary);
+          await symlink(target, binary);
+        }
+        if (defect === "not executable") await chmod(binary, 0o644);
+        if (defect === "extra output" || defect === "nonzero") {
+          await writeFile(binary, `${await readFile(binary, "utf8")}\n${defect === "extra output" ? "printf 'extra\\n'" : "exit 42"}\n`);
+        }
+        await assert.rejects(f.run());
+      });
+    }
+  }
+});
+
+test("Windows restore documentation preserves quoted paths and synchronous exit-code handling", async () => {
+  const docs = await readFile(new URL("../docs/releases.md", import.meta.url), "utf8");
+  const block = docs.match(/```powershell\n([\s\S]*?)```/)?.[1];
+  assert.ok(block);
+  const args = block.match(/^\$restoreArgs = '([^'\n]+)'$/m)?.[1];
+  assert.ok(args, "Start-Process needs a single argument string with literal quotes");
+  assert.match(args, /^restore-migration-backup --database "[^"\r\n]+" --backup "[^"\r\n]+"$/);
+  // These concrete paths contain spaces; outer PowerShell quotes alone do not survive ArgumentList.
+  const paths = [...args.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(paths.length, 2);
+  for (const value of paths) assert.match(value, /^C:\\[^\r\n]* [^\r\n]*\.db$/);
+  const commands = block.split("\n").filter((line) => line.includes("= Start-Process "));
+  assert.equal(commands.length, 2);
+  for (const command of commands) {
+    assert.match(command, /-ArgumentList \$restoreArgs -Wait -PassThru$/);
+  }
+  assert.equal(occurrences(block, /^\$result\.ExitCode$/gm), 2);
 });
 
 test("requires the SQLite 13 migration rehearsal in CI and the release gate", () => {
@@ -168,10 +398,11 @@ test("sanitizes, signs, verifies, and uploads exactly six Linux assets in order"
   const linux = jobSection(release, "linux");
   const build = linux.indexOf("- name: Build Linux installers");
   const sanitize = linux.indexOf("- name: Sanitize final AppImage bytes");
+  const maintenance = linux.indexOf("- name: Prove maintenance mode is executable from final Linux bundles");
   const sign = linux.indexOf("- name: Sign final Linux installer bytes");
   const verify = linux.indexOf("- name: Verify final Linux installer signatures");
   const upload = linux.indexOf("- name: Upload exactly six Linux release assets");
-  assert.ok(build < sanitize && sanitize < sign && sign < verify && verify < upload);
+  assert.ok(build < sanitize && sanitize < maintenance && maintenance < sign && sign < verify && verify < upload);
   assert.equal(stepRunBlock(linux, "Sanitize final AppImage bytes").trim(), 'scripts/sanitize-appimage.sh "$APPIMAGE"');
   assert.deepEqual(
     stepRunBlock(linux, "Sign final Linux installer bytes").trim().split("\n"),

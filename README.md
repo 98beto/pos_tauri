@@ -12,8 +12,8 @@ Linea POS guarda la información en una base de datos SQLite local y está dispo
 - Cálculo del efectivo recibido y el cambio a entregar.
 - Catálogo de productos organizado por marcas y categorías.
 - Presentaciones por pieza, paquete, peso, volumen o longitud, cada una con su propio precio y código de barras.
-- Control de existencias, compras, ajustes y valoración con costo acumulado, costo promedio y valor total a costo.
-- Corrección segura del precio de compras con recálculo cronológico de costos dependientes.
+- Control de existencias físicas mediante compras y conteos, con soporte para piezas, peso, volumen y longitud.
+- Precio e importe propios en cada compra, con corrección local que no modifica ventas, stock ni movimientos posteriores.
 - Consulta de movimientos y detalle histórico por producto.
 - Historial de tickets con filtros, totales y detalle de cada venta.
 - Configuración inicial y autenticación del propietario.
@@ -67,14 +67,23 @@ El modo de desarrollo no necesita claves de firma ni configuración de publicaci
 # Ejecutar la interfaz en el navegador
 pnpm dev
 
-# Ejecutar todas las pruebas de frontend y de los scripts de release
+# Ejecutar todas las pruebas, incluido el gate de símbolos financieros retirados
 pnpm test
+
+# Ejecutar de forma focalizada el gate del modelo sin valoración
+pnpm test:retired-costs
 
 # Comprobar tipos y generar el frontend de producción
 pnpm build
 
 # Ensayar migración, backup y restauración SQLite desde los esquemas 8 y 12 hasta el 13
 pnpm qa:migration-v8-v13
+
+# Comprobar el modo de mantenimiento del ejecutable instalado
+/usr/bin/pos_tauri maintenance-info
+
+# Restaurar el backup indicado por el manifiesto, con Linea POS cerrada
+/usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/pos-v12-before-v13-ID.db
 
 # Comprobar formato, lint y pruebas del backend
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -96,9 +105,11 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 
 La interfaz invoca comandos de Tauri definidos en Rust. Estos comandos aplican las reglas de negocio y persisten los datos en `pos.db`, dentro del directorio de datos de la aplicación.
 
+La restauración es un modo temprano del mismo ejecutable que incluyen los instaladores; no está expuesta como comando IPC ni en la interfaz y no inicializa Tauri. Las rutas deben ser absolutas, ambos archivos deben existir y ser distintos, el destino debe ser el `pos.db` canónico y el CLI rechaza la operación mientras la aplicación conserva el lock del directorio de datos. Solo acepta el backup identificado por un manifiesto v13 pendiente o completado de ese mismo directorio.
+
 ## Calidad y pruebas
 
-Además de las pruebas automatizadas, el proyecto incluye un ensayo reproducible de las rutas SQLite `8 -> 13` y `12 -> 13`. Verifica preservación literal de costos y datos comerciales, extensión exclusiva con centímetros, backup, marcadores, reapertura y restauración. Consulta [`docs/quality-assurance.md`](docs/quality-assurance.md).
+Además de las pruebas automatizadas, el proyecto incluye un ensayo reproducible de las rutas SQLite `8 -> 13` y `12 -> 13`. Verifica la eliminación intencional del modelo de valoración y de sus filas, la preservación literal de stock y datos comerciales, los fixtures v8/v12, centímetros, backup, marcadores, reapertura y rollback literal al esquema de origen. Consulta [`docs/quality-assurance.md`](docs/quality-assurance.md).
 
 ## Releases
 

@@ -280,8 +280,8 @@ fn assert_v13_data(connection: &Connection, before: &Value) -> Result<(), Box<dy
 
     let product_backfills = query_rows(
         connection,
-        "SELECT p.id,p.base_unit,p.inventory_cost_cents,pp.product_id,pp.name,pp.mode,pp.base_quantity,pp.price,pp.is_default,pp.is_active FROM products p JOIN product_presentations pp ON pp.product_id=p.id ORDER BY p.id",
-        10,
+        "SELECT p.id,p.base_unit,pp.product_id,pp.name,pp.mode,pp.base_quantity,pp.price,pp.is_default,pp.is_active FROM products p JOIN product_presentations pp ON pp.product_id=p.id ORDER BY p.id",
+        9,
     )?;
     assert_eq!(
         product_backfills,
@@ -289,7 +289,6 @@ fn assert_v13_data(connection: &Connection, before: &Value) -> Result<(), Box<dy
             vec![
                 json!(11),
                 json!("piece"),
-                Value::Null,
                 json!(11),
                 json!("Pieza"),
                 json!("fixed"),
@@ -301,7 +300,6 @@ fn assert_v13_data(connection: &Connection, before: &Value) -> Result<(), Box<dy
             vec![
                 json!(14),
                 json!("piece"),
-                json!(0),
                 json!(14),
                 json!("Pieza"),
                 json!("fixed"),
@@ -313,7 +311,6 @@ fn assert_v13_data(connection: &Connection, before: &Value) -> Result<(), Box<dy
             vec![
                 json!(20),
                 json!("piece"),
-                Value::Null,
                 json!(20),
                 json!("Pieza"),
                 json!("fixed"),
@@ -398,13 +395,20 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let backup = Connection::open_with_flags(&backup_files[0], OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_database(&backup, 8, true, &backup_files[0])?;
     assert_eq!(summary(&backup)?, before["summary"]);
-    let v8_snapshot = migration_snapshot(&backup, &backup_files[0], 8)?;
+    let v8_snapshot = migration_source_snapshot(&backup, &backup_files[0], 8)?;
     drop(backup);
     let manifest: MigrationManifest = serde_json::from_slice(&fs::read(&completed_files[0])?)?;
     assert_eq!(manifest.source_version, 8);
     assert_eq!(manifest.target_version, 13);
     assert_eq!(manifest.backup_path, backup_files[0]);
     assert!(manifest.created_at_unix_seconds > 0);
+    let completed: CompletedMigrationManifest =
+        serde_json::from_slice(&fs::read(&completed_files[0])?)?;
+    assert!(completed.migration.backup_validation_completed);
+    assert!(completed.canonical_target_validation_completed);
+    assert!(completed.source_specific_comparison_completed);
+    assert!(completed.financial_and_valuation_removal_verified);
+    assert_eq!(completed.removed_valuation_row_count, 0);
     assert_eq!(
         completed_files[0],
         runtime.join(format!(
@@ -419,7 +423,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let reopened = open_database_path(&runtime, &database_path)?;
     assert_v13_data(&reopened, &before)?;
     assert_eq!(
-        migration_snapshot(&reopened, &database_path, 8)?,
+        migration_target_snapshot(&reopened, &database_path, 8)?,
         v8_snapshot
     );
     assert_eq!(matching_files(&runtime, "pos-v8-before-v13-").len(), 1);
@@ -435,14 +439,13 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let v8_after_summary = summary(&reopened)?;
     drop(reopened);
 
-    let v8_restore_runtime = root.join("runtime-v8-restore");
-    fs::create_dir(&v8_restore_runtime)?;
-    let v8_restore_database = v8_restore_runtime.join("pos.db");
-    fs::copy(&database_path, &v8_restore_database)?;
+    fs::copy(&database_path, root.join("after-v8-v13-before-restore.db"))?;
+    let v8_restore_runtime = runtime.clone();
+    let v8_restore_database = database_path.clone();
     let v8_restored =
         restore_migration_backup(&v8_restore_runtime, &v8_restore_database, &backup_files[0])?;
     assert_eq!(
-        migration_snapshot(&v8_restored, &v8_restore_database, 8)?,
+        migration_source_snapshot(&v8_restored, &v8_restore_database, 8)?,
         v8_snapshot
     );
     assert_eq!(summary(&v8_restored)?, before["summary"]);
@@ -469,7 +472,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         Connection::open_with_flags(&v8_restore_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_database(&v8_restored_reopened, 8, true, &v8_restore_database)?;
     assert_eq!(
-        migration_snapshot(&v8_restored_reopened, &v8_restore_database, 8)?,
+        migration_source_snapshot(&v8_restored_reopened, &v8_restore_database, 8)?,
         v8_snapshot
     );
     assert_eq!(summary(&v8_restored_reopened)?, before["summary"]);
@@ -503,7 +506,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let v12_before_path = root.join("before-v12.db");
     create_v12_database(&v12_before_path);
     let v12_before = Connection::open(&v12_before_path)?;
-    let v12_snapshot = migration_snapshot(&v12_before, &v12_before_path, 12)?;
+    let v12_snapshot = migration_source_snapshot(&v12_before, &v12_before_path, 12)?;
     let v12_financial_before = query_rows(
         &v12_before,
         "SELECT (SELECT group_concat(id||':'||quote(inventory_cost_cents),'|') FROM products ORDER BY id),(SELECT group_concat(id||':'||quote(movement_cost_cents),'|') FROM sale_details ORDER BY id),(SELECT group_concat(id||':'||quote(unit_price_cents)||':'||quote(movement_cost_cents)||':'||quote(inventory_cost_before_cents)||':'||quote(inventory_cost_after_cents),'|') FROM inventory_movements ORDER BY id)",
@@ -517,17 +520,20 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     fs::copy(&v12_before_path, &v12_database_path)?;
     let v12_after = open_database_path(&v12_runtime, &v12_database_path)?;
     assert_eq!(
-        migration_snapshot(&v12_after, &v12_database_path, 12)?,
+        migration_target_snapshot(&v12_after, &v12_database_path, 12)?,
         v12_snapshot
     );
     validate_database(&v12_after, 13, true, &v12_database_path)?;
     assert_v13_unit_domains(&v12_after)?;
     let v12_financial_after = query_rows(
         &v12_after,
-        "SELECT (SELECT group_concat(id||':'||quote(inventory_cost_cents),'|') FROM products ORDER BY id),(SELECT group_concat(id||':'||quote(movement_cost_cents),'|') FROM sale_details ORDER BY id),(SELECT group_concat(id||':'||quote(unit_price_cents)||':'||quote(movement_cost_cents)||':'||quote(inventory_cost_before_cents)||':'||quote(inventory_cost_after_cents),'|') FROM inventory_movements ORDER BY id)",
-        3,
+        "SELECT (SELECT count(*) FROM pragma_table_info('products') WHERE name='inventory_cost_cents'),(SELECT count(*) FROM pragma_table_info('sale_details') WHERE name='movement_cost_cents'),(SELECT count(*) FROM pragma_table_info('inventory_movements') WHERE name IN ('unit_price_cents','movement_cost_cents','inventory_cost_before_cents','inventory_cost_after_cents')),(SELECT count(*) FROM inventory_movements WHERE reason='valoracion' OR type='valoracion'),(SELECT count(*) FROM inventory_movements WHERE record_version IN (1,2) AND (purchase_unit_price_cents IS NOT NULL OR purchase_total_cents IS NOT NULL))",
+        5,
     )?;
-    assert_eq!(v12_financial_after, v12_financial_before);
+    assert_eq!(
+        v12_financial_after,
+        vec![vec![json!(0), json!(0), json!(0), json!(0), json!(0)]]
+    );
     let v12_backups = matching_files(&v12_runtime, "pos-v12-before-v13-");
     let v12_manifests = matching_files(&v12_runtime, "pos-schema-v13-migration-completed-");
     assert_eq!(v12_backups.len(), 1);
@@ -536,8 +542,16 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         Connection::open_with_flags(&v12_backups[0], OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_database(&v12_backup, 12, true, &v12_backups[0])?;
     assert_eq!(
-        migration_snapshot(&v12_backup, &v12_backups[0], 12)?,
+        migration_source_snapshot(&v12_backup, &v12_backups[0], 12)?,
         v12_snapshot
+    );
+    assert_eq!(
+        query_rows(
+            &v12_backup,
+            "SELECT (SELECT group_concat(id||':'||quote(inventory_cost_cents),'|') FROM products ORDER BY id),(SELECT group_concat(id||':'||quote(movement_cost_cents),'|') FROM sale_details ORDER BY id),(SELECT group_concat(id||':'||quote(unit_price_cents)||':'||quote(movement_cost_cents)||':'||quote(inventory_cost_before_cents)||':'||quote(inventory_cost_after_cents),'|') FROM inventory_movements ORDER BY id)",
+            3,
+        )?,
+        v12_financial_before
     );
     drop(v12_backup);
     let v12_manifest: MigrationManifest = serde_json::from_slice(&fs::read(&v12_manifests[0])?)?;
@@ -547,6 +561,13 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(v12_manifest.backup_path, v12_backups[0]);
     assert!(v12_manifest.created_at_unix_seconds > 0);
+    let v12_completed: CompletedMigrationManifest =
+        serde_json::from_slice(&fs::read(&v12_manifests[0])?)?;
+    assert!(v12_completed.migration.backup_validation_completed);
+    assert!(v12_completed.canonical_target_validation_completed);
+    assert!(v12_completed.source_specific_comparison_completed);
+    assert!(v12_completed.financial_and_valuation_removal_verified);
+    assert_eq!(v12_completed.removed_valuation_row_count, 2);
     assert_eq!(
         v12_manifests[0],
         v12_runtime.join(format!(
@@ -560,7 +581,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let v12_manifest_bytes = fs::read(&v12_manifests[0])?;
     let v12_reopened = open_database_path(&v12_runtime, &v12_database_path)?;
     assert_eq!(
-        migration_snapshot(&v12_reopened, &v12_database_path, 12)?,
+        migration_target_snapshot(&v12_reopened, &v12_database_path, 12)?,
         v12_snapshot
     );
     validate_database(&v12_reopened, 13, true, &v12_database_path)?;
@@ -568,10 +589,10 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         query_rows(
             &v12_reopened,
-            "SELECT (SELECT group_concat(id||':'||quote(inventory_cost_cents),'|') FROM products ORDER BY id),(SELECT group_concat(id||':'||quote(movement_cost_cents),'|') FROM sale_details ORDER BY id),(SELECT group_concat(id||':'||quote(unit_price_cents)||':'||quote(movement_cost_cents)||':'||quote(inventory_cost_before_cents)||':'||quote(inventory_cost_after_cents),'|') FROM inventory_movements ORDER BY id)",
-            3,
+            "SELECT count(*) FROM inventory_movements WHERE reason='valoracion' OR type='valoracion'",
+            1,
         )?,
-        v12_financial_before
+        vec![vec![json!(0)]]
     );
     assert_eq!(matching_files(&v12_runtime, "pos-v12-before-v13-").len(), 1);
     assert_eq!(
@@ -585,14 +606,24 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let v12_integrity = integrity(&v12_reopened)?;
     drop(v12_reopened);
 
-    let restore_runtime = root.join("runtime-v12-restore");
-    fs::create_dir(&restore_runtime)?;
-    let restore_database = restore_runtime.join("pos.db");
-    fs::copy(&v12_database_path, &restore_database)?;
+    fs::copy(
+        &v12_database_path,
+        root.join("after-v12-v13-before-restore.db"),
+    )?;
+    let restore_runtime = v12_runtime.clone();
+    let restore_database = v12_database_path.clone();
     let restored = restore_migration_backup(&restore_runtime, &restore_database, &v12_backups[0])?;
     assert_eq!(
-        migration_snapshot(&restored, &restore_database, 12)?,
+        migration_source_snapshot(&restored, &restore_database, 12)?,
         v12_snapshot
+    );
+    assert_eq!(
+        query_rows(
+            &restored,
+            "SELECT (SELECT group_concat(id||':'||quote(inventory_cost_cents),'|') FROM products ORDER BY id),(SELECT group_concat(id||':'||quote(movement_cost_cents),'|') FROM sale_details ORDER BY id),(SELECT group_concat(id||':'||quote(unit_price_cents)||':'||quote(movement_cost_cents)||':'||quote(inventory_cost_before_cents)||':'||quote(inventory_cost_after_cents),'|') FROM inventory_movements ORDER BY id)",
+            3,
+        )?,
+        v12_financial_before
     );
     assert_eq!(
         integrity(&restored)?,
@@ -625,7 +656,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         Connection::open_with_flags(quarantined_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_database(&quarantined, 13, true, quarantined_database)?;
     assert_eq!(
-        migration_snapshot(&quarantined, quarantined_database, 12)?,
+        migration_target_snapshot(&quarantined, quarantined_database, 12)?,
         v12_snapshot
     );
     drop(quarantined);
@@ -635,7 +666,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         Connection::open_with_flags(&restore_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_database(&restored_reopened, 12, true, &restore_database)?;
     assert_eq!(
-        migration_snapshot(&restored_reopened, &restore_database, 12)?,
+        migration_source_snapshot(&restored_reopened, &restore_database, 12)?,
         v12_snapshot
     );
     assert_eq!(
@@ -652,12 +683,12 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         "backup": v12_backups[0],
         "completed_manifest": v12_manifests[0],
         "financial_values_before": v12_financial_before,
-        "financial_values_after": v12_financial_after,
+        "financial_retirement_after": v12_financial_after,
         "integrity": v12_integrity,
         "restore_runtime": restore_runtime,
         "restore_completed_manifest": restore_completed[0],
         "backup_count_after_second_open": 1,
-        "verified": ["productive open_database_path", "canonical v12 preflight", "literal retained-field snapshot", "known and unknown cost preservation", "correction-ready purchase/adjustment/sale/valuation chronology", "centimeter in all persisted unit domains", "unknown unit rejection", "intermediate version rejection", "validated v12 backup", "completed migration manifest", "no pending marker", "idempotent second open", "complete v12 restore snapshot", "durable v12 restore manifest", "v12 restore reopen", "verified quarantine", "preserved v12 backup"]
+        "verified": ["productive open_database_path", "canonical v12 preflight", "literal retained-field snapshot", "financial column removal", "historical purchase prices not copied", "valuation removal", "centimeter in all persisted unit domains", "unknown unit rejection", "intermediate version rejection", "validated v12 backup", "attested completed migration manifest", "no pending marker", "idempotent second open", "complete v12 restore snapshot including financial history", "durable v12 restore manifest", "v12 restore reopen", "verified quarantine", "preserved v12 backup"]
     });
     fs::write(
         root.join("result-v12-v13.json"),

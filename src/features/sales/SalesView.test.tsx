@@ -80,7 +80,6 @@ function detailWithPresentations(): SaleHistoryDetail {
         entered_quantity: 2,
         base_consumed: 500,
         unit_price: 4500,
-        movement_cost_cents: 1800,
         subtotal: 9000,
       },
       {
@@ -98,7 +97,6 @@ function detailWithPresentations(): SaleHistoryDetail {
         entered_quantity: 250,
         base_consumed: 250,
         unit_price: 12000,
-        movement_cost_cents: 600,
         subtotal: 3000,
       },
       {
@@ -116,7 +114,6 @@ function detailWithPresentations(): SaleHistoryDetail {
         entered_quantity: 1,
         base_consumed: 1,
         unit_price: 500,
-        movement_cost_cents: null,
         subtotal: null,
       },
     ],
@@ -147,7 +144,6 @@ function lengthDetail(): SaleHistoryDetail {
       unit_price: 2_000,
       entered_quantity: 75,
       base_consumed: 75,
-      movement_cost_cents: 600,
       subtotal: 1_500,
     }],
   };
@@ -280,9 +276,7 @@ describe("SalesView", () => {
     expect(dialog.textContent).toContain("$120.00 por 500 g");
     expect(dialog.textContent).toContain("Aplicado: $45.00 por Bolsa 250 g");
     expect(dialog.textContent).toContain("Catalogo: $50.00 por Bolsa 250 g");
-    expect(dialog.textContent).toContain("Costo de inventario");
-    expect(dialog.textContent).toContain("$18.00");
-    expect(dialog.textContent).toContain("Desconocido");
+    expect(dialog.textContent).not.toMatch(/costo de inventario|costo desconocido/i);
     expect(dialog.textContent).toContain("Sin presentacion registrada");
     expect(dialog.textContent).toContain("No representable");
     expect(dialog.textContent).toContain("Subtotal$125.00");
@@ -307,8 +301,7 @@ describe("SalesView", () => {
     expect(dialog.textContent).toContain("75 cm");
     expect(dialog.textContent).toContain("Aplicado: $20.00 por metro");
     expect(dialog.textContent).toContain("Catalogo: $25.00 por metro");
-    expect(dialog.textContent).toContain("Costo de inventario");
-    expect(dialog.textContent).toContain("$6.00");
+    expect(dialog.textContent).not.toMatch(/costo de inventario|costo desconocido/i);
     expect(dialog.textContent).toContain("$15.00");
     expect(dialog.textContent).toContain("Subtotal$15.00");
     expect(dialog.textContent).toContain("Descuento fijo-$1.50");
@@ -339,8 +332,7 @@ describe("SalesView", () => {
     const dialog = screen.getByRole("dialog");
     expect(dialog.textContent).toContain("Aplicado: $20.00 · base no disponible");
     expect(dialog.textContent).toContain("Catalogo: $25.00 · base no disponible");
-    expect(dialog.textContent).toContain("Costo de inventario");
-    expect(dialog.textContent).toContain("$6.00");
+    expect(dialog.textContent).not.toMatch(/costo de inventario|costo desconocido/i);
     expect(dialog.textContent).toContain("$15.00");
     expect(dialog.textContent).not.toContain("por 0");
   });

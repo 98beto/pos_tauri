@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   clearPendingManualMovement,
+  manualMovementLookupInput,
   manualMovementInput,
   readPendingManualMovement,
   replacePendingManualMovement,
   savePendingManualMovement,
   type PendingManualMovementV2,
-  type PendingManualMovementV3,
-  type PendingManualMovementV4,
+  type PendingPurchaseV5,
+  type PendingStockCountV5,
 } from "./manual-movement-intent";
 
-function intentV2(userId: number, token = `token-v2-${userId}`): PendingManualMovementV2 {
+function legacyIntent(userId: number, token = `legacy-${userId}`): PendingManualMovementV2 {
   return {
     version: 2,
     userId,
@@ -28,102 +29,134 @@ function intentV2(userId: number, token = `token-v2-${userId}`): PendingManualMo
   };
 }
 
-function intentV3(userId: number, token = `token-v3-${userId}`): PendingManualMovementV3 {
+function purchaseIntent(userId: number, token = `purchase-${userId}`): PendingPurchaseV5 {
   return {
-    version: 3,
+    version: 5,
+    kind: "purchase",
     userId,
     operationToken: token,
     productId: 11,
     presentationId: 101,
-    reason: "compra",
-    type: "entrada",
     quantity: "3",
+    purchaseUnitPrice: "12.50",
     supplier: "Proveedor",
     documentReference: "FAC-9",
     note: "Entrega completa",
-    quoteFingerprint: "inventory-quote-v3:new",
+    quoteFingerprint: "purchase-quote-v3:new",
   };
 }
 
-function intentV4(userId: number, token = `token-v4-${userId}`): PendingManualMovementV4 {
+function stockCountIntent(userId: number, token = `count-${userId}`): PendingStockCountV5 {
   return {
-    version: 4,
+    version: 5,
+    kind: "stock_count",
     userId,
     operationToken: token,
     productId: 11,
-    presentationId: 101,
-    reason: "compra",
-    type: "entrada",
-    quantity: "3",
-    unitPrice: "12.50",
-    supplier: "Proveedor",
-    documentReference: "FAC-9",
-    note: "Entrega completa",
-    quoteFingerprint: "inventory-quote-v4:new",
+    countedStock: "275",
+    adjustmentReason: "Conteo mensual",
+    quoteFingerprint: "stock-count-quote-v3:new",
   };
 }
 
 describe("manual movement intent storage", () => {
-  it("round-trips v4 including purchase price and maps the backend input", () => {
-    const pending = intentV4(3);
+  it("round-trips a purchase and maps the exact backend input", () => {
+    const pending = purchaseIntent(3);
     savePendingManualMovement(pending);
     expect(readPendingManualMovement(3)).toEqual(pending);
     expect(manualMovementInput(pending)).toEqual({
       product_id: 11,
       presentation_id: 101,
-      reason: "compra",
-      type: "entrada",
       quantity: "3",
-      unit_price: "12.50",
+      purchase_unit_price: "12.50",
       supplier: "Proveedor",
       document_reference: "FAC-9",
       note: "Entrega completa",
-      operation_token: "token-v4-3",
-      quote_fingerprint: "inventory-quote-v4:new",
+      operation_token: "purchase-3",
+      quote_fingerprint: "purchase-quote-v3:new",
     });
   });
 
-  it("loads v2 context and replaces it atomically with reviewed v4", () => {
-    const legacy = intentV2(4, "same-token");
-    const replacement = intentV4(4, "same-token");
-    savePendingManualMovement(legacy);
-    expect(readPendingManualMovement(4)).toEqual(legacy);
-    expect(replacePendingManualMovement(legacy, replacement)).toBe(true);
-    expect(readPendingManualMovement(4)).toEqual(replacement);
-    expect(readPendingManualMovement(4)).toEqual(replacement);
+  it("round-trips a stock count without commercial fields", () => {
+    const pending = stockCountIntent(4);
+    savePendingManualMovement(pending);
+    expect(readPendingManualMovement(4)).toEqual(pending);
+    expect(manualMovementInput(pending)).toEqual({
+      product_id: 11,
+      counted_stock: "275",
+      adjustment_reason: "Conteo mensual",
+      operation_token: "count-4",
+      quote_fingerprint: "stock-count-quote-v3:new",
+    });
   });
 
-  it("loads discarded no-cost v3 only as recovery context", () => {
-    const legacy = intentV3(6);
-    savePendingManualMovement(legacy);
-    expect(readPendingManualMovement(6)).toEqual(legacy);
-  });
-
-  it("loads v1 as recoverable context but manualMovementInput only accepts v3", () => {
-    const legacy = { version: 1 as const, userId: 5, operationToken: "v1", productId: 12, reason: "ajuste" as const, type: "salida" as const, quantity: "2" };
+  it("loads legacy context but never converts it to a confirmable input", () => {
+    const legacy = legacyIntent(5, "same-token");
     savePendingManualMovement(legacy);
     expect(readPendingManualMovement(5)).toEqual(legacy);
+    expect(() => manualMovementInput(legacy)).toThrow(/quoted again/);
+    expect(manualMovementLookupInput(legacy)).toEqual({ operation_token: "same-token" });
+
+    const replacement = purchaseIntent(5, "same-token");
+    expect(replacePendingManualMovement(legacy, replacement)).toBe(true);
+    expect(readPendingManualMovement(5)).toEqual(replacement);
+  });
+
+  it("does not recover retired valuation intents", () => {
+    localStorage.setItem(
+      "pos.inventory-movement-intent.user.13",
+      JSON.stringify({ ...legacyIntent(13), reason: "valoracion", type: "valoracion" }),
+    );
+    expect(readPendingManualMovement(13)).toBeNull();
+  });
+
+  it("uses only the token to check a lost response and supports an absent lookup", async () => {
+    const lookup = async ({ operation_token }: { operation_token: string }) =>
+      operation_token === "applied" ? { id: 41 } : null;
+
+    await expect(lookup(manualMovementLookupInput(legacyIntent(12, "applied"))))
+      .resolves.toEqual({ id: 41 });
+    await expect(lookup(manualMovementLookupInput(legacyIntent(12, "absent"))))
+      .resolves.toBeNull();
+  });
+
+  it("rejects cross-kind fields in persisted v5 records", () => {
+    localStorage.setItem(
+      "pos.inventory-movement-intent.user.6",
+      JSON.stringify({ ...stockCountIntent(6), supplier: "No permitido" }),
+    );
+    expect(readPendingManualMovement(6)).toBeNull();
   });
 
   it("only clears the matching user and token", () => {
-    savePendingManualMovement(intentV4(7, "current"));
+    savePendingManualMovement(purchaseIntent(7, "current"));
     expect(clearPendingManualMovement(7, "old")).toBe("mismatch");
     expect(clearPendingManualMovement(7, "current")).toBe("cleared");
     expect(clearPendingManualMovement(7, "current")).toBe("absent");
   });
 
   it("does not overwrite a concurrently changed local record", () => {
-    const legacy = intentV2(8, "token");
+    const legacy = legacyIntent(8, "token");
     savePendingManualMovement(legacy);
-    savePendingManualMovement(intentV4(8, "other-token"));
-    expect(replacePendingManualMovement(legacy, intentV4(8, "token"))).toBe(false);
+    localStorage.setItem("pos.inventory-movement-intent.user.8", JSON.stringify(stockCountIntent(8, "other-token")));
+    expect(replacePendingManualMovement(legacy, purchaseIntent(8, "token"))).toBe(false);
     expect(readPendingManualMovement(8)?.operationToken).toBe("other-token");
   });
 
   it("ignores corrupt and cross-user records", () => {
     localStorage.setItem("pos.inventory-movement-intent.user.9", "{invalid");
-    localStorage.setItem("pos.inventory-movement-intent.user.10", JSON.stringify(intentV4(11)));
+    localStorage.setItem("pos.inventory-movement-intent.user.10", JSON.stringify(purchaseIntent(11)));
     expect(readPendingManualMovement(9)).toBeNull();
     expect(readPendingManualMovement(10)).toBeNull();
+  });
+
+  it("rejects a different token until the original is resolved", () => {
+    const original = purchaseIntent(14);
+    savePendingManualMovement(original);
+    expect(() => savePendingManualMovement(stockCountIntent(14))).toThrow(/pendiente/);
+    expect(readPendingManualMovement(14)).toEqual(original);
+    expect(clearPendingManualMovement(14, original.operationToken)).toBe("cleared");
+    savePendingManualMovement(stockCountIntent(14));
+    expect(readPendingManualMovement(14)).toEqual(stockCountIntent(14));
   });
 });
