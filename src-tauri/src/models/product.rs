@@ -50,6 +50,7 @@ impl TryFrom<&str> for BaseUnit {
 #[derive(Debug, Serialize)]
 pub struct Product {
     pub id: i64,
+    pub is_active: bool,
     pub name: String,
     pub price: i64,
     pub stock: i64,
@@ -101,8 +102,19 @@ pub struct ProductCodeMatch {
     pub presentation_id: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProductStatus {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ProductViewFilters {
+    #[serde(default)]
+    pub status: ProductStatus,
     pub search: Option<String>,
     pub brand_id: Option<i64>,
     pub category_id: Option<i64>,
@@ -111,6 +123,7 @@ pub struct ProductViewFilters {
 #[derive(Debug, Serialize)]
 pub struct ProductViewRow {
     pub id: i64,
+    pub is_active: bool,
     pub name: String,
     pub price: i64,
     pub stock: i64,

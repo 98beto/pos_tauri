@@ -77,6 +77,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::cash::get_cash_state,
+            commands::cash::list_cash_sessions,
+            commands::cash::get_cash_session_detail,
+            commands::cash::open_cash_session,
+            commands::cash::cash_income,
+            commands::cash::cash_withdraw,
+            commands::cash::close_cash_session,
             commands::auth::owner_exists,
             commands::auth::initialize_owner,
             commands::auth::login,
@@ -104,6 +111,9 @@ pub fn run() {
             commands::categories::create_category,
             commands::categories::update_category,
             commands::products::list_products,
+            commands::products::get_product,
+            commands::products::archive_product,
+            commands::products::restore_product,
             commands::products::get_products_view,
             commands::products::list_product_selector,
             commands::products::find_product_by_sku,

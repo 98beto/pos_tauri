@@ -1,5 +1,6 @@
 pub mod brand;
 pub mod cart;
+pub mod cash;
 pub mod category;
 pub mod inventory_movement;
 pub mod product;

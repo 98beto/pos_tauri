@@ -5,8 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use crate::models::{
     product::{
         BaseUnit, CreateProductWithPresentationsInput, Product, ProductCodeMatch,
-        ProductCodeMatchKind, ProductSelectorFilters, ProductSelectorRow, ProductView,
-        ProductViewFilters, ProductViewRow, ProductViewStats, UpdateProductWithPresentationsInput,
+        ProductCodeMatchKind, ProductSelectorFilters, ProductSelectorRow, ProductStatus,
+        ProductView, ProductViewFilters, ProductViewRow, ProductViewStats,
+        UpdateProductWithPresentationsInput,
     },
     product_presentation::{
         CreateProductPresentationInput, PresentationMode, ProductPresentation,
@@ -305,11 +306,11 @@ fn load_product(
     active_presentations_only: bool,
 ) -> ServiceResult<Product> {
     let data = connection.query_row(
-        "SELECT id, name, price, stock, sku, brand_id, category_id, created_at, updated_at, base_unit
+        "SELECT id, name, price, stock, sku, brand_id, category_id, created_at, updated_at, base_unit, is_active
          FROM products WHERE id = ?1", [id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?, row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?, parse_base_unit(row.get(9)?)?))
+                row.get::<_, String>(8)?, parse_base_unit(row.get(9)?)?, row.get::<_, bool>(10)?))
         },
     ).map_err(|error| match error {
         rusqlite::Error::QueryReturnedNoRows => ServiceError::not_found("PRODUCT_NOT_FOUND", "Producto no encontrado"),
@@ -327,6 +328,7 @@ fn load_product(
             )
         })?;
     Ok(Product {
+        is_active: data.10,
         id: data.0,
         name: data.1,
         price: data.2,
@@ -344,6 +346,43 @@ fn load_product(
 }
 
 pub fn list(connection: &Connection) -> ServiceResult<Vec<Product>> {
+    Ok(list_all(connection)?
+        .into_iter()
+        .filter(|p| p.is_active)
+        .collect())
+}
+
+pub fn get(connection: &Connection, id: i64) -> ServiceResult<Product> {
+    validate_id(id)?;
+    load_product(connection, id, false)
+}
+
+pub(crate) fn ensure_active(connection: &Connection, id: i64) -> ServiceResult<()> {
+    let active = connection
+        .query_row("SELECT is_active FROM products WHERE id=?1", [id], |row| {
+            row.get::<_, bool>(0)
+        })
+        .optional()?
+        .ok_or_else(|| ServiceError::not_found("PRODUCT_NOT_FOUND", "Producto no encontrado"))?;
+    if !active {
+        return Err(ServiceError::conflict(
+            "PRODUCT_ARCHIVED",
+            "El producto esta archivado; restaurelo para operar",
+        ));
+    }
+    Ok(())
+}
+
+pub fn set_active(connection: &mut Connection, id: i64, active: bool) -> ServiceResult<Product> {
+    validate_id(id)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute("UPDATE products SET is_active=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND is_active<>?2", params![id, active])?;
+    let product = load_product(&transaction, id, false)?;
+    transaction.commit()?;
+    Ok(product)
+}
+
+fn list_all(connection: &Connection) -> ServiceResult<Vec<Product>> {
     let ids = connection
         .prepare("SELECT id FROM products ORDER BY name COLLATE NOCASE, id")?
         .query_map([], |row| row.get(0))?
@@ -355,7 +394,7 @@ pub fn list(connection: &Connection) -> ServiceResult<Vec<Product>> {
 
 fn list_operational(connection: &Connection) -> ServiceResult<Vec<Product>> {
     let ids = connection
-        .prepare("SELECT id FROM products ORDER BY name COLLATE NOCASE, id")?
+        .prepare("SELECT id FROM products WHERE is_active=1 ORDER BY name COLLATE NOCASE, id")?
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<i64>, _>>()?;
     ids.into_iter()
@@ -367,7 +406,7 @@ pub fn find_by_sku(connection: &Connection, sku: &str) -> ServiceResult<Option<P
     let key = search_key(sku);
     let id = connection
         .query_row(
-            "SELECT id FROM products WHERE sku_search_key = ?1",
+            "SELECT id FROM products WHERE sku_search_key = ?1 AND is_active=1",
             [key],
             |row| row.get(0),
         )
@@ -390,10 +429,11 @@ pub fn find_by_code(
         .query_row(
             "SELECT product_id, match_kind, presentation_id FROM (
                  SELECT id AS product_id, 'sku' AS match_kind, NULL AS presentation_id, 0 AS priority
-                 FROM products WHERE sku_search_key = ?1
+                  FROM products WHERE sku_search_key = ?1 AND is_active=1
                  UNION ALL
                  SELECT product_id, 'barcode', id, 1
-                 FROM product_presentations WHERE barcode_search_key = ?1 AND is_active = 1
+                  FROM product_presentations WHERE barcode_search_key = ?1 AND is_active = 1
+                  AND EXISTS(SELECT 1 FROM products p WHERE p.id=product_id AND p.is_active=1)
              ) ORDER BY priority LIMIT 1",
             [key],
             |row| {
@@ -557,6 +597,7 @@ pub fn update_with_presentations(
 ) -> ServiceResult<Product> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_id(id)?;
+    ensure_active(&transaction, id)?;
     let (name, sku) = validate_product(&input.name, &input.sku)?;
     let stored_unit: String = transaction
         .query_row("SELECT base_unit FROM products WHERE id=?1", [id], |row| {
@@ -663,7 +704,12 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
         validate_id(id)?;
     }
     let mut items = Vec::new();
-    for product in list(connection)? {
+    for product in list_all(connection)? {
+        if matches!(filters.status, ProductStatus::Active) && !product.is_active
+            || matches!(filters.status, ProductStatus::Archived) && product.is_active
+        {
+            continue;
+        }
         if filters.brand_id.is_some_and(|id| product.brand_id != id)
             || filters
                 .category_id
@@ -689,6 +735,7 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         items.push(ProductViewRow {
+            is_active: product.is_active,
             id: product.id,
             name: product.name,
             price: product.price,
@@ -712,6 +759,10 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
     let mut centimeter_stock = 0;
     let mut brands = BTreeSet::new();
     for item in &items {
+        brands.insert(item.brand_id);
+        if !item.is_active {
+            continue;
+        }
         let target = match item.base_unit {
             BaseUnit::Piece => &mut piece_stock,
             BaseUnit::Gram => &mut gram_stock,
@@ -719,7 +770,6 @@ pub fn view(connection: &Connection, filters: ProductViewFilters) -> ServiceResu
             BaseUnit::Centimeter => &mut centimeter_stock,
         };
         *target = checked_total(*target, item.stock, "PRODUCT_STATS_OVERFLOW")?;
-        brands.insert(item.brand_id);
     }
     Ok(ProductView {
         stats: ProductViewStats {
@@ -749,7 +799,7 @@ pub fn selector(
         let presentation = connection
             .query_row(
                 "SELECT product_id, mode, base_quantity
-                 FROM product_presentations WHERE id = ?1 AND is_active = 1",
+                 FROM product_presentations WHERE id = ?1",
                 [presentation_id],
                 |row| {
                     Ok((
@@ -845,12 +895,176 @@ mod tests {
     };
     use rusqlite::{params, Connection};
 
+    fn seed_sale(c: &mut Connection) {
+        c.execute_batch("INSERT INTO users(first_name,last_name,email,password_hash) VALUES('A','B','a@b.c','hash');").unwrap();
+        crate::services::cash::open(
+            c,
+            1,
+            crate::models::cash::OpenCashInput {
+                operation_token: "fixture-open".into(),
+                opening_amount: 0,
+            },
+        )
+        .unwrap();
+        c.execute_batch("INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method,cash_session_id) VALUES(1,'A B','a@b.c','token','fp','2026-01-01',100,'none',0,0,100,'tarjeta',1);").unwrap();
+    }
+
     fn db() -> Connection {
         let mut c = Connection::open_in_memory().unwrap();
         c.pragma_update(None, "foreign_keys", true).unwrap();
         migrations::run(&mut c).unwrap();
         c.execute_batch("INSERT INTO brands(name,name_search_key)VALUES('Marca','marca');INSERT INTO categories(name,name_search_key)VALUES('Categoria','categoria');").unwrap();
         c
+    }
+
+    #[test]
+    fn archive_restore_are_idempotent_preserve_children_stock_and_reserve_codes() {
+        use crate::models::product::{ProductStatus, ProductViewFilters};
+        let mut c = db();
+        let mut input = product_input("ARCHIVE");
+        input.presentations[0].barcode = Some("ACTIVE-BARCODE".into());
+        input.presentations[1].is_active = false;
+        let product = super::create_with_presentations(&mut c, input).unwrap();
+        c.execute("UPDATE products SET stock=123 WHERE id=?1", [product.id])
+            .unwrap();
+        let original = super::get(&c, product.id).unwrap();
+        let archived = super::set_active(&mut c, product.id, false).unwrap();
+        assert!(!archived.is_active);
+        assert_eq!(archived.stock_base, 123);
+        assert_eq!(
+            serde_json::to_value(&archived.presentations).unwrap(),
+            serde_json::to_value(&original.presentations).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&archived).unwrap(),
+            serde_json::to_value(super::set_active(&mut c, product.id, false).unwrap()).unwrap()
+        );
+        assert!(super::list(&c).unwrap().is_empty());
+        assert!(super::view(&c, Default::default())
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(super::find_by_sku(&c, "archive").unwrap().is_none());
+        assert!(super::find_by_code(&c, "ARCHIVE").unwrap().is_none());
+        assert!(super::find_by_code(&c, "ACTIVE-BARCODE").unwrap().is_none());
+        assert!(super::find_by_code(&c, "BOLSA-100").unwrap().is_none());
+        let view = super::view(
+            &c,
+            ProductViewFilters {
+                status: ProductStatus::Archived,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(view.items.len(), 1);
+        assert!(!view.items[0].is_active);
+        assert_eq!(view.stats.piece_stock, 0);
+        assert_eq!(view.stats.brand_count, 1);
+        assert_eq!(
+            super::view(
+                &c,
+                ProductViewFilters {
+                    status: ProductStatus::All,
+                    search: Some("active-barcode".into()),
+                    brand_id: Some(1),
+                    category_id: Some(1),
+                }
+            )
+            .unwrap()
+            .items
+            .len(),
+            1
+        );
+        assert!(super::view(
+            &c,
+            ProductViewFilters {
+                search: Some("active-barcode".into()),
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .items
+        .is_empty());
+        assert_eq!(
+            super::view(
+                &c,
+                ProductViewFilters {
+                    status: ProductStatus::All,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .items
+            .len(),
+            1
+        );
+        assert!(super::selector(
+            &c,
+            &BTreeMap::from([(product.default_presentation.id, 1)]),
+            Default::default()
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            super::create_with_presentations(&mut c, product_input("ARCHIVE"))
+                .unwrap_err()
+                .code,
+            "SKU_ALREADY_EXISTS"
+        );
+        assert_eq!(
+            super::create_with_presentations(&mut c, product_input("OTHER"))
+                .unwrap_err()
+                .code,
+            "BARCODE_ALREADY_EXISTS"
+        );
+        assert_eq!(
+            super::update_with_presentations(
+                &mut c,
+                product.id,
+                UpdateProductWithPresentationsInput {
+                    name: "Edit".into(),
+                    sku: "EDIT".into(),
+                    brand_id: 1,
+                    category_id: 1,
+                    base_unit: BaseUnit::Piece,
+                    presentations: vec![],
+                }
+            )
+            .unwrap_err()
+            .code,
+            "PRODUCT_ARCHIVED"
+        );
+        let restored = super::set_active(&mut c, product.id, true).unwrap();
+        assert!(restored.is_active);
+        assert_eq!(restored.stock_base, 123);
+        assert_eq!(
+            serde_json::to_value(&restored.presentations).unwrap(),
+            serde_json::to_value(&original.presentations).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(super::set_active(&mut c, product.id, true).unwrap()).unwrap()
+        );
+        assert!(super::find_by_sku(&c, "ARCHIVE").unwrap().is_some());
+        assert!(super::find_by_code(&c, "ACTIVE-BARCODE").unwrap().is_some());
+        assert!(super::find_by_code(&c, "BOLSA-100").unwrap().is_none());
+        assert_eq!(
+            c.query_row(
+                "SELECT (SELECT count(*) FROM sales)+(SELECT count(*) FROM inventory_movements)",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            super::set_active(&mut c, 999, false).unwrap_err().code,
+            "PRODUCT_NOT_FOUND"
+        );
+        assert!(serde_json::from_value::<ProductViewFilters>(
+            serde_json::json!({"status":"deleted"})
+        )
+        .is_err());
     }
     fn presentations() -> Vec<CreateProductPresentationInput> {
         vec![
@@ -1238,7 +1452,7 @@ mod tests {
         )
         .unwrap();
         let piece = p.presentations.iter().find(|x| x.name == "Pieza").unwrap();
-        c.execute_batch("INSERT INTO users(first_name,last_name,email,password_hash) VALUES('A','B','a@b.c','hash'); INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method) VALUES(1,'A B','a@b.c','token','fp','2026-01-01',100,'none',0,0,100,'tarjeta');").unwrap();
+        seed_sale(&mut c);
         c.execute("INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(?1,1,2,?2,'Nombre anterior','SKU','Pieza','piece','fixed',1,1,100,1,1,100)",params![p.id,piece.id]).unwrap();
         c.execute(
             "UPDATE product_presentations SET barcode='PIECE-OLD',barcode_search_key='piece-old' WHERE id=?1",
@@ -1377,7 +1591,7 @@ mod tests {
         )
         .unwrap();
         let piece = p.presentations.iter().find(|x| x.name == "Pieza").unwrap();
-        c.execute_batch("INSERT INTO users(first_name,last_name,email,password_hash) VALUES('A','B','a@b.c','hash'); INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method) VALUES(1,'A B','a@b.c','token','fp','2026-01-01',100,'none',0,0,100,'tarjeta');").unwrap();
+        seed_sale(&mut c);
         c.execute("INSERT INTO sale_details(product_id,sale_id,record_version,presentation_id,product_name,sku,presentation_name,base_unit,presentation_mode,presentation_base_quantity,quantity,unit_price,entered_quantity,base_quantity,line_total) VALUES(?1,1,2,?2,'Uno','SKU','Pieza','piece','fixed',1,1,100,1,1,100)",params![p.id,piece.id]).unwrap();
         let updates = p
             .presentations

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type ViewId = "pos" | "products" | "inventory" | "sales";
+export type ViewId = "pos" | "products" | "inventory" | "sales" | "cash";
 
 export type NavigationItem = {
   id: ViewId;
@@ -26,6 +26,7 @@ export const navigation: NavigationItem[] = [
     description: "Registra una nueva venta y administra el cobro.",
     icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M4 5.5h2l1.5 9h9.4l1.7-6H7M9.5 19h.01M16.5 19h.01" /></Icon>,
   },
+  { id: "cash", label: "Caja", title: "Caja", description: "Apertura, movimientos y cierre final de caja.", icon: null },
   {
     id: "products",
     label: "Productos",

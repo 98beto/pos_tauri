@@ -7,6 +7,7 @@ import { PosView } from "../features/pos/PosView";
 import { ProductsView } from "../features/products/ProductsView";
 import { InventoryView } from "../features/inventory/InventoryView";
 import { SalesView } from "../features/sales/SalesView";
+import { CashView } from "../features/cash/CashView";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
 
@@ -49,7 +50,8 @@ export function AppShell({ user, sessionId, loggingOut, onLogout, onNotice, onSe
       />
       <div className="min-w-0">
         <Topbar view={view} menuOpen={mobileMenuOpen} onOpenMenu={() => setMobileMenuOpen(true)} />
-        {activeView === "pos" && <PosView user={user} sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
+        {activeView === "pos" && <PosView user={user} sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} onOpenCash={() => navigate("cash")} />}
+        {activeView === "cash" && <CashView key={`cash-${sessionId}`} user={user} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "products" && <ProductsView sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "inventory" && <InventoryView key={`inventory-${historyActivation}`} user={user} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "sales" && <SalesView key={`sales-${historyActivation}`} onSessionRequired={onSessionRequired} />}

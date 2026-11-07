@@ -15,6 +15,8 @@ import {
   setCartItemUnitPrice,
 } from "../../api/cart";
 import { listCategories } from "../../api/categories";
+import { getCashState } from "../../api/cash";
+import type { CashSession } from "../../types/cash";
 import { findProductByCode, listProductSelector } from "../../api/products";
 import { Button, EmptyState, Field, Modal, Spinner } from "../../components/ui";
 import { errorMessage, isAppError, isSessionRequired } from "../../lib/app-error";
@@ -35,6 +37,8 @@ import type { PaymentMethod, SaleReceipt } from "../../types/sale";
 import type { User } from "../../types/user";
 import {
   checkoutInput,
+  archiveBlockedCheckout,
+  CheckoutStorageError,
   clearPendingCheckout,
   readPendingCheckout,
   savePendingCheckout,
@@ -55,6 +59,7 @@ type PosViewProps = {
   sessionId: number;
   onNotice: (notice: Notice) => void;
   onSessionRequired: () => void;
+  onOpenCash?: () => void;
 };
 
 const paymentMethods: { value: PaymentMethod; label: string }[] = [
@@ -82,11 +87,11 @@ const clearedCart: Cart = {
 };
 
 function uncertainCheckoutError(error: unknown) {
-  return !isAppError(error) || error.category === "database" || error.category === "internal" || isSessionRequired(error);
+  return !isAppError(error) || !["validation", "conflict", "not_found"].includes(error.category);
 }
 
 function checkoutIntentConflict(error: unknown) {
-  return isAppError(error) && ["CART_CHANGED", "CART_FINGERPRINT_MISMATCH", "CHECKOUT_TOKEN_REUSED"].includes(error.code);
+  return isAppError(error) && ["CART_CHANGED", "CART_FINGERPRINT_MISMATCH", "CHECKOUT_TOKEN_REUSED", "CASH_SESSION_REQUIRED", "CASH_SESSION_NOT_OPEN"].includes(error.code);
 }
 
 function fixedQuantityName(presentation: ProductPresentation, baseUnit: ProductSelectorRow["base_unit"]) {
@@ -113,9 +118,12 @@ function discountLabel(type: CartDiscountType, value: number) {
   return "Descuento";
 }
 
-export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosViewProps) {
+export function PosView({ user, sessionId, onNotice, onSessionRequired, onOpenCash }: PosViewProps) {
   const { beginCartReporting, beginCartOperation, reportCart, runCartMutation, runCheckout } = useUpdater();
   const [cart, setCart] = useState<Cart>();
+  const [cashState, setCashState] = useState<CashSession | null>();
+  const [cashStateError, setCashStateError] = useState("");
+  const cashRequest = useRef(0);
   const [categories, setCategories] = useState<Category[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerItems, setPickerItems] = useState<ProductSelectorRow[]>([]);
@@ -139,6 +147,10 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [receipt, setReceipt] = useState<SaleReceipt>();
   const [pending, setPending] = useState<PendingCheckout>();
+  const [checkoutStorageReady, setCheckoutStorageReady] = useState(false);
+  const [checkoutStorageError, setCheckoutStorageError] = useState<CheckoutStorageError>();
+  const [storageReviewOpen, setStorageReviewOpen] = useState(false);
+  const [storageReviewed, setStorageReviewed] = useState(false);
   const [intentConflict, setIntentConflict] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const [quantityEditor, setQuantityEditor] = useState<QuantityEditor>();
@@ -168,6 +180,19 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
   pendingRef.current = pending;
   const busyOrPending = busy || Boolean(pending);
 
+  async function refreshCashState() {
+    const request = ++cashRequest.current;
+    const generation = lifetime.current;
+    setCashState(undefined); setCashStateError("");
+    try {
+      const next = await getCashState();
+      if (request === cashRequest.current && generation === lifetime.current) setCashState(next);
+    } catch (value) {
+      if (request !== cashRequest.current || generation !== lifetime.current) return;
+      if (isSessionRequired(value)) onSessionRequired();
+      setCashStateError(errorMessage(value, "No se pudo consultar el estado de caja."));
+    }
+  }
   useEffect(() => {
     const generation = ++lifetime.current;
     return () => {
@@ -178,6 +203,13 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       quoteRequest.current += 1;
       discountRequest.current += 1;
     };
+  }, [sessionId]);
+
+  useEffect(() => {
+    void refreshCashState();
+    const focus = () => void refreshCashState();
+    window.addEventListener("focus", focus);
+    return () => { ++cashRequest.current; window.removeEventListener("focus", focus); };
   }, [sessionId]);
 
   function nextCartOperation(): CartReportVersion {
@@ -269,8 +301,9 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
         setLoadError("");
         setDataStale(false);
         onNotice({ tone: "success", message: "Cobro recuperado correctamente." });
-      } catch {
+      } catch (value) {
         if (lifetime.current !== generation) return;
+        if (isSessionRequired(value)) onSessionRequired();
         setLoadError("No se pudo actualizar el carrito despues de la venta.");
         setDataStale(true);
         onNotice({ tone: "error", message: "Venta completada, no se pudo actualizar el carrito." });
@@ -279,18 +312,49 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       if (lifetime.current !== generation) return;
       if (checkoutIntentConflict(value)) {
         setIntentConflict(true);
+        void refreshCashState();
       } else if (!uncertainCheckoutError(value)) {
         clearPendingCheckout(intent.userId, intent.checkoutToken);
         setPending(undefined);
       }
       if (isSessionRequired(value)) onSessionRequired();
-      else if (checkoutIntentConflict(value)) setCheckoutError("El carrito o la intencion ya no coinciden. No se realizara un cobro con datos distintos.");
+      else if (checkoutIntentConflict(value)) setCheckoutError("La caja, el carrito o la intencion ya no coinciden. Revisa el intento; si el backend confirma que no se creo, descarta la intencion y abre caja para crear un cobro nuevo. No se reasignara la caja original.");
       else setCheckoutError(errorMessage(value, "No fue posible confirmar el estado del cobro. Usa Reintentar cobro."));
     } finally {
       if (lifetime.current === generation && mutationInFlight.current === mutation) {
         mutationInFlight.current = undefined;
         setBusy(false);
       }
+    }
+  }
+
+  function inspectPendingCheckout() {
+    try {
+      const stored = readPendingCheckout(user.id);
+      setCheckoutStorageReady(true); setCheckoutStorageError(undefined);
+      const recoveryKey = stored ? `${stored.userId}:${stored.checkoutToken}` : "";
+      if (stored) {
+        setPending(stored); pendingRef.current = stored;
+        if (recoveryStarted.current !== recoveryKey) {
+          recoveryStarted.current = recoveryKey;
+          void recover(stored);
+        }
+      }
+    } catch (value) {
+      setCheckoutStorageReady(false);
+      setCheckoutStorageError(value instanceof CheckoutStorageError ? value : new CheckoutStorageError());
+    }
+  }
+
+  function resolveBlockedCheckout() {
+    if (!checkoutStorageError || !storageReviewed || busy) return;
+    try {
+      archiveBlockedCheckout(user.id, checkoutStorageError);
+      setStorageReviewOpen(false); setStorageReviewed(false);
+      inspectPendingCheckout();
+    } catch {
+      setCheckoutStorageReady(false); setStorageReviewOpen(false);
+      setCheckoutStorageError(new CheckoutStorageError());
     }
   }
 
@@ -309,18 +373,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       setCategories(nextCategories);
       setDataReady(true);
       setDataStale(false);
-      const stored = readPendingCheckout(user.id);
-      const recoveryKey = stored ? `${stored.userId}:${stored.checkoutToken}` : "";
-      if (stored && recoveryStarted.current !== recoveryKey) {
-        recoveryStarted.current = recoveryKey;
-        setPending(stored);
-        if (nextCart.lines.length > 0 && nextCart.cart_fingerprint !== stored.cartFingerprint) {
-          setIntentConflict(true);
-          setCheckoutError("El carrito cambio desde que se inicio el cobro. Revisa los datos y descarta la intencion para continuar.");
-        } else {
-          void recover(stored);
-        }
-      }
+      inspectPendingCheckout();
     } catch (value: unknown) {
       if (lifetime.current !== generation || loadRequest.current !== request) return;
       if (isSessionRequired(value)) onSessionRequired();
@@ -334,6 +387,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
   }
 
   useEffect(() => {
+    setCheckoutStorageReady(false); setCheckoutStorageError(undefined); setStorageReviewOpen(false);
     void loadData();
   }, [sessionId]);
 
@@ -540,7 +594,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
   }
 
   async function submitCheckout() {
-    if (!cart || mutationInFlight.current || pendingRef.current) return;
+    if (!cart || !checkoutStorageReady || mutationInFlight.current || pendingRef.current || cashState?.status !== "open" || cashStateError) return;
     const generation = lifetime.current;
     const mutation = Symbol();
     mutationInFlight.current = mutation;
@@ -550,12 +604,15 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       checkoutToken: crypto.randomUUID(),
       cartFingerprint: cart.cart_fingerprint,
       paymentMethod,
+      expectedCashSessionId: cashState.id,
       ...(paymentMethod === "efectivo" ? { cashReceived } : {}),
     };
     try {
       savePendingCheckout(intent);
     } catch {
       if (mutationInFlight.current === mutation) mutationInFlight.current = undefined;
+      setCheckoutStorageReady(false);
+      inspectPendingCheckout();
       onNotice({ tone: "error", message: "No se pudo proteger el cobro localmente. Intenta de nuevo." });
       return;
     }
@@ -584,8 +641,9 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
         setLoadError("");
         setDataStale(false);
         onNotice({ tone: "success", message: "Venta completada correctamente." });
-      } catch {
+      } catch (value) {
         if (lifetime.current !== generation) return;
+        if (isSessionRequired(value)) onSessionRequired();
         setLoadError("No se pudo actualizar el carrito despues de la venta.");
         setDataStale(true);
         onNotice({ tone: "error", message: "Venta completada, no se pudo actualizar el carrito." });
@@ -594,12 +652,13 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
       if (lifetime.current !== generation) return;
       if (checkoutIntentConflict(value)) {
         setIntentConflict(true);
+        void refreshCashState();
       } else if (!uncertainCheckoutError(value)) {
         clearPendingCheckout(intent.userId, intent.checkoutToken);
         setPending(undefined);
       }
       if (isSessionRequired(value)) onSessionRequired();
-      else if (checkoutIntentConflict(value)) setCheckoutError("El carrito cambio durante el cobro. La intencion se conservo y no se cobro un precio distinto.");
+      else if (checkoutIntentConflict(value)) setCheckoutError("La caja o el carrito cambio durante el cobro. La intencion conserva su caja original. Revisa el rechazo antes de descartar y crear un nuevo cobro; abre caja si es necesario.");
       else setCheckoutError(errorMessage(value, "No fue posible confirmar el cobro. La intencion se conservo para reintentar."));
     } finally {
       if (lifetime.current === generation && mutationInFlight.current === mutation) {
@@ -626,9 +685,11 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
 
   return (
     <main id="main-content" tabIndex={-1} className="p-4 outline-none sm:p-6 min-[900px]:p-8">
+      {checkoutStorageError && <section role="alert" className="mb-4 rounded-card border border-danger/25 bg-danger-soft p-4"><p>{checkoutStorageError.message}</p><Button disabled={busy} onClick={inspectPendingCheckout}>Releer cobro guardado</Button>{checkoutStorageError.records.length > 0 && <Button disabled={busy} onClick={() => { setStorageReviewed(false); setStorageReviewOpen(true); }}>Revisar datos guardados</Button>}</section>}
+      <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-line bg-surface p-4" role="status"><span>{cashStateError || (cashState === undefined ? "Consultando estado de caja..." : cashState ? `Caja #${cashState.id} abierta` : "No hay caja abierta. Abre caja para cobrar con cualquier metodo.")}</span><div className="flex gap-2"><Button onClick={() => void refreshCashState()}>Actualizar caja</Button>{cashState?.status !== "open" && onOpenCash && <Button onClick={onOpenCash}>Abrir caja</Button>}</div></section>
       {pending && (
         <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-warning/30 bg-warning-soft p-4" role="status">
-          <div><strong className="text-sm text-ink">Cobro pendiente de confirmar</strong><p className="mt-1 text-xs text-muted">La intencion permanece guardada y puede recuperar el recibo sin volver a cobrar.</p></div>
+          <div><strong className="text-sm text-ink">Cobro pendiente de confirmar</strong><p className="mt-1 text-xs text-muted">La intencion permanece guardada y puede recuperar el recibo sin volver a cobrar.</p><p className="mt-1 text-xs text-muted">{pending.expectedCashSessionId === undefined ? "Intento anterior: solo puede recuperar una venta ya confirmada." : `Caja original #${pending.expectedCashSessionId}. No se cambiara al reintentar.`}</p></div>
           <div className="flex flex-wrap gap-2"><Button disabled={busy || intentConflict} onClick={() => void recover(pending)}>Reintentar cobro</Button>{intentConflict && <Button variant="ghost" disabled={busy} onClick={() => setDiscardOpen(true)}>Descartar intencion</Button>}</div>
         </section>
       )}
@@ -648,7 +709,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
                 <caption className="sr-only">Productos agregados al carrito actual</caption>
                 <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-3 py-3">Producto</th><th className="border-b border-line px-3 py-3">Precio</th><th className="border-b border-line px-3 py-3 text-center">Cantidad</th><th className="border-b border-line px-3 py-3 text-right">Subtotal</th><th className="border-b border-line px-3 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
                 <tbody>{cart.lines.map((line) => <tr key={line.presentation_id} className={!line.available ? "bg-danger-soft/50" : ""}>
-                  <td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="block text-xs text-muted">{line.presentation_name} · {line.sku}</span><span className="text-xs text-muted">Stock {formatBaseQuantity(line.stock_base, line.base_unit)}</span></td>
+                  <td className="border-b border-line px-3 py-4"><strong className="block">{line.product_name}</strong><span className="block text-xs text-muted">{line.presentation_name} · {line.sku}</span><span className="text-xs text-muted">Stock {formatBaseQuantity(line.stock_base, line.base_unit)}</span>{!line.available && <p className="text-xs text-danger">Producto no disponible para venta. Retiralo del carrito para continuar.</p>}</td>
                     <td className="border-b border-line px-3 py-4"><span className="block font-semibold">{presentationPriceLabel({ mode: line.mode, name: line.presentation_name, price: line.applied_unit_price, base_quantity: line.base_quantity }, line.base_unit)}</span>{line.catalog_unit_price !== line.applied_unit_price && <span className="mt-1 block text-xs text-muted">Catalogo: {presentationPriceLabel({ mode: line.mode, name: line.presentation_name, price: line.catalog_unit_price, base_quantity: line.base_quantity }, line.base_unit)}</span>}<button aria-label={`Cambiar precio de ${line.product_name}, ${line.presentation_name}`} className="mt-1 rounded px-2 py-1 text-xs font-bold text-brand hover:bg-brand-soft disabled:opacity-40" disabled={busyOrPending} onClick={() => openPriceEditor(line)}>Cambiar precio</button></td>
                     <td className="border-b border-line px-3 py-4"><div className="grid justify-items-center gap-1">{line.mode === "fixed" ? <div className="flex w-fit items-center rounded-control border border-line"><button aria-label={`Reducir ${line.product_name}, ${line.presentation_name}`} disabled={busyOrPending} className="size-9 text-lg disabled:opacity-40" onClick={() => void mutate(() => decrementCartItem(line.presentation_id), "No se pudo reducir la cantidad.")}>−</button><span className="min-w-24 text-center text-xs font-bold">{formatEnteredQuantity(line.entered_quantity, line.mode, line.presentation_name, line.base_unit)}</span><button aria-label={`Aumentar ${line.product_name}, ${line.presentation_name}`} disabled={busyOrPending} className="size-9 text-lg disabled:opacity-40" onClick={() => void mutate(() => incrementCartItem(line.presentation_id), "No se pudo aumentar la cantidad.")}>+</button></div> : <strong>{formatEnteredQuantity(line.entered_quantity, line.mode, line.presentation_name, line.base_unit)}</strong>}<button aria-label={`Editar cantidad de ${line.product_name}, ${line.presentation_name}`} className="rounded px-2 py-1 text-xs font-bold text-brand hover:bg-brand-soft disabled:opacity-40" disabled={busyOrPending} onClick={() => openQuantityEditor({ presentation: { id: line.presentation_id, product_id: line.product_id, name: line.presentation_name, mode: line.mode, base_quantity: line.base_quantity, price: line.applied_unit_price, barcode: line.presentation_barcode, is_default: false, is_active: true, is_conversion_locked: true, created_at: "", updated_at: "" }, productName: line.product_name, baseUnit: line.base_unit, currentQuantity: line.entered_quantity, availableBase: line.stock_base - cart.lines.filter((other) => other.product_id === line.product_id && other.presentation_id !== line.presentation_id).reduce((total, other) => total + other.base_consumed, 0) })}>Editar cantidad</button></div></td>
                   <td className="border-b border-line px-3 py-4 text-right font-bold">{formatMoney(line.line_total)}</td>
@@ -666,7 +727,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
            <fieldset className="mt-5" disabled={busyOrPending}><legend className="mb-2 text-[0.625rem] font-extrabold tracking-wider text-muted uppercase">Metodo de pago</legend><div className="grid grid-cols-3 gap-2">{paymentMethods.map((method) => <label key={method.value} className={`cursor-pointer rounded-control border px-2 py-3 text-center text-xs font-bold transition has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-brand ${paymentMethod === method.value ? "border-brand bg-brand-soft text-brand" : "border-line text-muted"}`}><input className="sr-only" type="radio" name="payment" value={method.value} checked={paymentMethod === method.value} onChange={() => setPaymentMethod(method.value)} />{method.label}</label>)}</div></fieldset>
            {paymentMethod === "efectivo" && <div className="mt-5"><Field label="Efectivo recibido" value={cashReceived} onChange={(event) => setCashReceived(event.target.value)} inputMode="decimal" placeholder="0.00" disabled={busyOrPending} required /></div>}
            {paymentMethod === "efectivo" && cashReceived.trim() && <div className="mt-3 min-h-16" aria-live="polite">{quoteLoading ? <p className="text-xs font-semibold text-muted">Calculando cambio...</p> : cashQuote ? <dl className="grid gap-2 rounded-control bg-surface-soft p-3 text-sm"><div className="flex justify-between"><dt className="text-muted">Total</dt><dd className="font-semibold">{formatMoney(cashQuote.total)}</dd></div><div className="flex justify-between"><dt className="text-muted">Efectivo</dt><dd className="font-semibold">{formatMoney(cashQuote.cash_received)}</dd></div><div className="flex justify-between border-t border-line pt-2"><dt className="font-bold">Cambio</dt><dd className="font-bold text-brand">{formatMoney(cashQuote.change)}</dd></div></dl> : cashQuoteError ? <p className="rounded-control bg-danger-soft px-3 py-2 text-sm text-danger" role="status">{cashQuoteError}</p> : null}</div>}
-           <Button className="mt-5 w-full" size="lg" variant="primary" loading={busy} disabled={busyOrPending || !cart?.lines.length || dataStale || (paymentMethod === "efectivo" && !cashQuote)} onClick={() => void submitCheckout()}>Cobrar {formatMoney(cart?.total ?? 0)}</Button>
+            <Button className="mt-5 w-full" size="lg" variant="primary" loading={busy} disabled={!checkoutStorageReady || cashState?.status !== "open" || Boolean(cashStateError) || busyOrPending || !cart?.lines.length || cart.lines.some((line) => !line.available) || dataStale || (paymentMethod === "efectivo" && !cashQuote)} onClick={() => void submitCheckout()}>Cobrar {formatMoney(cart?.total ?? 0)}</Button>
         </aside>
       </div>
 
@@ -710,6 +771,11 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired }: PosVie
         })}</div><dl className="mt-4 grid gap-2 border-t border-line pt-4 text-sm"><div className="flex justify-between"><dt className="text-muted">Subtotal</dt><dd className="font-semibold">{formatMoney(receipt.sale.subtotal)}</dd></div>{receipt.sale.discount_type !== "none" && <div className="flex justify-between text-danger"><dt>{discountLabel(receipt.sale.discount_type, receipt.sale.discount_value)}</dt><dd className="font-semibold">-{formatMoney(receipt.sale.discount_amount)}</dd></div>}<div className="flex justify-between font-bold"><dt>Total</dt><dd>{formatMoney(receipt.sale.total)}</dd></div>{receipt.sale.change_amount !== null && <div className="flex justify-between border-t border-line pt-3"><dt>Cambio</dt><dd>{formatMoney(receipt.sale.change_amount)}</dd></div>}</dl></div>}
       </Modal>
 
+      <Modal open={storageReviewOpen} onClose={() => setStorageReviewOpen(false)} closeDisabled={busy} title="Revisar cobro guardado" size="lg" footer={<><Button onClick={() => setStorageReviewOpen(false)}>Volver</Button><Button disabled={!storageReviewed || busy} onClick={resolveBlockedCheckout}>Conservar copia y desbloquear</Button></>}>
+        <p className="text-sm">No podemos interpretar estos datos con seguridad. Revisa primero el historial de ventas y verifica que no queda un cobro pendiente de confirmar. Desbloquear no cancela ni revierte ventas; conserva una copia local exacta de estos datos antes de retirarlos de la cola activa.</p>
+        <pre className="my-4 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-control border border-line p-3 text-xs">{checkoutStorageError?.records.map((record) => `${record.key}\n${record.raw}`).join("\n\n")}</pre>
+        <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={storageReviewed} onChange={(event) => setStorageReviewed(event.target.checked)} />Revise las ventas y confirme que no queda un cobro pendiente por resolver</label>
+      </Modal>
       <Modal open={discardOpen} onClose={() => setDiscardOpen(false)} closeDisabled={busy} title="Descartar intencion de cobro" description="Esta accion no confirma ni repite el cobro." size="sm" footer={<><Button disabled={busy} onClick={() => setDiscardOpen(false)}>Cancelar</Button><Button variant="primary" loading={busy} onClick={() => void discardIntent()}>Descartar y recargar carrito</Button></>}>
         <p className="text-sm leading-6 text-muted">Descarta la intencion guardada solo si verificaste que la venta no fue cobrada. El carrito se recargara con los precios actuales.</p>
       </Modal>

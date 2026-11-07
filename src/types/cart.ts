@@ -47,6 +47,8 @@ export interface CashChangeQuote {
 }
 
 export interface CheckoutCartInput {
+  /** Required for NEW sales. Omit/null only to recover an already saved token. */
+  expected_cash_session_id?: number | null;
   checkout_token: string;
   cart_fingerprint: string;
   payment_method: PaymentMethod;

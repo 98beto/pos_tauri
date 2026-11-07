@@ -3,20 +3,22 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createBrand, listBrands, updateBrand } from "../../api/brands";
 import { createCategory, listCategories, updateCategory } from "../../api/categories";
-import { createProductWithPresentations, getProductsView, updateProductWithPresentations } from "../../api/products";
+import { archiveProduct, createProductWithPresentations, getProductsView, restoreProduct, updateProductWithPresentations } from "../../api/products";
 import { deferred } from "../../test/fixtures";
 import type { ProductView } from "../../types/product";
 import { ProductsView } from "./ProductsView";
 
 vi.mock("../../api/brands", () => ({ createBrand: vi.fn(), listBrands: vi.fn(), updateBrand: vi.fn() }));
 vi.mock("../../api/categories", () => ({ createCategory: vi.fn(), listCategories: vi.fn(), updateCategory: vi.fn() }));
-vi.mock("../../api/products", () => ({ createProductWithPresentations: vi.fn(), getProductsView: vi.fn(), updateProductWithPresentations: vi.fn() }));
+vi.mock("../../api/products", () => ({ archiveProduct: vi.fn(), createProductWithPresentations: vi.fn(), getProductsView: vi.fn(), restoreProduct: vi.fn(), updateProductWithPresentations: vi.fn() }));
 
 const mockedListBrands = vi.mocked(listBrands);
 const mockedListCategories = vi.mocked(listCategories);
 const mockedGetProductsView = vi.mocked(getProductsView);
 const mockedCreateProduct = vi.mocked(createProductWithPresentations);
 const mockedUpdateProduct = vi.mocked(updateProductWithPresentations);
+const mockedArchiveProduct = vi.mocked(archiveProduct);
+const mockedRestoreProduct = vi.mocked(restoreProduct);
 
 const piecePresentation = {
   id: 101,
@@ -54,6 +56,7 @@ const view: ProductView = {
     id: 11,
     name: "Cafe molido",
     sku: "CAFE-1",
+    is_active: true,
     price: 1250,
     stock: 5,
     stock_base: 1250,
@@ -71,6 +74,7 @@ const view: ProductView = {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  localStorage.clear();
   mockedListBrands.mockResolvedValue([{ id: 1, name: "Origen", created_at: "", updated_at: "" }]);
   mockedListCategories.mockResolvedValue([{ id: 2, name: "Bebidas", created_at: "", updated_at: "" }]);
   mockedGetProductsView.mockResolvedValue(view);
@@ -78,16 +82,44 @@ beforeEach(() => {
   vi.mocked(updateBrand).mockResolvedValue({ id: 1, name: "Origen", created_at: "", updated_at: "" });
   vi.mocked(createCategory).mockResolvedValue({ id: 2, name: "Bebidas", created_at: "", updated_at: "" });
   vi.mocked(updateCategory).mockResolvedValue({ id: 2, name: "Bebidas", created_at: "", updated_at: "" });
+  mockedArchiveProduct.mockResolvedValue({ ...view.items[0], is_active: false });
+  mockedRestoreProduct.mockResolvedValue(view.items[0]);
+  vi.stubGlobal("confirm", vi.fn(() => true));
 });
 
 async function renderLoaded() {
-  render(<ProductsView sessionId={1} onNotice={vi.fn()} onSessionRequired={vi.fn()} />);
+  const rendered = render(<ProductsView sessionId={1} onNotice={vi.fn()} onSessionRequired={vi.fn()} />);
   await act(() => vi.advanceTimersByTimeAsync(250));
   await act(async () => undefined);
   expect(screen.getByText("Cafe molido")).toBeTruthy();
+  return rendered;
 }
 
 describe("ProductsView", () => {
+  it("switches layouts without reloading or dropping search filters and persists cards", async () => {
+    const firstRender = await renderLoaded();
+    expect((screen.getByRole("button", { name: "Lista" }) as HTMLButtonElement).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "cafe" } });
+    fireEvent.change(screen.getByLabelText("Marca"), { target: { value: "1" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    const calls = mockedGetProductsView.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    expect(mockedGetProductsView).toHaveBeenCalledTimes(calls);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(mockedGetProductsView).toHaveBeenCalledTimes(calls);
+    expect((screen.getByRole("button", { name: "Tarjetas" }) as HTMLButtonElement).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: "Editar producto Cafe molido" })).toBeTruthy();
+    expect((screen.getByLabelText("Buscar") as HTMLInputElement).value).toBe("cafe");
+    expect((screen.getByLabelText("Marca") as HTMLSelectElement).value).toBe("1");
+
+    firstRender.unmount();
+    const rendered = render(<ProductsView sessionId={1} onNotice={vi.fn()} onSessionRequired={vi.fn()} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    await act(async () => undefined);
+    expect((screen.getByRole("button", { name: "Tarjetas" }) as HTMLButtonElement).getAttribute("aria-pressed")).toBe("true");
+    rendered.unmount();
+  });
+
   it("sends search, brand and category as remote filters", async () => {
     await renderLoaded();
     fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "cafe" } });
@@ -95,7 +127,7 @@ describe("ProductsView", () => {
     fireEvent.change(screen.getByLabelText("Categoria"), { target: { value: "2" } });
     await act(() => vi.advanceTimersByTimeAsync(250));
 
-    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ search: "cafe", brand_id: 1, category_id: 2 });
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ search: "cafe", brand_id: 1, category_id: 2, status: "active" });
   });
 
   it("names each product edit action with its product", async () => {
@@ -522,5 +554,157 @@ describe("ProductsView", () => {
     await act(async () => request.reject({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion vencida" }));
     expect(onNotice).not.toHaveBeenCalled();
     expect(onSessionRequired).not.toHaveBeenCalled();
+  });
+
+  it("filters active, archived and all products through the API with active as default", async () => {
+    await renderLoaded();
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ status: "active" });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "archived" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ status: "archived" });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "all" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ status: "all" });
+  });
+
+  it("cancels archive without a request, then archives in cards and refreshes current filters", async () => {
+    const confirmMock = vi.mocked(window.confirm);
+    confirmMock.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "cafe" } });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "all" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    expect(confirmMock).toHaveBeenLastCalledWith(expect.stringContaining("Existencia actual: 1.25 kg. El stock no se ajustará."));
+    expect(mockedArchiveProduct).not.toHaveBeenCalled();
+
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [{ ...view.items[0], is_active: false }] });
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    await act(async () => undefined);
+    expect(mockedArchiveProduct).toHaveBeenCalledWith(11);
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ search: "cafe", status: "all" });
+    expect(screen.getByText("Eliminado")).toBeTruthy();
+  });
+
+  it("restores archived products in list with status and filters retained", async () => {
+    const archived = { ...view.items[0], is_active: false };
+    mockedGetProductsView.mockResolvedValue({ ...view, items: [archived] });
+    mockedRestoreProduct.mockResolvedValue({ ...archived, is_active: true });
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "cafe" } });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "archived" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText("Eliminado")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Editar producto Cafe molido" })).toBeNull();
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Restaurar producto Cafe molido" }));
+    await act(async () => undefined);
+    expect(mockedRestoreProduct).toHaveBeenCalledWith(11);
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ search: "cafe", status: "archived" });
+    expect(screen.queryByText("Cafe molido")).toBeNull();
+  });
+
+  it.each(["Lista", "Tarjetas"])("blocks editing while archive is pending in %s", async (layout) => {
+    const request = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    mockedArchiveProduct.mockReturnValueOnce(request.promise);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: layout }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    const edit = screen.getByRole("button", { name: "Editar producto Cafe molido" }) as HTMLButtonElement;
+    expect(edit.disabled).toBe(true);
+    fireEvent.click(edit);
+    expect(screen.queryByRole("dialog", { name: "Editar producto" })).toBeNull();
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [] });
+    await act(async () => request.resolve({ ...view.items[0], is_active: false }));
+    expect(screen.queryByRole("button", { name: "Editar producto Cafe molido" })).toBeNull();
+  });
+
+  it("keeps archived status locally when refresh fails, preserving filters and layout", async () => {
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "cafe" } });
+    fireEvent.change(screen.getByLabelText("Marca"), { target: { value: "1" } });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "all" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" })));
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText("Eliminado")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Editar producto Cafe molido" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Restaurar producto Cafe molido" })).toBeTruthy();
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ search: "cafe", brand_id: 1, status: "all" });
+    expect((screen.getByRole("button", { name: "Tarjetas" }) as HTMLButtonElement).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("removes status-mismatched rows after archive or restore even if refresh fails", async () => {
+    await renderLoaded();
+    mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" })));
+    expect(screen.queryByText("Cafe molido")).toBeNull();
+    expect(screen.getByRole("alert")).toBeTruthy();
+
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [{ ...view.items[0], is_active: false }] });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "archived" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Restaurar producto Cafe molido" })));
+    expect(screen.queryByText("Cafe molido")).toBeNull();
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect((screen.getByLabelText("Estado") as HTMLSelectElement).value).toBe("archived");
+  });
+
+  it.each(["archive", "restore"] as const)("keeps failed filter results stale during %s and a failed refresh", async (action) => {
+    const initial = { ...view.items[0], is_active: action === "archive" };
+    const initialView = { ...view, items: [initial] };
+    mockedGetProductsView.mockResolvedValue(initialView);
+    const request = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    if (action === "archive") mockedArchiveProduct.mockReturnValueOnce(request.promise);
+    else mockedRestoreProduct.mockReturnValueOnce(request.promise);
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "all" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+
+    mockedGetProductsView.mockRejectedValueOnce(new Error("filter failed"));
+    fireEvent.change(screen.getByLabelText("Categoria"), { target: { value: "2" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    const assertStale = () => {
+      expect(screen.getAllByText("-")).toHaveLength(5);
+      expect(screen.getByText("Se muestran los resultados anteriores; no corresponden a los filtros actuales.")).toBeTruthy();
+      expect(screen.queryByText("Segun filtros actuales")).toBeNull();
+    };
+    assertStale();
+    fireEvent.click(screen.getByRole("button", { name: `${action === "archive" ? "Eliminar" : "Restaurar"} producto Cafe molido` }));
+    assertStale();
+    mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
+    await act(async () => request.resolve({ ...initial, is_active: !initial.is_active }));
+    assertStale();
+    expect(mockedGetProductsView).toHaveBeenLastCalledWith({ category_id: 2, status: "all" });
+    expect(screen.getByText(action === "archive" ? "Eliminado" : "Activo")).toBeTruthy();
+
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [] });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Reintentar carga" })));
+    expect(screen.queryByText("Se muestran los resultados anteriores; no corresponden a los filtros actuales.")).toBeNull();
+    expect(screen.getAllByText("Segun filtros actuales")).toHaveLength(5);
+  });
+
+  it("shows archive errors and routes authentication failures to the session handler", async () => {
+    const onSessionRequired = vi.fn();
+    render(<ProductsView sessionId={1} onNotice={vi.fn()} onSessionRequired={onSessionRequired} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    await act(async () => undefined);
+    mockedArchiveProduct.mockRejectedValueOnce(new Error("No se pudo archivar"));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    await act(async () => undefined);
+    expect(screen.getByRole("alert").textContent).toContain("No se pudo eliminar el producto.");
+
+    mockedRestoreProduct.mockRejectedValueOnce({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion vencida" });
+    const archived = { ...view.items[0], is_active: false };
+    mockedGetProductsView.mockResolvedValue({ ...view, items: [archived] });
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "archived" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Restaurar producto Cafe molido" }));
+    await act(async () => undefined);
+    expect(onSessionRequired).toHaveBeenCalledOnce();
   });
 });

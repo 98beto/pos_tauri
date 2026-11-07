@@ -153,10 +153,10 @@ test("rejects file and directory symlinks", async (t) => {
   ]);
 });
 
-test("pins every immutable migration from 001 through 012 with full hashes", async (t) => {
+test("pins every immutable migration from 001 through 013 with full hashes", async (t) => {
   const files = {};
   const migrations = await readdir(path.join(projectRoot, "src-tauri/migrations"));
-  for (let version = 1; version <= 12; version += 1) {
+  for (let version = 1; version <= 13; version += 1) {
     const prefix = String(version).padStart(3, "0");
     const name = migrations.find((entry) => entry.startsWith(`${prefix}_`));
     files[`src-tauri/migrations/${name}`] = await readFile(path.join(projectRoot, "src-tauri/migrations", name));
@@ -204,9 +204,8 @@ test("pins original bytes of the checkout corpus without the ignored local demo"
   }
   const root = await fixture(t, files);
   const pinnedOnly = { enforceImmutableFiles: false, enforcePinnedFiles: true };
-  // Preserve existing corpus drift as a baseline; the repository CLI gate reports it.
   const baseline = await validateRetiredInventoryCosts(root, pinnedOnly);
-  assert.ok(!baseline.some(({ path: relativePath }) => relativePath === "docs/demo.html"));
+  assert.deepEqual(baseline, []);
 
   for (const [symbol, relativePath] of corpus) {
     const buffer = files[relativePath];
@@ -225,6 +224,82 @@ test("pins original bytes of the checkout corpus without the ignored local demo"
         assert.deepEqual(await validateRetiredInventoryCosts(root, pinnedOnly), baseline);
       });
     }
+  }
+});
+
+test("v15 migration reference pins reject additions, replacements, removal and copied consumers", async (t) => {
+  const paths = [
+    "src-tauri/src/db/migrations.rs",
+    "src-tauri/src/db/mod.rs",
+    "src-tauri/src/db/tests/migration_qa.rs",
+  ];
+  const pinnedOnly = { enforceImmutableFiles: false, enforcePinnedFiles: true };
+  const retired = snake("inventory", "cost", "cents");
+  for (const relativePath of paths) {
+    await t.test(relativePath, async (t) => {
+      const contents = await readFile(path.join(projectRoot, relativePath), "utf8");
+      const root = await fixture(t, { [relativePath]: contents });
+      const ownViolations = async () => (await validateRetiredInventoryCosts(root, pinnedOnly))
+        .filter((violation) => violation.path === relativePath);
+      assert.deepEqual(await ownViolations(), []);
+      for (const changed of [
+        `${contents}\n// harmless drift\n`,
+        `${contents}\nfn new_consumer() { ${retired}(); }\n`,
+        "// replacement without retired concepts\n",
+      ]) {
+        await writeFile(path.join(root, relativePath), changed);
+        assert.deepEqual(await ownViolations(), [
+          { symbol: "pinned-reference", path: relativePath, line: 1 },
+        ]);
+      }
+      await rm(path.join(root, relativePath));
+      assert.deepEqual(await ownViolations(), [
+        { symbol: "pinned-reference", path: relativePath, line: 1 },
+      ]);
+      const copiedPath = "src-tauri/src/services/new_consumer.rs";
+      await mkdir(path.dirname(path.join(root, copiedPath)), { recursive: true });
+      await writeFile(path.join(root, copiedPath), contents);
+      assert.ok((await validateFixture(root)).some((violation) => (
+        violation.path === copiedPath
+      )));
+    });
+  }
+});
+
+test("relocated purchase correction and UI absence probes remain exact exceptions", async (t) => {
+  for (const relativePath of [
+    "src-tauri/src/services/inventory.rs",
+    "src/features/inventory/InventoryView.test.tsx",
+  ]) {
+    await t.test(relativePath, async (t) => {
+      const contents = await readFile(path.join(projectRoot, relativePath), "utf8");
+      const root = await fixture(t, { [relativePath]: contents });
+      assert.deepEqual(await validateFixture(root), []);
+
+      // No relaxation for matching context at a different position or path.
+      await writeFile(path.join(root, relativePath), `\n${contents}`);
+      assert.ok((await validateFixture(root)).length > 0);
+      await writeFile(path.join(root, relativePath), contents);
+      const copiedPath = "src/new-consumer.ts";
+      await mkdir(path.dirname(path.join(root, copiedPath)), { recursive: true });
+      await writeFile(path.join(root, copiedPath), contents);
+      assert.ok((await validateFixture(root)).some(({ path: entryPath }) => entryPath === copiedPath));
+      await rm(path.join(root, copiedPath));
+
+      const target = relativePath.endsWith(".rs")
+        ? "previous_purchase_unit_price_cents: previous_price,"
+        : 'it("removes valuation and cost UI and exposes two separate actions"';
+      assert.ok(contents.includes(target));
+      await writeFile(path.join(root, relativePath), contents.replace(target, `${target} /* changed context */`));
+      assert.ok((await validateFixture(root)).length > 0);
+
+      // A new symbol in the same file is never covered by the old exceptions.
+      await writeFile(path.join(root, relativePath), `${contents}\n${snake("inventory", "cost", "cents")}\n`);
+      assert.deepEqual(await validateFixture(root), [{
+        symbol: snake("inventory", "cost", "cents"), path: relativePath,
+        line: contents.split("\n").length + 1, column: 1,
+      }]);
+    });
   }
 });
 

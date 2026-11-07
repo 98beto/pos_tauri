@@ -150,33 +150,45 @@ fn integrity(connection: &Connection) -> rusqlite::Result<Value> {
 
 fn assert_v13_unit_domains(connection: &Connection) -> Result<(), Box<dyn Error>> {
     connection.execute_batch("SAVEPOINT centimeter_domain")?;
-    for table in ["products", "sale_details", "inventory_movements"] {
+    // v15 correctly forbids rewriting migrated closed-session sale details.
+    // Use a rollback-only new open-session detail for the unit-domain probes;
+    // do not disable guards or let their rejection mask the unit CHECK itself.
+    connection.execute_batch("INSERT INTO cash_sessions(status,opening_amount,opened_by,opening_operator) VALUES('open',0,1,'QA');
+        INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,subtotal,discount_type,discount_value,discount_amount,total,payment_method,cash_session_id)
+        VALUES(1,'QA','qa@local','qa-unit-domain','qa-unit-domain',CURRENT_TIMESTAMP,1,'none',0,0,1,'tarjeta',last_insert_rowid());
+        INSERT INTO sale_details(product_id,sale_id,product_name,sku,quantity,unit_price) VALUES(1,last_insert_rowid(),'QA','QA',1,1);")?;
+    let detail_id = connection.last_insert_rowid();
+    let targets = [
+        ("products", 1),
+        ("sale_details", detail_id),
+        ("inventory_movements", 1),
+    ];
+    for (table, id) in targets {
         connection.execute(
-            &format!("UPDATE {table} SET base_unit='centimeter' WHERE id=1"),
+            &format!("UPDATE {table} SET base_unit='centimeter' WHERE id={id}"),
             [],
         )?;
         assert_eq!(
             connection.query_row(
-                &format!("SELECT base_unit FROM {table} WHERE id=1"),
+                &format!("SELECT base_unit FROM {table} WHERE id={id}"),
                 [],
                 |row| row.get::<_, String>(0),
             )?,
             "centimeter"
         );
     }
-    connection.execute_batch("ROLLBACK TO centimeter_domain; RELEASE centimeter_domain")?;
-
-    for table in ["products", "sale_details", "inventory_movements"] {
+    for (table, id) in targets {
         assert!(
             connection
                 .execute(
-                    &format!("UPDATE {table} SET base_unit='unknown' WHERE id=1"),
+                    &format!("UPDATE {table} SET base_unit='unknown' WHERE id={id}"),
                     [],
                 )
                 .is_err(),
             "{table} accepted an unknown base unit"
         );
     }
+    connection.execute_batch("ROLLBACK TO centimeter_domain; RELEASE centimeter_domain")?;
     Ok(())
 }
 
@@ -273,7 +285,7 @@ fn create_v8_fixture(path: &Path) -> Result<Value, Box<dyn Error>> {
 fn assert_v13_data(connection: &Connection, before: &Value) -> Result<(), Box<dyn Error>> {
     assert_eq!(
         integrity(connection)?,
-        json!({"user_version":13,"quick_check":"ok","foreign_key_violations":0})
+        json!({"user_version":CURRENT_SCHEMA_VERSION,"quick_check":"ok","foreign_key_violations":0})
     );
     let after_legacy = summary(connection)?;
     assert_eq!(after_legacy, before["summary"]);
@@ -368,6 +380,104 @@ fn v8_migration_sources_match_main_e2ab2d2() {
     assert_v8_migrations_match_e2ab2d2();
 }
 
+fn cash_v14_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    let runtime = root.join("runtime-v14-v15");
+    fs::create_dir(&runtime)?;
+    let path = runtime.join("pos.db");
+    create_v12_database(&path);
+    let mut before = Connection::open(&path)?;
+    migrations::run_to_v14(&mut before)?;
+    before.execute_batch("UPDATE products SET is_active=0 WHERE id=1;")?;
+    validate_database(&before, 14, true, &path)?;
+    let snapshot = migration_source_snapshot(&before, &path, 14)?;
+    drop(before);
+    fs::copy(&path, root.join("before-v14.db"))?;
+    let mut after = open_database_path(&runtime, &path)?;
+    validate_database(&after, 15, true, &path)?;
+    validate_cash_backfill(&after, &path)?;
+    assert_eq!(migration_target_snapshot(&after, &path, 14)?, snapshot);
+    assert!(!crate::services::products::get(&after, 1)?.is_active);
+    let historical = crate::services::cash::detail(&after, 1)?;
+    assert!(historical.session.historical);
+    assert_eq!(historical.session.status, "closed");
+    assert_eq!(
+        (
+            historical.session.opening_amount,
+            historical.session.expected_amount,
+            historical.session.counted_amount,
+            historical.session.difference
+        ),
+        (None, None, None, None)
+    );
+    assert!(historical.operations.is_empty());
+    assert!(crate::services::cash::state(&after)?.is_none());
+    for sale in crate::services::sales::list(&after)? {
+        assert_eq!(sale.cash_session_id, 1);
+        assert_eq!(
+            crate::services::sales::history_detail(&after, sale.id)?.cash_session_id,
+            1
+        );
+    }
+    let backups = matching_files(&runtime, "pos-v14-before-v15-");
+    assert_eq!(backups.len(), 1);
+    let backup = Connection::open(&backups[0])?;
+    validate_database(&backup, 14, true, &backups[0])?;
+    assert_eq!(
+        migration_source_snapshot(&backup, &backups[0], 14)?,
+        snapshot
+    );
+    drop(backup);
+    fs::copy(&path, root.join("after-v14-v15-before-operations.db"))?;
+    let opened = crate::services::cash::open(
+        &mut after,
+        1,
+        crate::models::cash::OpenCashInput {
+            operation_token: "qa-opening".into(),
+            opening_amount: 123,
+        },
+    )?;
+    assert_eq!(opened.session.id, 2);
+    drop(after);
+    let mut reopened = open_database_path(&runtime, &path)?;
+    assert_eq!(
+        crate::services::cash::state(&reopened)?,
+        Some(opened.session.clone())
+    );
+    assert_eq!(matching_files(&runtime, "pos-v14-before-v15-").len(), 1);
+    let closed = crate::services::cash::close(
+        &mut reopened,
+        1,
+        crate::models::cash::CloseCashInput {
+            operation_token: "qa-close".into(),
+            session_id: 2,
+            counted_amount: 120,
+        },
+    )?;
+    assert_eq!(closed.session.difference, Some(-3));
+    assert_eq!(
+        crate::services::cash::session(&reopened, 1)?,
+        historical.session
+    );
+    drop(reopened);
+    let restored = restore_migration_backup(&runtime, &path, &backups[0])?;
+    validate_database(&restored, 14, true, &path)?;
+    assert_eq!(migration_source_snapshot(&restored, &path, 14)?, snapshot);
+    drop(restored);
+    let result = json!({"status":"passed","route":"v14->v15","target_version":15,"database":path,"backup":backups[0],"historical_session":historical,"closed_session":closed,
+        "verified":["canonical source and target", "all retained columns and sequences", "archived product preserved", "every legacy sale linked to historical session 1", "no fabricated opening or count or expected or difference", "foreign keys", "opening persists restart", "closed snapshot", "validated backup", "durable v14 restore"]});
+    fs::write(
+        root.join("result-v14-v15.json"),
+        serde_json::to_vec_pretty(&result)?,
+    )?;
+    Ok(result)
+}
+
+#[test]
+fn v14_cash_upgrade_preserves_archived_sales_and_durable_restore() {
+    let root = tempfile::tempdir().unwrap();
+    cash_v14_upgrade_qa(root.path()).unwrap();
+}
+
 #[test]
 #[ignore = "creates inspectable QA artifacts with POS_MIGRATION_QA_DIR"]
 fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
@@ -387,7 +497,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
 
     let connection = open_database_path(&runtime, &database_path)?;
     assert_v13_data(&connection, &before)?;
-    let backup_files = matching_files(&runtime, "pos-v8-before-v13-");
+    let backup_files = matching_files(&runtime, "pos-v8-before-v15-");
     let completed_files = matching_files(&runtime, "pos-schema-v13-migration-completed-");
     assert_eq!(backup_files.len(), 1);
     assert_eq!(completed_files.len(), 1);
@@ -399,7 +509,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     drop(backup);
     let manifest: MigrationManifest = serde_json::from_slice(&fs::read(&completed_files[0])?)?;
     assert_eq!(manifest.source_version, 8);
-    assert_eq!(manifest.target_version, 13);
+    assert_eq!(manifest.target_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(manifest.backup_path, backup_files[0]);
     assert!(manifest.created_at_unix_seconds > 0);
     let completed: CompletedMigrationManifest =
@@ -426,7 +536,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         migration_target_snapshot(&reopened, &database_path, 8)?,
         v8_snapshot
     );
-    assert_eq!(matching_files(&runtime, "pos-v8-before-v13-").len(), 1);
+    assert_eq!(matching_files(&runtime, "pos-v8-before-v15-").len(), 1);
     assert_eq!(
         matching_files(&runtime, "pos-schema-v13-migration-completed-").len(),
         1
@@ -480,6 +590,8 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
 
     let v8_result = json!({
         "status": "passed",
+        "route": "v8->v15",
+        "target_version": CURRENT_SCHEMA_VERSION,
         "source_commit": "e2ab2d2",
         "migration_sha256": V8_MIGRATIONS.iter().chain(IMMUTABLE_V9_V12_MIGRATIONS.iter()).map(|(name, _, hash)| json!({"file":name,"sha256":hash})).collect::<Vec<_>>(),
         "credentials": {"email":"admin@pos.local","password":"PosDemo123!"},
@@ -493,8 +605,8 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         "after": {"integrity": v8_after_integrity, "summary": v8_after_summary},
         "verified": [
             "v8 source identity", "v8 preflight", "productive open_database_path",
-            "v13 integrity", "validated v8 backup", "completed manifest", "no pending marker",
-            "idempotent second open", "credentials", "legacy values", "sequence holes", "001-012 migration hashes", "v9-v13 backfills",
+            "v15 integrity", "validated v8 backup", "completed manifest", "no pending marker",
+            "idempotent second open", "credentials", "legacy values", "sequence holes", "001-012 migration hashes", "v9-v15 backfills",
             "complete v8 restore snapshot", "durable v8 restore manifest", "v8 restore reopen", "preserved v8 backup"
         ]
     });
@@ -523,7 +635,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         migration_target_snapshot(&v12_after, &v12_database_path, 12)?,
         v12_snapshot
     );
-    validate_database(&v12_after, 13, true, &v12_database_path)?;
+    validate_database(&v12_after, CURRENT_SCHEMA_VERSION, true, &v12_database_path)?;
     assert_v13_unit_domains(&v12_after)?;
     let v12_financial_after = query_rows(
         &v12_after,
@@ -534,7 +646,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         v12_financial_after,
         vec![vec![json!(0), json!(0), json!(0), json!(0), json!(0)]]
     );
-    let v12_backups = matching_files(&v12_runtime, "pos-v12-before-v13-");
+    let v12_backups = matching_files(&v12_runtime, "pos-v12-before-v15-");
     let v12_manifests = matching_files(&v12_runtime, "pos-schema-v13-migration-completed-");
     assert_eq!(v12_backups.len(), 1);
     assert_eq!(v12_manifests.len(), 1);
@@ -557,7 +669,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     let v12_manifest: MigrationManifest = serde_json::from_slice(&fs::read(&v12_manifests[0])?)?;
     assert_eq!(
         (v12_manifest.source_version, v12_manifest.target_version),
-        (12, 13)
+        (12, CURRENT_SCHEMA_VERSION)
     );
     assert_eq!(v12_manifest.backup_path, v12_backups[0]);
     assert!(v12_manifest.created_at_unix_seconds > 0);
@@ -584,7 +696,12 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         migration_target_snapshot(&v12_reopened, &v12_database_path, 12)?,
         v12_snapshot
     );
-    validate_database(&v12_reopened, 13, true, &v12_database_path)?;
+    validate_database(
+        &v12_reopened,
+        CURRENT_SCHEMA_VERSION,
+        true,
+        &v12_database_path,
+    )?;
     assert_v13_unit_domains(&v12_reopened)?;
     assert_eq!(
         query_rows(
@@ -594,7 +711,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         )?,
         vec![vec![json!(0)]]
     );
-    assert_eq!(matching_files(&v12_runtime, "pos-v12-before-v13-").len(), 1);
+    assert_eq!(matching_files(&v12_runtime, "pos-v12-before-v15-").len(), 1);
     assert_eq!(
         matching_files(&v12_runtime, "pos-schema-v13-migration-completed-").len(),
         1
@@ -654,7 +771,12 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     assert!(quarantined_database.is_file());
     let quarantined =
         Connection::open_with_flags(quarantined_database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    validate_database(&quarantined, 13, true, quarantined_database)?;
+    validate_database(
+        &quarantined,
+        CURRENT_SCHEMA_VERSION,
+        true,
+        quarantined_database,
+    )?;
     assert_eq!(
         migration_target_snapshot(&quarantined, quarantined_database, 12)?,
         v12_snapshot
@@ -676,9 +798,78 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     drop(restored_reopened);
     assert_intermediate_versions_rejected(&root)?;
 
+    let v13_before_path = root.join("before-v13.db");
+    fs::copy(&v12_before_path, &v13_before_path)?;
+    let mut v13_before = Connection::open(&v13_before_path)?;
+    migrations::run_to_v13(&mut v13_before)?;
+    v13_before.execute_batch("INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Compra v13','SKU-1','compra v13','sku-1',3,'piece',125,250,'manual','compra','entrada',2,2,2,10,12,'Proveedor','proveedor','V13','v13','purchase-v13','purchase-v13'); UPDATE products SET stock=12 WHERE id=1;")?;
+    validate_database(&v13_before, 13, true, &v13_before_path)?;
+    let v13_snapshot = migration_source_snapshot(&v13_before, &v13_before_path, 13)?;
+    drop(v13_before);
+    let v13_runtime = root.join("runtime-v13-v15");
+    fs::create_dir(&v13_runtime)?;
+    let v13_database_path = v13_runtime.join("pos.db");
+    fs::copy(&v13_before_path, &v13_database_path)?;
+    let v13_after = open_database_path(&v13_runtime, &v13_database_path)?;
+    validate_database(&v13_after, CURRENT_SCHEMA_VERSION, true, &v13_database_path)?;
+    validate_cash_backfill(&v13_after, &v13_database_path)?;
+    assert_eq!(
+        migration_target_snapshot(&v13_after, &v13_database_path, 13)?,
+        v13_snapshot
+    );
+    assert_eq!(
+        query_rows(
+            &v13_after,
+            "SELECT count(*) FROM products WHERE is_active<>1",
+            1
+        )?,
+        vec![vec![json!(0)]]
+    );
+    drop(v13_after);
+    let v13_backups = matching_files(&v13_runtime, "pos-v13-before-v15-");
+    let v13_manifests = matching_files(&v13_runtime, "pos-schema-v13-migration-completed-");
+    assert_eq!(v13_backups.len(), 1);
+    assert_eq!(v13_manifests.len(), 1);
+    let v13_backup =
+        Connection::open_with_flags(&v13_backups[0], OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    validate_database(&v13_backup, 13, true, &v13_backups[0])?;
+    assert_eq!(
+        migration_source_snapshot(&v13_backup, &v13_backups[0], 13)?,
+        v13_snapshot
+    );
+    drop(v13_backup);
+    let v13_reopened = open_database_path(&v13_runtime, &v13_database_path)?;
+    assert_eq!(
+        migration_target_snapshot(&v13_reopened, &v13_database_path, 13)?,
+        v13_snapshot
+    );
+    drop(v13_reopened);
+    assert_eq!(matching_files(&v13_runtime, "pos-v13-before-v15-").len(), 1);
+    fs::copy(
+        &v13_database_path,
+        root.join("after-v13-v15-before-restore.db"),
+    )?;
+    let v13_restored = restore_migration_backup(&v13_runtime, &v13_database_path, &v13_backups[0])?;
+    validate_database(&v13_restored, 13, true, &v13_database_path)?;
+    assert_eq!(
+        migration_source_snapshot(&v13_restored, &v13_database_path, 13)?,
+        v13_snapshot
+    );
+    drop(v13_restored);
+    let v13_result = json!({
+        "status":"passed", "route":"v13->v15", "target_version":CURRENT_SCHEMA_VERSION,
+        "database":v13_database_path, "backup":v13_backups[0], "completed_manifest":v13_manifests[0],
+        "verified":["canonical v13 and v15", "complete retained history including v13 purchase prices", "all products initially active", "validated v13 backup", "idempotent reopen", "complete v13 restore snapshot", "historical cash session without fabricated reconciliation"]
+    });
+    fs::write(
+        root.join("result-v13-v15.json"),
+        serde_json::to_vec_pretty(&v13_result)?,
+    )?;
+
     let v12_result = json!({
         "status": "passed",
-        "route": "v12->v13",
+        "route": "v12->v15",
+        "target_version": CURRENT_SCHEMA_VERSION,
         "database": v12_database_path,
         "backup": v12_backups[0],
         "completed_manifest": v12_manifests[0],
@@ -694,17 +885,19 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         root.join("result-v12-v13.json"),
         serde_json::to_vec_pretty(&v12_result)?,
     )?;
+    let v14_result = cash_v14_upgrade_qa(&root)?;
     fs::write(
         root.join("result.json"),
         serde_json::to_vec_pretty(&json!({
             "status": "passed",
-            "routes": {"v8->v13": v8_result, "v12->v13": v12_result}
+            "target_version": CURRENT_SCHEMA_VERSION,
+            "routes": {"v8->v15": v8_result, "v12->v15": v12_result, "v13->v15": v13_result, "v14->v15": v14_result}
         }))?,
     )?;
     fs::write(
         root.join("README.txt"),
         format!(
-            "Linea POS migration QA: PASSED\n\nRoute v8 -> v13\nSource: main e2ab2d2 migrations 001-008\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nCredentials: admin@pos.local / PosDemo123!\n\nRoute v12 -> v13\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nCombined report: {}\n",
+            "Linea POS migration QA: PASSED (target v15; historical entrypoint/artifact names retained)\n\nRoute v8 -> v15\nSource: main e2ab2d2 migrations 001-008\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nCredentials: admin@pos.local / PosDemo123!\n\nRoute v12 -> v15\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nRoute v13 -> v15: result-v13-v15.json\nRoute v14 -> v15: result-v14-v15.json\nCombined report: {}\n",
             before_path.display(),
             database_path.display(),
             backup_files[0].display(),

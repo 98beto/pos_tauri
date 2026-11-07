@@ -231,6 +231,15 @@ mod tests {
             .unwrap();
         connection.execute("INSERT INTO products (name, name_search_key, price, stock, sku, sku_search_key, brand_id, category_id) VALUES ('Producto', 'producto', 1250, 2, 'SKU-1', 'sku-1', 1, 1)", []).unwrap();
         connection.execute("INSERT INTO product_presentations (product_id, name, mode, base_quantity, price, is_default) VALUES (1, 'Pieza', 'fixed', 1, 1250, 1)", []).unwrap();
+        crate::services::cash::open(
+            &mut connection,
+            1,
+            crate::models::cash::OpenCashInput {
+                operation_token: "fixture-open".into(),
+                opening_amount: 0,
+            },
+        )
+        .unwrap();
         connection
     }
 
@@ -241,6 +250,7 @@ mod tests {
         cash: &str,
     ) -> CheckoutCartInput {
         CheckoutCartInput {
+            expected_cash_session_id: Some(1),
             checkout_token: token.into(),
             cart_fingerprint: crate::services::cart::get(connection, cart)
                 .unwrap()
@@ -279,6 +289,7 @@ mod tests {
             1,
             &mut cart,
             CheckoutCartInput {
+                expected_cash_session_id: None,
                 checkout_token: "successful".into(),
                 cart_fingerprint: persisted_fingerprint,
                 payment_method: "efectivo".into(),

@@ -8,6 +8,7 @@ export type BaseUnit = "piece" | "gram" | "milliliter" | "centimeter";
 
 export interface Product {
   id: number;
+  is_active: boolean;
   name: string;
   price: number;
   stock: number;
@@ -47,6 +48,7 @@ export interface ProductCodeMatch {
 }
 
 export interface ProductViewFilters {
+  status?: "active" | "archived" | "all";
   search?: string;
   brand_id?: number;
   category_id?: number;
@@ -58,6 +60,7 @@ export interface ProductViewRow extends Product {
 }
 
 export interface ProductViewStats {
+  // Counts reflect the filtered rows; stock totals include active products only.
   product_count: number;
   piece_stock: number;
   gram_stock: number;

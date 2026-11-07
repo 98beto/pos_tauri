@@ -81,6 +81,7 @@ impl<const N: usize> From<[(i64, i64); N]> for SessionCart {
 }
 
 struct Presentation {
+    available: bool,
     id: i64,
     name: String,
     barcode: Option<String>,
@@ -104,7 +105,7 @@ pub fn get(connection: &Connection, state: &SessionCart) -> ServiceResult<Cart> 
         if !(1..=JS_MAX_SAFE_INTEGER).contains(&entry.entered_quantity) {
             return Err(invalid_quantity());
         }
-        let presentation = load_presentation(connection, entry.presentation_id, true)?;
+        let presentation = load_presentation(connection, entry.presentation_id, false)?;
         let applied_unit_price = entry.unit_price_override.unwrap_or(presentation.price);
         if !(1..=JS_MAX_SAFE_INTEGER).contains(&applied_unit_price) {
             return Err(invalid_price());
@@ -145,15 +146,16 @@ pub fn get(connection: &Connection, state: &SessionCart) -> ServiceResult<Cart> 
             entered_quantity: entry.entered_quantity,
             base_consumed,
             stock_base: presentation.stock,
-            available: false,
+            available: presentation.available,
             line_total: computed_total,
         });
     }
 
     for line in &mut lines {
-        line.available = demand_by_product
-            .get(&line.product_id)
-            .is_some_and(|demand| *demand <= line.stock_base);
+        line.available = line.available
+            && demand_by_product
+                .get(&line.product_id)
+                .is_some_and(|demand| *demand <= line.stock_base);
     }
     let (discount_type, discount_value, discount_amount) =
         discount_values(state.discount, subtotal)?;
@@ -372,15 +374,24 @@ pub fn remove(
     presentation_id: i64,
 ) -> ServiceResult<Cart> {
     validate_id(presentation_id)?;
-    mutate(connection, state, |candidate| {
-        if candidate.lines.remove(&presentation_id).is_none() {
-            return Err(item_not_found());
-        }
-        if candidate.lines.is_empty() {
+    let mut candidate = state.clone();
+    if candidate.lines.remove(&presentation_id).is_none() {
+        return Err(item_not_found());
+    }
+    if candidate.is_empty() {
+        candidate.discount = CartDiscount::None;
+    }
+    // Removing a line must not be blocked by other unavailable lines or by a
+    // fixed discount that no longer fits the reduced subtotal.
+    let cart = match get(connection, &candidate) {
+        Err(error) if error.code == "INVALID_CART_DISCOUNT" => {
             candidate.discount = CartDiscount::None;
+            get(connection, &candidate)?
         }
-        Ok(())
-    })
+        result => result?,
+    };
+    *state = candidate;
+    Ok(cart)
 }
 
 pub fn clear(connection: &Connection, state: &mut SessionCart) -> ServiceResult<Cart> {
@@ -544,7 +555,10 @@ fn load_presentation(
     presentation_id: i64,
     require_active: bool,
 ) -> ServiceResult<Presentation> {
-    let raw = connection.query_row("SELECT pp.id,pp.name,pp.barcode,p.id,p.name,p.sku,p.base_unit,pp.mode,pp.base_quantity,pp.price,p.stock,pp.is_active FROM product_presentations pp JOIN products p ON p.id=pp.product_id WHERE pp.id=?1", [presentation_id], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,i64>(8)?,row.get::<_,i64>(9)?,row.get::<_,i64>(10)?,row.get::<_,bool>(11)?))).optional()?.ok_or_else(|| ServiceError::not_found("PRESENTATION_NOT_FOUND", "La presentacion no existe"))?;
+    let raw = connection.query_row("SELECT pp.id,pp.name,pp.barcode,p.id,p.name,p.sku,p.base_unit,pp.mode,pp.base_quantity,pp.price,p.stock,(pp.is_active AND p.is_active) FROM product_presentations pp JOIN products p ON p.id=pp.product_id WHERE pp.id=?1", [presentation_id], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,i64>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,i64>(8)?,row.get::<_,i64>(9)?,row.get::<_,i64>(10)?,row.get::<_,bool>(11)?))).optional()?.ok_or_else(|| ServiceError::not_found("PRESENTATION_NOT_FOUND", "La presentacion no existe"))?;
+    if require_active {
+        super::products::ensure_active(connection, raw.3)?;
+    }
     if require_active && !raw.11 {
         return Err(ServiceError::conflict(
             "PRESENTATION_INACTIVE",
@@ -552,6 +566,7 @@ fn load_presentation(
         ));
     }
     Ok(Presentation {
+        available: raw.11,
         id: raw.0,
         name: raw.1,
         barcode: raw.2,
@@ -613,6 +628,32 @@ mod tests {
         migrations::run(&mut connection).unwrap();
         connection.execute_batch("INSERT INTO brands(name,name_search_key) VALUES('M','m'); INSERT INTO categories(name,name_search_key) VALUES('C','c'); INSERT INTO products(name,name_search_key,price,stock,sku,sku_search_key,brand_id,category_id,base_unit) VALUES('Tornillo','tornillo',100,200,'T','t',1,1,'piece'); INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,is_default) VALUES(1,'Pieza','fixed',1,100,1); INSERT INTO product_presentations(product_id,name,mode,base_quantity,price) VALUES(1,'Bolsa','fixed',100,8000);").unwrap();
         (connection, 1, 2)
+    }
+
+    #[test]
+    fn archived_cart_is_readable_and_removable_even_with_other_unavailable_lines() {
+        let (mut connection, piece, bag) = database();
+        let mut state = super::SessionCart::from([(piece, 1), (bag, 1)]);
+        super::set_discount(&connection, &mut state, "fixed", "2.00").unwrap();
+        let before = state.clone();
+        crate::services::products::set_active(&mut connection, 1, false).unwrap();
+        let cart = super::get(&connection, &state).unwrap();
+        assert_eq!(cart.lines.len(), 2);
+        assert!(cart.lines.iter().all(|line| !line.available));
+        assert_eq!(state, before);
+        assert_eq!(
+            super::add(&connection, &mut state, piece).unwrap_err().code,
+            "PRODUCT_ARCHIVED"
+        );
+        assert_eq!(state, before);
+        let cart = super::remove(&connection, &mut state, bag).unwrap();
+        assert_eq!(cart.lines.len(), 1);
+        assert!(!cart.lines[0].available);
+        assert_eq!(state.discount, super::CartDiscount::None);
+        assert!(super::remove(&connection, &mut state, piece)
+            .unwrap()
+            .lines
+            .is_empty());
     }
 
     #[test]

@@ -7,10 +7,26 @@ import { createCategory, listCategories, updateCategory } from "./categories";
 import { confirmPurchasePriceCorrection, createPurchase, createStockCount, getInventoryView, getProductInventoryDetail, listInventoryMovements, lookupInventoryMovement, quotePurchase, quotePurchasePriceCorrection, quoteStockCount, searchInventoryProducts } from "./inventory";
 import { createProductWithPresentations, findProductByCode, findProductBySku, getProductsView, listProductSelector, listProducts, updateProductWithPresentations } from "./products";
 import { getSaleHistoryDetail, getSalesView, listSales } from "./sales";
+import { cashIncome, cashWithdraw, closeCashSession, getCashSessionDetail, getCashState, listCashSessions, openCashSession } from "./cash";
 
 beforeEach(() => invokeMock.mockReset().mockResolvedValue(undefined));
 
 describe("Tauri API adapters", () => {
+  it("keeps exact cash cents, durable tokens and original checkout/session filters in the IPC envelope", async () => {
+    const opening = { operation_token: "open-token", opening_amount: 29 };
+    const movement = { operation_token: "movement-token", session_id: 2, amount: 101, reason: "Cambio" };
+    const closing = { operation_token: "close-token", session_id: 2, counted_amount: 0 };
+    const checkout = { checkout_token: "sale-token", cart_fingerprint: "cart", payment_method: "tarjeta" as const, expected_cash_session_id: 2 };
+    await getCashState(); await listCashSessions(); await getCashSessionDetail(2);
+    await openCashSession(opening); await cashIncome(movement); await cashWithdraw(movement); await closeCashSession(closing);
+    await checkoutCart(checkout); await getSalesView({ cash_session_id: 1 });
+    expect(invokeMock.mock.calls).toEqual([
+      ["get_cash_state"], ["list_cash_sessions"], ["get_cash_session_detail", { sessionId: 2 }],
+      ["open_cash_session", { input: opening }], ["cash_income", { input: movement }],
+      ["cash_withdraw", { input: movement }], ["close_cash_session", { input: closing }],
+      ["checkout_cart", { input: checkout }], ["get_sales_view", { filters: { cash_session_id: 1 } }],
+    ]);
+  });
   it("returns a movement for a lost response and null when the token is absent", async () => {
     const movement = { id: 41, operation_token: "lost-response" };
     invokeMock.mockResolvedValueOnce(movement).mockResolvedValueOnce(null);

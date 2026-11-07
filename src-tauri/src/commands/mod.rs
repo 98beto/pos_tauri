@@ -130,3 +130,4 @@ mod tests {
         assert!(state.cart.is_empty());
     }
 }
+pub mod cash;
