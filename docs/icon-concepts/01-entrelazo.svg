@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Entrelazo</title>
+  <desc>Monograma LP compacto: dos trazos geométricos se cruzan y comparten una base.</desc>
+  <rect width="512" height="512" rx="112" fill="#102C4C"/>
+  <path d="M156 133V359H340" stroke="#F7FBFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M239 359V154H319C365 154 390 180 390 219C390 258 365 283 319 283H239" stroke="#52D8CC" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Línea de cierre</title>
+  <desc>La L continua de trazo grueso y redondeado termina en un punto turquesa, acompañada por un arco abierto sobre fondo petróleo.</desc>
+  <rect width="512" height="512" rx="112" fill="#126C83"/>
+  <path d="M256 105C172 105 104 173 104 257C104 341 172 409 256 409" stroke="#74E3D5" stroke-width="24" stroke-linecap="round"/>
+  <g transform="translate(134.4 100.52) scale(0.64)">
+    <path d="M202 119V344C202 369 216 382 242 382H365" stroke="#FFFFFF" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M260 382H365" stroke="#21BFB4" stroke-width="66" stroke-linecap="round"/>
+  </g>
+  <circle cx="368" cy="345" r="30" fill="#74E3D5"/>
+</svg>

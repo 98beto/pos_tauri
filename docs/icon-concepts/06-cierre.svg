@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Cierre</title>
+  <desc>Una L amplia y firme termina en un punto de transacción, dentro de un anillo abierto.</desc>
+  <rect width="512" height="512" rx="112" fill="#126C83"/>
+  <path d="M256 105C172 105 104 173 104 257C104 341 172 409 256 409" stroke="#74E3D5" stroke-width="24" stroke-linecap="round"/>
+  <path d="M224 160V315C224 333 236 345 254 345H343" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="368" cy="345" r="30" fill="#74E3D5"/>
+</svg>
