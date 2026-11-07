@@ -7,3 +7,4 @@ export { Modal, type ModalProps } from "./Modal";
 export { Spinner, type SpinnerProps } from "./Spinner";
 export { StatCard, type StatCardProps } from "./StatCard";
 export { Toast, type ToastProps } from "./Toast";
+export { ViewToggle } from "./ViewToggle";
