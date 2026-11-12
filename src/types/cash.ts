@@ -37,6 +37,24 @@ export interface CashOperation {
 export interface CashSessionDetail {
   session: CashSession;
   operations: CashOperation[];
+  timeline: CashTimelineEvent[];
+}
+/** Derived read model, not a token-bearing persisted cash operation. Amount is
+ * net sale total, opening fund, manual amount or counted closing cash in cents. */
+export interface CashTimelineEvent {
+  event_key: string;
+  session_id: number;
+  kind: "open" | "income" | "withdraw" | "cash_sale" | "close";
+  operation_id: number | null;
+  sale_id: number | null;
+  ticket_number: string | null;
+  amount: number;
+  reason: string;
+  user_id: number;
+  operator: string;
+  created_at: string;
+  cash_received: number | null;
+  change_amount: number | null;
 }
 export interface OpenCashInput {
   operation_token: string;

@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use super::{checked_total, validate_id, ServiceError, ServiceResult, JS_MAX_SAFE_INTEGER};
 use crate::models::cash::{
     CashBreakdown, CashMovementInput, CashOperation, CashSession, CashSessionDetail,
-    CloseCashInput, OpenCashInput,
+    CashTimelineEvent, CashTimelineKind, CloseCashInput, OpenCashInput,
 };
 
 fn conflict(code: &'static str) -> ServiceError {
@@ -174,10 +174,79 @@ pub fn detail(connection: &Connection, id: i64) -> ServiceResult<CashSessionDeta
     let operations = connection.prepare("SELECT id,session_id,kind,amount,reason,user_id,operator,operation_token,created_at FROM cash_operations WHERE session_id=?1 ORDER BY id")?.query_map([id], |r| Ok(CashOperation {
         id:r.get(0)?,session_id:r.get(1)?,kind:r.get(2)?,amount:r.get(3)?,reason:r.get(4)?,user_id:r.get(5)?,operator:r.get(6)?,operation_token:r.get(7)?,created_at:r.get(8)?,
     }))?.collect::<Result<Vec<_>,_>>()?;
+    let mut timeline = Vec::new();
+    for op in &operations {
+        let kind = match op.kind.as_str() {
+            "open" => CashTimelineKind::Open,
+            "income" => CashTimelineKind::Income,
+            "withdraw" => CashTimelineKind::Withdraw,
+            "close" => CashTimelineKind::Close,
+            _ => {
+                return Err(ServiceError::internal(
+                    "INVALID_CASH_OPERATION",
+                    "Movimiento de caja invalido",
+                ))
+            }
+        };
+        timeline.push(CashTimelineEvent {
+            event_key: format!("operation:{}", op.id),
+            session_id: id,
+            kind,
+            operation_id: Some(op.id),
+            sale_id: None,
+            ticket_number: None,
+            amount: op.amount,
+            reason: op.reason.clone(),
+            user_id: op.user_id,
+            operator: op.operator.clone(),
+            created_at: op.created_at.clone(),
+            cash_received: None,
+            change_amount: None,
+        });
+    }
+    let mut statement = connection.prepare("SELECT id,total,user_id,cashier_name,cashier_email,sale_date,cash_received,change_amount FROM sales WHERE cash_session_id=?1 AND payment_method='efectivo' ORDER BY id")?;
+    let sales = statement.query_map([id], |r| {
+        let sale_id: i64 = r.get(0)?;
+        Ok(CashTimelineEvent {
+            event_key: format!("sale:{sale_id}"),
+            session_id: id,
+            kind: CashTimelineKind::CashSale,
+            operation_id: None,
+            sale_id: Some(sale_id),
+            ticket_number: Some(format!("POS-{sale_id:08}")),
+            amount: r.get(1)?,
+            reason: String::new(),
+            user_id: r.get(2)?,
+            operator: format!("{} <{}>", r.get::<_, String>(3)?, r.get::<_, String>(4)?),
+            created_at: r.get(5)?,
+            cash_received: r.get(6)?,
+            change_amount: r.get(7)?,
+        })
+    })?;
+    timeline.extend(sales.collect::<Result<Vec<_>, _>>()?);
+    sort_timeline(&mut timeline);
     Ok(CashSessionDetail {
         session,
         operations,
+        timeline,
     })
+}
+
+fn sort_timeline(timeline: &mut [CashTimelineEvent]) {
+    // Timestamp ties do not reveal commit order across tables. Open first, close
+    // last, then lexical source key is a deterministic presentation-only tie-break.
+    let rank = |kind| match kind {
+        CashTimelineKind::Open => 0,
+        CashTimelineKind::Close => 2,
+        _ => 1,
+    };
+    timeline.sort_by(|a, b| {
+        (&a.created_at, rank(a.kind), &a.event_key).cmp(&(
+            &b.created_at,
+            rank(b.kind),
+            &b.event_key,
+        ))
+    });
 }
 
 pub fn open(
@@ -376,6 +445,193 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn timeline_projects_net_checkout_cash_without_a_second_ledger_and_survives_retries() {
+        let mut c = db();
+        c.execute(
+            "UPDATE product_presentations SET price=15000 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let id = open(&mut c, 1, opening("open", 0)).unwrap().session.id;
+        let cart = SessionCart::from([(1, 1)]);
+        let input = CheckoutCartInput {
+            expected_cash_session_id: Some(id),
+            checkout_token: "net-cash".into(),
+            cart_fingerprint: cart::get(&c, &cart).unwrap().cart_fingerprint,
+            payment_method: "efectivo".into(),
+            cash_received: Some("200.00".into()),
+        };
+        let receipt = sales::checkout(&mut c, 1, &cart, input).unwrap();
+        checkout(&mut c, Some(id), "card", "tarjeta").unwrap();
+        checkout(&mut c, Some(id), "transfer", "transferencia").unwrap();
+        movement(&mut c, 2, manual(id, "income", 15000), false).unwrap();
+        movement(&mut c, 2, manual(id, "withdraw", 5000), true).unwrap();
+        let before = session(&c, id).unwrap();
+        let projected = detail(&c, id).unwrap();
+        assert_eq!(projected.session, before);
+        assert_eq!(before.expected_amount, Some(25000));
+        assert_eq!(before.breakdown.cash_sales, 15000);
+        assert_eq!(before.breakdown.card_sales, 15000);
+        assert_eq!(before.breakdown.transfer_sales, 15000);
+        assert_eq!(before.breakdown.sale_count, 3);
+        assert_eq!(projected.operations.len(), 3);
+        assert_eq!(projected.timeline.len(), 4);
+        let event = projected
+            .timeline
+            .iter()
+            .find(|e| e.kind == CashTimelineKind::CashSale)
+            .unwrap();
+        assert_eq!(event.amount, 15000);
+        assert_eq!(
+            (event.cash_received, event.change_amount),
+            (Some(20000), Some(5000))
+        );
+        assert_eq!(event.sale_id, Some(receipt.sale.id));
+        assert_eq!(event.operation_id, None);
+        assert_eq!(event.ticket_number.as_deref(), Some("POS-00000001"));
+        assert_eq!(event.created_at, receipt.sale.sale_date);
+        assert_eq!(event.operator, "Ada POS <ada@local>");
+        assert_eq!(event.user_id, receipt.sale.user_id);
+        assert!(event.reason.is_empty());
+        assert!(projected
+            .timeline
+            .iter()
+            .any(|e| e.event_key == "operation:1"));
+        assert_eq!(event.event_key, "sale:1"); // Same numeric ID, different namespace.
+        assert!(projected
+            .timeline
+            .iter()
+            .any(|e| e.kind == CashTimelineKind::Income && e.amount == event.amount));
+        let closed = close(&mut c, 2, closing(id, "close", 24000)).unwrap();
+        assert_eq!(closed.session.expected_amount, before.expected_amount);
+        assert_eq!(closed.session.breakdown, before.breakdown);
+        assert_eq!(closed.session.difference, Some(-1000));
+        assert_eq!(closed.operations.len(), 4);
+        assert_eq!(closed.timeline.len(), 5);
+        let close_event = closed
+            .timeline
+            .iter()
+            .find(|e| e.kind == CashTimelineKind::Close)
+            .unwrap();
+        assert_eq!(close_event.amount, 24000);
+
+        // Test timestamp ties deliberately, independent of wall clock speed.
+        let mut ties = detail(&c, id).unwrap().timeline;
+        for e in &mut ties {
+            e.created_at = "2026-01-01 12:00:00".into();
+        }
+        ties.reverse();
+        sort_timeline(&mut ties);
+        assert_eq!(
+            ties.iter()
+                .map(|e| e.event_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "operation:1",
+                "operation:2",
+                "operation:3",
+                "sale:1",
+                "operation:4"
+            ]
+        );
+
+        let next_id = open(&mut c, 1, opening("next", 0)).unwrap().session.id;
+        checkout(&mut c, Some(next_id), "other-session", "tarjeta").unwrap();
+        // Another session's cash sale must also stay out of the old timeline.
+        c.execute("UPDATE product_presentations SET price=100 WHERE id=1", [])
+            .unwrap();
+        checkout(&mut c, Some(next_id), "other-cash", "efectivo").unwrap();
+        c.execute(
+            "UPDATE users SET first_name='Renamed',email='new@local' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let retry = sales::checkout(
+            &mut c,
+            1,
+            &SessionCart::default(),
+            CheckoutCartInput {
+                expected_cash_session_id: Some(id),
+                checkout_token: "net-cash".into(),
+                cart_fingerprint: receipt.sale.cart_fingerprint.clone(),
+                payment_method: "efectivo".into(),
+                cash_received: Some("200.00".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(retry, receipt);
+        let recovered = close(&mut c, 2, closing(id, "close", 24000)).unwrap();
+        assert_eq!(recovered.session, closed.session);
+        assert_eq!(recovered.timeline, closed.timeline);
+        assert_eq!(
+            serde_json::to_value(&recovered.operations).unwrap(),
+            serde_json::to_value(&closed.operations).unwrap()
+        );
+        assert_eq!(detail(&c, id).unwrap().timeline, closed.timeline);
+        assert_eq!(
+            movement(&mut c, 2, manual(id, "income", 15000), false)
+                .unwrap()
+                .timeline,
+            closed.timeline
+        );
+        assert_eq!(recovered.operations.len(), 4);
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM cash_operations WHERE session_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            4
+        );
+        let json = serde_json::to_value(&recovered).unwrap();
+        let sale_json = json["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "cash_sale")
+            .unwrap();
+        assert_eq!(sale_json["amount"], 15000);
+        assert!(sale_json["operation_id"].is_null());
+        assert!(sale_json.get("operation_token").is_none());
+    }
+
+    #[test]
+    fn historical_timeline_uses_legacy_sales_without_fabricated_cash_operations() {
+        let mut c = Connection::open_in_memory().unwrap();
+        migrations::run_to_v8(&mut c).unwrap();
+        c.execute_batch("INSERT INTO users(first_name,last_name,email,password_hash) VALUES('Current','Profile','current@local','hash');
+            INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,total,payment_method,cash_received)
+            VALUES(1,'Historical Cashier','old@local','old-cash','old-fp','2020-01-01 12:00:00',15000,'efectivo',20000),
+            (1,'Historical Cashier','old@local','old-card','card-fp','2020-01-02 12:00:00',200,'tarjeta',NULL);").unwrap();
+        migrations::run(&mut c).unwrap();
+        let historical = detail(&c, 1).unwrap();
+        assert!(historical.session.historical);
+        assert_eq!(
+            (
+                historical.session.opening_amount,
+                historical.session.expected_amount,
+                historical.session.counted_amount,
+                historical.session.difference
+            ),
+            (None, None, None, None)
+        );
+        assert!(historical.operations.is_empty());
+        assert_eq!(historical.timeline.len(), 1);
+        let event = &historical.timeline[0];
+        assert_eq!(event.kind, CashTimelineKind::CashSale);
+        assert_eq!(event.operator, "Historical Cashier <old@local>");
+        assert_eq!(event.created_at, "2020-01-01 12:00:00");
+        assert_eq!(event.amount, 15000);
+        assert_eq!(
+            (event.cash_received, event.change_amount),
+            (Some(20000), None)
+        );
+        assert_eq!(historical.session.breakdown.cash_sales, 15000);
+        assert_eq!(historical.session.breakdown.card_sales, 200);
     }
 
     #[test]

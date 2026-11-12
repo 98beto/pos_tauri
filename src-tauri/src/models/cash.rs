@@ -69,4 +69,33 @@ pub struct CashOperation {
 pub struct CashSessionDetail {
     pub session: CashSession,
     pub operations: Vec<CashOperation>,
+    pub timeline: Vec<CashTimelineEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CashTimelineKind {
+    Open,
+    Income,
+    Withdraw,
+    CashSale,
+    Close,
+}
+
+/// Read-only projection; never an additional persisted cash operation.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct CashTimelineEvent {
+    pub event_key: String,
+    pub session_id: i64,
+    pub kind: CashTimelineKind,
+    pub operation_id: Option<i64>,
+    pub sale_id: Option<i64>,
+    pub ticket_number: Option<String>,
+    pub amount: i64,
+    pub reason: String,
+    pub user_id: i64,
+    pub operator: String,
+    pub created_at: String,
+    pub cash_received: Option<i64>,
+    pub change_amount: Option<i64>,
 }

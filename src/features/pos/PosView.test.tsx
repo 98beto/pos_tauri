@@ -1090,6 +1090,36 @@ describe("PosView", () => {
     expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
     expect(onNotice).toHaveBeenCalledWith({ tone: "error", message: "Venta completada, no se pudo actualizar el carrito." });
     expect(screen.queryByText(/confirmar el cobro/i)).toBeNull();
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes cash after recovering a confirmed legacy sale even when the cart reload fails", async () => {
+    vi.mocked(getCashState).mockResolvedValue(null);
+    savePendingCheckout({ version: 1, userId: user.id, checkoutToken: "legacy-confirmed", cartFingerprint: cart.cart_fingerprint, paymentMethod: "tarjeta" });
+    mockedGetCart.mockResolvedValueOnce(cart).mockRejectedValueOnce(new Error("offline"));
+    await renderLoaded();
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+    expect(mockedCheckoutCart).toHaveBeenCalledWith(expect.objectContaining({ checkout_token: "legacy-confirmed" }));
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
+    expect(screen.queryByText("Cobro pendiente de confirmar")).toBeNull();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
+  });
+
+  it("keeps a confirmed sale completed if its cash refresh fails", async () => {
+    vi.mocked(getCashState).mockResolvedValueOnce(openCash).mockRejectedValueOnce(new Error("offline"));
+    await renderLoaded();
+    expect(screen.queryByRole("button", { name: "Actualizar caja" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    await settleMutation(screen.getByRole("button", { name: /^Cobrar/ }));
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar recibo" }));
+    expect(screen.getByRole("button", { name: "Reintentar consulta de caja" })).toBeTruthy();
+    expect(screen.queryByText("Cobro pendiente de confirmar")).toBeNull();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
   });
 
   it.each([false, true])("reports expired authentication after confirmed checkout reload without restoring the intent (recovery=%s)", async (recovery) => {
@@ -1310,6 +1340,31 @@ describe("PosView", () => {
     expect(checkoutCart).not.toHaveBeenCalled();
   });
 
+  it("only offers cash retry on failure, and enables checkout after a successful retry", async () => {
+    const retry = deferred<typeof openCash | null>();
+    vi.mocked(getCashState).mockRejectedValueOnce(new Error("offline")).mockReturnValueOnce(retry.promise);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Reintentar consulta de caja" }));
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Consultando estado de caja...")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Actualizar caja" })).toBeNull();
+    await act(async () => retry.resolve(openCash));
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(false);
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(checkoutCart).not.toHaveBeenCalled();
+  });
+
+  it("reports authentication errors from the cash query", async () => {
+    vi.mocked(getCashState).mockRejectedValueOnce({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion requerida" });
+    const { onSessionRequired } = await renderLoaded();
+    expect(onSessionRequired).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Reintentar consulta de caja" })).toBeTruthy();
+  });
+
   it("keeps an archived/unavailable cart line removable and explains why it cannot be sold", async () => {
     mockedGetCart.mockResolvedValue({ ...cart, lines: cart.lines.map((line) => ({ ...line, available: false })) });
     vi.mocked(removeCartItem).mockResolvedValueOnce(emptyCart);
@@ -1329,6 +1384,8 @@ describe("PosView", () => {
     const onOpenCash = vi.fn();
     render(<PosView user={user} sessionId={1} onNotice={vi.fn()} onSessionRequired={vi.fn()} onOpenCash={onOpenCash} />);
     await act(async () => undefined);
+    expect(screen.queryByRole("button", { name: "Abrir caja" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
     fireEvent.focus(window); await act(async () => undefined);
     fireEvent.click(screen.getByRole("button", { name: "Abrir caja" }));
     expect(onOpenCash).toHaveBeenCalledOnce();

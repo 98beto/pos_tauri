@@ -26,7 +26,7 @@ export const navigation: NavigationItem[] = [
     description: "Registra una nueva venta y administra el cobro.",
     icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M4 5.5h2l1.5 9h9.4l1.7-6H7M9.5 19h.01M16.5 19h.01" /></Icon>,
   },
-  { id: "cash", label: "Caja", title: "Caja", description: "Apertura, movimientos y cierre final de caja.", icon: null },
+  { id: "cash", label: "Caja", title: "Caja", description: "Apertura, movimientos y cierre final de caja.", icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M7 10V4h10v6M5 10h14l1 5v5H4v-5l1-5Zm-1 5h16M8 7h4M9 18h6" /></Icon> },
   {
     id: "products",
     label: "Productos",

@@ -292,6 +292,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired, onOpenCa
       setReceipt(recovered);
       setCart(clearedCart);
       setPickerItems([]);
+      void refreshCashState();
       try {
         const refreshOperation = nextCartOperation();
         const nextCart = await getCart();
@@ -632,6 +633,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired, onOpenCa
       setCashReceived("");
       setCart(clearedCart);
       setPickerItems([]);
+      void refreshCashState();
       try {
         const refreshOperation = nextCartOperation();
         const nextCart = await getCart();
@@ -686,7 +688,7 @@ export function PosView({ user, sessionId, onNotice, onSessionRequired, onOpenCa
   return (
     <main id="main-content" tabIndex={-1} className="p-4 outline-none sm:p-6 min-[900px]:p-8">
       {checkoutStorageError && <section role="alert" className="mb-4 rounded-card border border-danger/25 bg-danger-soft p-4"><p>{checkoutStorageError.message}</p><Button disabled={busy} onClick={inspectPendingCheckout}>Releer cobro guardado</Button>{checkoutStorageError.records.length > 0 && <Button disabled={busy} onClick={() => { setStorageReviewed(false); setStorageReviewOpen(true); }}>Revisar datos guardados</Button>}</section>}
-      <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-line bg-surface p-4" role="status"><span>{cashStateError || (cashState === undefined ? "Consultando estado de caja..." : cashState ? `Caja #${cashState.id} abierta` : "No hay caja abierta. Abre caja para cobrar con cualquier metodo.")}</span><div className="flex gap-2"><Button onClick={() => void refreshCashState()}>Actualizar caja</Button>{cashState?.status !== "open" && onOpenCash && <Button onClick={onOpenCash}>Abrir caja</Button>}</div></section>
+      <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-line bg-surface p-4" role="status"><span>{cashStateError || (cashState === undefined ? "Consultando estado de caja..." : cashState ? `Caja #${cashState.id} abierta` : "No hay caja abierta. Abre caja para cobrar con cualquier metodo.")}</span><div className="flex gap-2">{cashStateError && <Button onClick={() => void refreshCashState()}>Reintentar consulta de caja</Button>}{cashState === null && onOpenCash && <Button onClick={onOpenCash}>Abrir caja</Button>}</div></section>
       {pending && (
         <section className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-card border border-warning/30 bg-warning-soft p-4" role="status">
           <div><strong className="text-sm text-ink">Cobro pendiente de confirmar</strong><p className="mt-1 text-xs text-muted">La intencion permanece guardada y puede recuperar el recibo sin volver a cobrar.</p><p className="mt-1 text-xs text-muted">{pending.expectedCashSessionId === undefined ? "Intento anterior: solo puede recuperar una venta ya confirmada." : `Caja original #${pending.expectedCashSessionId}. No se cambiara al reintentar.`}</p></div>

@@ -1,14 +1,15 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { cashIncome, cashWithdraw, closeCashSession, getCashSessionDetail, getCashState, listCashSessions, openCashSession } from "../../api/cash";
-import { openCash } from "../../test/cash-fixtures";
+import { cashIncomeEvent, cashSaleEvent, openCash } from "../../test/cash-fixtures";
 import { deferred, user } from "../../test/fixtures";
 import type { CashSession, CashSessionDetail } from "../../types/cash";
 import { readCashIntent, saveCashIntent } from "./cash-intent";
 import { CashView } from "./CashView";
+import { formatDateTime } from "../../lib/format";
 
 vi.mock("../../api/cash", () => ({ getCashState: vi.fn(), listCashSessions: vi.fn(), getCashSessionDetail: vi.fn(), openCashSession: vi.fn(), cashIncome: vi.fn(), cashWithdraw: vi.fn(), closeCashSession: vi.fn() }));
-const detail: CashSessionDetail = { session: openCash, operations: [] };
+const detail: CashSessionDetail = { session: openCash, operations: [], timeline: [] };
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(getCashState).mockResolvedValue(openCash);
@@ -17,7 +18,7 @@ beforeEach(() => {
   vi.mocked(openCashSession).mockResolvedValue(detail);
   vi.mocked(cashIncome).mockResolvedValue(detail);
   vi.mocked(cashWithdraw).mockResolvedValue(detail);
-  vi.mocked(closeCashSession).mockResolvedValue({ session: { ...openCash, status: "closed", counted_amount: 999, difference: -1 }, operations: [] });
+  vi.mocked(closeCashSession).mockResolvedValue({ session: { ...openCash, status: "closed", counted_amount: 999, difference: -1 }, operations: [], timeline: [] });
 });
 async function loaded() {
   const onNotice = vi.fn(); const onSessionRequired = vi.fn();
@@ -29,6 +30,34 @@ const click = async (name: string) => { const buttons = screen.getAllByRole("but
 const amount = (label: string, value: string) => fireEvent.change(screen.getByLabelText(label, { exact: false }), { target: { value } });
 
 describe("CashView", () => {
+  it("shows net cash sales alongside distinct manual movements and non-income opening/closing amounts", async () => {
+    const base = { ...cashIncomeEvent, session_id: 2 };
+    vi.mocked(getCashSessionDetail).mockResolvedValue({ ...detail, timeline: [
+      { ...base, event_key: "operation:1", operation_id: 1, kind: "open", amount: 0, reason: "" },
+      cashSaleEvent,
+      { ...base, amount: 15000, reason: "Fondo adicional" },
+      { ...base, event_key: "operation:5", operation_id: 5, kind: "withdraw", amount: 500, reason: "Pago menor" },
+      { ...base, event_key: "operation:6", operation_id: 6, kind: "close", amount: 0, reason: "" },
+    ] });
+    await loaded(); await click("Ver caja #2");
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.getByRole("heading", { name: "Movimientos de caja" })).toBeTruthy();
+    const rows = dialog.getAllByRole("listitem");
+    expect(rows).toHaveLength(5);
+    expect(rows[0].textContent).toContain("Fondo inicial · $0.00");
+    const sale = within(rows[1]);
+    expect(sale.getByText("Venta en efectivo · +$150.00")).toBeTruthy();
+    expect(sale.getByText("POS-00000001")).toBeTruthy();
+    expect(sale.queryByRole("link")).toBeNull();
+    expect(sale.getByText("Recibido: $200.00")).toBeTruthy();
+    expect(sale.getByText("Cambio: $50.00")).toBeTruthy();
+    expect(sale.getByText(`Ada <ada@example.com> · ${formatDateTime(cashSaleEvent.created_at)}`)).toBeTruthy();
+    expect(rows[2].textContent).toContain("Ingreso manual · +$150.00");
+    expect(rows[2].textContent).toContain("Fondo adicional");
+    expect(rows[3].textContent).toContain("Retiro · −$5.00");
+    expect(rows[3].textContent).toContain("Pago menor");
+    expect(rows[4].textContent).toContain("Cierre · Efectivo contado · $0.00");
+  });
   it.each(["income", "withdraw", "close"] as const)("pins a %s form to its opening session and discards old input when focus finds another session", async (kind) => {
     await loaded(); await click(kind === "income" ? "Registrar ingreso" : kind === "withdraw" ? "Registrar retiro" : "Cerrar caja");
     const label = kind === "close" ? "Efectivo contado" : "Importe";
@@ -181,7 +210,7 @@ describe("CashView", () => {
     expect(screen.getByRole("dialog", { name: "Confirmar cierre final" })).toBeTruthy();
     expect(closeCashSession).toHaveBeenCalledWith(expect.objectContaining({ session_id: 2, counted_amount: 999 }));
     vi.mocked(getCashState).mockResolvedValue(null);
-    await act(async () => response.resolve({ session: { ...openCash, status: "closed", counted_amount: 999, difference: -1 }, operations: [] }));
+    await act(async () => response.resolve({ session: { ...openCash, status: "closed", counted_amount: 999, difference: -1 }, operations: [], timeline: [] }));
     expect(within(screen.getByRole("dialog", { name: "Detalle de caja" })).getByText("Caja #2 · Cerrada")).toBeTruthy();
   });
 
@@ -189,7 +218,7 @@ describe("CashView", () => {
     const historical: CashSession = { ...openCash, id: 1, historical: true, status: "closed", opening_amount: null, expected_amount: null, counted_amount: null, difference: null, opened_by: null, opening_operator: null, opened_at: "2020-01-01 10:00:00", closed_at: "2021-12-31 15:00:00", breakdown: { ...openCash.breakdown, cash_sales: 300 } };
     vi.mocked(getCashState).mockResolvedValue(null);
     vi.mocked(listCashSessions).mockResolvedValue([historical]);
-    vi.mocked(getCashSessionDetail).mockResolvedValue({ session: historical, operations: [] });
+    vi.mocked(getCashSessionDetail).mockResolvedValue({ session: historical, operations: [], timeline: [{ ...cashSaleEvent, session_id: 1, amount: 300, cash_received: null, change_amount: null }] });
     await loaded(); await click("Ver caja #1");
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText("Caja #1 · Historica · Cerrada")).toBeTruthy();
@@ -198,6 +227,11 @@ describe("CashView", () => {
     expect(within(dialog).getByText(/Ultima venta:/).textContent).toContain("2021");
     expect(within(dialog).queryByRole("button", { name: "Cerrar caja" })).toBeNull();
     expect(within(dialog).getAllByText("$0.00", { selector: "dd" }).length).toBeGreaterThan(0); // Known breakdown zero, not fabricated reconciliation.
+    expect(within(dialog).getByText("Venta en efectivo · +$3.00")).toBeTruthy();
+    expect(within(dialog).queryByText(/^Recibido:/)).toBeNull();
+    expect(within(dialog).queryByText(/^Cambio:/)).toBeNull();
+    expect(within(dialog).queryByText(/^Fondo inicial ·/)).toBeNull();
+    expect(within(dialog).queryByText(/^Cierre · Efectivo contado ·/)).toBeNull();
   });
 
   it("never dispatches when storage cannot persist the intention", async () => {
@@ -211,7 +245,7 @@ describe("CashView", () => {
 
   it("recovers a persisted movement with its original session, never the currently open one", async () => {
     saveCashIntent({ version: 1, userId: user.id, token: "original", kind: "income", sessionId: 1, amount: 10, reason: "Cambio" });
-    vi.mocked(cashIncome).mockResolvedValue({ session: { ...openCash, id: 1, status: "closed" }, operations: [{ id: 4, session_id: 1, kind: "income", amount: 10, reason: "Cambio", user_id: user.id, operator: "Otro operador <otro@example.com>", operation_token: "original", created_at: "2026-01-01 12:00:00" }] });
+    vi.mocked(cashIncome).mockResolvedValue({ session: { ...openCash, id: 1, status: "closed" }, operations: [{ id: 4, session_id: 1, kind: "income", amount: 10, reason: "Cambio", user_id: user.id, operator: "Otro operador <otro@example.com>", operation_token: "original", created_at: "2026-01-01 12:00:00" }], timeline: [cashIncomeEvent] });
     await loaded(); await click("Reintentar operacion");
     expect(cashIncome).toHaveBeenCalledWith({ operation_token: "original", session_id: 1, amount: 10, reason: "Cambio" });
     expect(within(screen.getByRole("dialog")).getByText(/Otro operador/)).toBeTruthy();

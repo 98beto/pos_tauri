@@ -27,7 +27,9 @@ CashMovementInput = {
 CloseCashInput = {
   operation_token: string; session_id: number; counted_amount: number
 }
-CashSessionDetail = { session: CashSession; operations: CashOperation[] }
+CashSessionDetail = {
+  session: CashSession; operations: CashOperation[]; timeline: CashTimelineEvent[]
+}
 CashSession = {
   id: number; status: "open" | "closed"; historical: boolean;
   opening_amount: number | null; opened_by: number | null;
@@ -46,6 +48,14 @@ CashOperation = {
   amount: number; reason: string; user_id: number; operator: string;
   operation_token: string; created_at: string
 }
+CashTimelineEvent = {
+  event_key: string; session_id: number;
+  kind: "open" | "income" | "withdraw" | "cash_sale" | "close";
+  operation_id: number | null; sale_id: number | null;
+  ticket_number: string | null; amount: number; reason: string;
+  user_id: number; operator: string; created_at: string;
+  cash_received: number | null; change_amount: number | null
+}
 ```
 
 - Importes: **centavos enteros**, no texto decimal ni pesos, entre 0 y
@@ -63,6 +73,45 @@ CashOperation = {
   del snapshot persistido. `counted_amount` y `difference` son null estando abierta.
 - `operations` ordenadas por id ascendente. Incluye apertura/cierre; para éstos
   `reason` es `""` y `amount` es apertura/contado respectivamente.
+
+### Historial unificado (read model aditivo)
+
+`timeline` es obligatorio en todo `CashSessionDetail`, también en respuestas de
+apertura, movimiento, cierre y reintento. No modifica `operations` ni crea otro
+ledger: se deriva de esas operaciones y de ventas de **la sesión solicitada** con
+`payment_method='efectivo'`. Tarjeta/transferencia siguen en el desglose, no en
+esta cronología. No requiere migración, backfill ni escrituras adicionales.
+
+- Operación: `event_key=operation:ID`, `operation_id=ID`, `sale_id` y
+  `ticket_number` null. Importe, motivo, usuario, operador y fecha conservan el
+  snapshot auditado; recibido/cambio son null. No expone `operation_token`.
+- Venta: `event_key=sale:ID`, `sale_id=ID`, `operation_id=null`, ticket
+  `POS-00000001` (mismo formato de Ventas). `amount=total` neto en centavos,
+  **no** recibido; `reason=""`. Usuario y operador proceden de `sales.user_id`,
+  `cashier_name` y `cashier_email`, fecha de `sale_date`, nunca del perfil actual.
+  `cash_received`/`change_amount` conservan los valores persistidos, incluidos null
+  históricos, sin inferirlos ni descontar cambio otra vez.
+- Orden ascendente por `created_at`; a igual fecha, apertura primero y cierre al
+  final; los demás empatan por `event_key` lexicográfico. Es presentación estable,
+  no una afirmación de secuencia global de commits entre tablas. No hay saldo
+  corrido inventado.
+- UI: «Movimientos de caja», «Fondo inicial» (sin signo de ingreso), «Ingreso
+  manual», «Retiro», «Venta en efectivo» (+total neto), «Cierre · Efectivo contado»
+  (sin signo de ingreso). Apertura/cierre cero son válidos. Ticket es texto plano;
+  recibido/cambio sólo se muestran cuando existen. Se conserva fecha/operador y
+  motivo manual.
+
+La fórmula continúa siendo apertura + ventas efectivo + ingresos − retiros,
+calculada desde las fuentes previas, **no** sumando `timeline`. El cierre muestra
+contado, no un ingreso. Reintentos no duplican ventas, eventos ni operaciones.
+Sesiones cerradas conservan el snapshot de saldo/desglose y sus ventas protegidas;
+la cronología sigue derivándose de esas fuentes inmutables. La sesión histórica 1
+expone sus ventas efectivo antiguas sin fabricar apertura/cierre auditados ni
+convertir reconciliaciones desconocidas de null a cero.
+
+Auditoría de alcance: cambio limitado a DTO Rust/TS, consulta de detalle,
+presentación de Caja y regresiones/fixtures; sin APIs de modificación de ventas,
+dependencias, navegación/POS, schema/migraciones ni cambios al flujo de compras.
 
 ## Checkout e intenciones pendientes
 

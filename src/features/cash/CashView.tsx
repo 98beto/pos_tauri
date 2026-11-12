@@ -1,15 +1,26 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { getCashState, getCashSessionDetail, listCashSessions } from "../../api/cash";
-import { Button, EmptyState, Field, Modal, Spinner } from "../../components/ui";
+import { Button, EmptyState, Field, Modal, MovementIndicator, movementAppearance, Spinner } from "../../components/ui";
 import { errorMessage, isAppError, isSessionRequired } from "../../lib/app-error";
 import { formatDateTime } from "../../lib/format";
-import type { CashSession, CashSessionDetail } from "../../types/cash";
+import type { CashSession, CashSessionDetail, CashTimelineEvent } from "../../types/cash";
 import type { User } from "../../types/user";
 import { clearCashIntent, formatCashAmount as formatMoney, parseCashAmount, readCashIntent, saveCashIntent, submitCashIntent, type CashAction, type CashIntent } from "./cash-intent";
 
 type Props = { user: User; onNotice: (notice: { tone: "success" | "error" | "info"; message: string }) => void; onSessionRequired: () => void };
 const labels: Record<CashAction, string> = { open: "Abrir caja", income: "Registrar ingreso", withdraw: "Registrar retiro", close: "Cerrar caja" };
 const money = (amount: number | null) => amount === null ? "No registrado" : formatMoney(amount);
+const timelineLabels: Record<CashTimelineEvent["kind"], string> = { open: "Fondo inicial", income: "Ingreso manual", withdraw: "Retiro", cash_sale: "Venta en efectivo", close: "Cierre · Efectivo contado" };
+
+function Timeline({ events }: { events: CashTimelineEvent[] }) {
+  return <><h4 className="mt-5 font-bold">Movimientos de caja</h4>{!events.length && <p>No hay movimientos registrados.</p>}<ol className="mt-3 grid gap-3">{events.map((event) => { const tone = event.kind === "income" || event.kind === "cash_sale" ? "positive" : event.kind === "withdraw" ? "negative" : "neutral"; return <li key={event.event_key} className={`break-words rounded-control border border-line border-l-4 p-3 ${movementAppearance[tone].card}`}>
+    <MovementIndicator tone={tone}>{timelineLabels[event.kind]} · {event.kind === "income" || event.kind === "cash_sale" ? "+" : event.kind === "withdraw" ? "−" : ""}{formatMoney(event.amount)}</MovementIndicator>
+    {event.ticket_number && <p>{event.ticket_number}</p>}
+    {event.reason && <p>{event.reason}</p>}
+    {event.kind === "cash_sale" && <>{event.cash_received !== null && <p>Recibido: {formatMoney(event.cash_received)}</p>}{event.change_amount !== null && <p>Cambio: {formatMoney(event.change_amount)}</p>}</>}
+    <p className="text-sm">{event.operator} · {formatDateTime(event.created_at)}</p>
+  </li>; })}</ol></>;
+}
 
 function Summary({ session: s }: { session: CashSession }) {
   const values: [string, number | null][] = [["Fondo de apertura", s.opening_amount], ["Ventas en efectivo", s.breakdown.cash_sales], ["Tarjeta", s.breakdown.card_sales], ["Transferencia", s.breakdown.transfer_sales], ["Ingresos", s.breakdown.income], ["Retiros", s.breakdown.withdrawals], ["Esperado", s.expected_amount], ["Contado", s.counted_amount], ["Diferencia", s.difference]];
@@ -153,7 +164,7 @@ export function CashView({ user, onNotice, onSessionRequired }: Props) {
       {confirmation && <><p>Caja destino #{confirmation.sessionId}</p><dl><dt>Esperado actual</dt><dd>{money(current?.expected_amount ?? null)}</dd><dt>Contado</dt><dd>{formatMoney(confirmation.amount)}</dd><dt>Diferencia prevista</dt><dd>{current?.expected_amount === null || current?.expected_amount === undefined ? "No registrado" : formatMoney(confirmation.amount - current.expected_amount)}</dd></dl></>}
     </Modal>
     <Modal open={detailOpen} title="Detalle de caja" onClose={closeDetail} closeDisabled={busy} footer={<Button disabled={busy} onClick={closeDetail}>Cerrar detalle</Button>} size="lg">
-      {detailLoading ? <p role="status">Cargando detalle...</p> : detailError ? <div role="alert">{detailError}<Button onClick={() => selectedId && void showDetail(selectedId)}>Reintentar detalle</Button></div> : detail && <><Summary session={detail.session} /><h4 className="mt-5 font-bold">Movimientos auditados</h4>{!detail.operations.length && <p>No hay movimientos registrados.</p>}<ol className="mt-3 grid gap-3">{detail.operations.map((op) => <li key={op.id} className="break-words rounded-control border border-line p-3"><strong>{labels[op.kind]} · {formatMoney(op.amount)}</strong><p>{op.reason}</p><p className="text-sm">{op.operator} · {formatDateTime(op.created_at)}</p></li>)}</ol></>}
+      {detailLoading ? <p role="status">Cargando detalle...</p> : detailError ? <div role="alert">{detailError}<Button onClick={() => selectedId && void showDetail(selectedId)}>Reintentar detalle</Button></div> : detail && <><Summary session={detail.session} /><Timeline events={detail.timeline} /></>}
     </Modal>
   </main>;
 }
