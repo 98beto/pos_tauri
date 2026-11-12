@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type ViewId = "pos" | "products" | "inventory" | "sales" | "cash";
+export type ViewId = "pos" | "products" | "inventory" | "sales" | "cash" | "purchases";
 
 export type NavigationItem = {
   id: ViewId;
@@ -48,4 +48,5 @@ export const navigation: NavigationItem[] = [
     description: "Consulta tickets y el historial de operaciones.",
     icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M6 3h12v18l-3-2-3 2-3-2-3 2V3Zm3 5h6M9 12h6M9 16h3" /></Icon>,
   },
+  { id: "purchases", label: "Compras", title: "Compras", description: "Registra y consulta facturas documentales de proveedores.", icon: <Icon><path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3Zm3 5h6M9 12h6" /></Icon> },
 ];

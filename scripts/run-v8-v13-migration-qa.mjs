@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
-// Backward-compatible entrypoint; the harness validates v8/v12/v13/v14 -> v15.
+// Backward-compatible entrypoint; the harness validates v8/v12/v13/v14/v15 -> v16.
 
 if (process.argv.length !== 2) {
   console.error("This command accepts no paths or arguments; it always uses a new isolated temporary directory.");

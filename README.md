@@ -16,6 +16,7 @@ Linea POS guarda la información en una base de datos SQLite local y está dispo
 - Control de existencias físicas mediante compras y conteos, con soporte para piezas, peso, volumen y longitud.
 - Precio e importe propios en cada compra, con corrección local que no modifica ventas, stock ni movimientos posteriores.
 - Consulta de movimientos y detalle histórico por producto.
+- Registro documental de facturas de proveedores desde XML CFDI, con PDF opcional y consulta en Compras.
 - Historial de tickets con filtros, totales y detalle de cada venta.
 - Vistas de lista y tarjetas en productos, movimientos y ventas, con preferencia local.
 - Apertura de caja con fondo, ingresos y retiros de efectivo, y cierre con arqueo y diferencia.
@@ -80,16 +81,17 @@ pnpm test:retired-costs
 # Comprobar tipos y generar el frontend de producción
 pnpm build
 
-# Ensayar migración, backup y restauración SQLite desde 8, 12, 13 y 14 hasta 15
+# Ensayar migración, backup y restauración SQLite desde 8, 12, 13, 14 y 15 hasta 16
+pnpm qa:migration-v16
+# Entrada histórica compatible
 pnpm qa:migration-v8-v13
-# Entrada explícita al mismo ensayo (el nombre anterior se conserva por compatibilidad)
 node scripts/run-v15-migration-qa.mjs
 
 # Comprobar el modo de mantenimiento del ejecutable instalado
 /usr/bin/pos_tauri maintenance-info
 
 # Restaurar el backup indicado por el manifiesto, con Linea POS cerrada
-/usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/pos-v12-before-v15-ID.db
+/usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/backup-indicado-en-manifiesto.db
 
 # Comprobar formato, lint y pruebas del backend
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -121,9 +123,15 @@ Las ventas anteriores al control de caja se agrupan en una sesión histórica ce
 
 **Eliminar** oculta un producto de las operaciones nuevas sin borrar su historia ni ajustar stock. En Productos, el filtro **Eliminados** permite restaurarlo; sus códigos permanecen reservados y las presentaciones conservan su estado. La unidad base sigue sin poder modificarse después del alta.
 
+## Facturas de proveedores
+
+En **Compras**, selecciona **Importar factura**, elige el XML y, si lo deseas, adjunta un PDF. Revisa emisor, receptor, importes y la tabla de conceptos originales antes de registrar; cancelar no guarda el documento. En el listado puedes combinar proveedor, número y fechas, alternar lista/tarjetas y abrir **Ver detalle**. Desde el detalle puedes adjuntar un PDF si falta, abrirlo con el visor del sistema y exportar los archivos originales. La preferencia de vista se guarda localmente.
+
+Se admite XML UTF-8 CFDI 4.0 timbrado de ingreso (`I`) de hasta 5 MiB, con namespaces y prefijos variables; el PDF opcional admite hasta 15 MiB y lo aporta el usuario. Los decimales se conservan como texto exacto. No hay extracción de PDF, OCR, IA ni servidor externo, ni certificación SAT. Registrar es únicamente documental: no crea productos, entradas de stock ni pagos o movimientos de caja. El XML y PDF se guardan en SQLite; un respaldo consistente de esa base conserva sus bytes y hashes. No existe una nueva interfaz de respaldo para esta función.
+
 ## Calidad y pruebas
 
-Además de las pruebas automatizadas, el proyecto incluye un ensayo reproducible de las rutas SQLite `8/12/13/14 -> 15`. Verifica la preservación de stock y datos comerciales, las reglas históricas de la migración 013, baja lógica, asociación de ventas a la caja histórica, backup, marcadores, reapertura y rollback al esquema de origen. Consulta [`docs/quality-assurance.md`](docs/quality-assurance.md).
+Además de las pruebas automatizadas, el proyecto incluye un ensayo reproducible de las rutas SQLite `8/12/13/14/15 -> 16`. Cubre datos anteriores, backup, marcadores, reapertura, rollback y conservación de adjuntos en un respaldo v16. La verificación final y los smokes de plataforma están pendientes; consulta [`docs/quality-assurance.md`](docs/quality-assurance.md).
 
 ## Releases
 

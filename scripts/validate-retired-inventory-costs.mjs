@@ -73,18 +73,18 @@ const HISTORICAL_FILES = new Map([
 ]);
 
 const PINNED_REFERENCE_FILES = new Map([
-  ["README.md", "1badb8b650fd8eda1cfe70f04dc04452c445023f5a2b0c7bafcf09e4e89c0892"],
+  ["README.md", "722e8474ab4e8d9d7d216559bef5bd6869c2990d8fbde5bfc94eb72a3b714ae9"],
   ["docs/plans/measured-presentations-inventory-cost-corrections.md", "43e86deb8a8ebde7561cf48a16ceffac8bf83343c627571407cfae6622d70bc6"],
-  ["docs/quality-assurance.md", "1a5e8eb749a19d28ad42dd2c2cd49c57c6fb257d00180319b34611768680fc7e"],
-  ["docs/releases.md", "8401afad72ec08fd3e16a37852a70d9ddc546593c465c566c738ffdecc8c579c"],
+  ["docs/quality-assurance.md", "a5fb0ad78fa88b4087183c96a9b7a264997a61bd719651f7a011bbfd6bb287ee"],
+  ["docs/releases.md", "9874efe49a82f0f383ce7ce9f0ceb158b1666c652198461996fbd44e6aeffef6"],
   // The test suite contains intentional evasions and is itself an immutable reproduction corpus.
   ["scripts/validate-retired-inventory-costs.node-test.mjs", "76dc0d46f0cce85b25cd5dd00a0c60cbe3b43a53e4d183edeb48d5a05fc2fd94"],
-  // Reviewed v14 archive / v15 cash upgrades retain legacy retirement probes,
+  // Reviewed v14 archive / v15 cash / v16 document upgrades retain legacy probes,
   // independent history projections, canonical schemas and backup/restore QA.
   // Exact bytes only: additions (including new consumers) must fail integrity.
-  ["src-tauri/src/db/migrations.rs", "1b9734ca1ecc9a79e6c91f20f94c0de672084b469e47100d80c0f2a33d247343"],
-  ["src-tauri/src/db/mod.rs", "a662476d91e1d7715e846aa001fcf532e315720a78a34b0633673c375fb954c2"],
-  ["src-tauri/src/db/tests/migration_qa.rs", "f3a98c6976305ca85388e1e2c9a0abea16c734031c5851b2b36dbca51ad08c24"],
+  ["src-tauri/src/db/migrations.rs", "e61c9c2cda007720d432971b7bb225ce41db678ebb0725cb06b363ca58444199"],
+  ["src-tauri/src/db/mod.rs", "ee73c5fa11394c0a0bd49e65a6d8e01ee4d322104599ee74faa63e3ad724124c"],
+  ["src-tauri/src/db/tests/migration_qa.rs", "4c6d4187c8ee612056a0989fae8e3863f2b5f1fb5c54da1e9aa1999568f14468"],
 ]);
 
 // Local-only historical corpus: absence is allowed, but only the previously pinned

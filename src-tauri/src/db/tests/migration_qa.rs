@@ -1,4 +1,10 @@
 use super::*;
+
+#[test]
+#[ignore = "creates inspectable v16 QA artifacts with POS_MIGRATION_QA_DIR"]
+fn real_sources_to_v16_migration_qa() -> Result<(), Box<dyn Error>> {
+    real_v8_to_v13_migration_qa()
+}
 use crate::{models::user::LoginInput, services::auth};
 use argon2::{password_hash::PasswordHasher, Argon2};
 use serde_json::{json, Value};
@@ -393,7 +399,7 @@ fn cash_v14_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>>
     drop(before);
     fs::copy(&path, root.join("before-v14.db"))?;
     let mut after = open_database_path(&runtime, &path)?;
-    validate_database(&after, 15, true, &path)?;
+    validate_database(&after, CURRENT_SCHEMA_VERSION, true, &path)?;
     validate_cash_backfill(&after, &path)?;
     assert_eq!(migration_target_snapshot(&after, &path, 14)?, snapshot);
     assert!(!crate::services::products::get(&after, 1)?.is_active);
@@ -418,7 +424,7 @@ fn cash_v14_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>>
             1
         );
     }
-    let backups = matching_files(&runtime, "pos-v14-before-v15-");
+    let backups = matching_files(&runtime, "pos-v14-before-v16-");
     assert_eq!(backups.len(), 1);
     let backup = Connection::open(&backups[0])?;
     validate_database(&backup, 14, true, &backups[0])?;
@@ -443,7 +449,7 @@ fn cash_v14_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>>
         crate::services::cash::state(&reopened)?,
         Some(opened.session.clone())
     );
-    assert_eq!(matching_files(&runtime, "pos-v14-before-v15-").len(), 1);
+    assert_eq!(matching_files(&runtime, "pos-v14-before-v16-").len(), 1);
     let closed = crate::services::cash::close(
         &mut reopened,
         1,
@@ -463,7 +469,7 @@ fn cash_v14_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>>
     validate_database(&restored, 14, true, &path)?;
     assert_eq!(migration_source_snapshot(&restored, &path, 14)?, snapshot);
     drop(restored);
-    let result = json!({"status":"passed","route":"v14->v15","target_version":15,"database":path,"backup":backups[0],"historical_session":historical,"closed_session":closed,
+    let result = json!({"status":"passed","route":"v14->v16","target_version":CURRENT_SCHEMA_VERSION,"database":path,"backup":backups[0],"historical_session":historical,"closed_session":closed,
         "verified":["canonical source and target", "all retained columns and sequences", "archived product preserved", "every legacy sale linked to historical session 1", "no fabricated opening or count or expected or difference", "foreign keys", "opening persists restart", "closed snapshot", "validated backup", "durable v14 restore"]});
     fs::write(
         root.join("result-v14-v15.json"),
@@ -476,6 +482,187 @@ fn cash_v14_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>>
 fn v14_cash_upgrade_preserves_archived_sales_and_durable_restore() {
     let root = tempfile::tempdir().unwrap();
     cash_v14_upgrade_qa(root.path()).unwrap();
+}
+
+fn invoice_v15_upgrade_qa(root: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    use crate::{
+        models::{cash::*, purchase_invoice::*, user::User},
+        services::{
+            cash, purchase_invoice_files::capture, purchase_invoice_parser::parse_purchase_invoice,
+            purchase_invoices as invoices,
+        },
+    };
+    let runtime = root.join("runtime-v15-v16");
+    fs::create_dir(&runtime)?;
+    let path = runtime.join("pos.db");
+    create_v12_database(&path);
+    let mut source = Connection::open(&path)?;
+    migrations::run_to_v15(&mut source)?;
+    source.pragma_update(None, "foreign_keys", true)?;
+    let closed = cash::open(
+        &mut source,
+        1,
+        OpenCashInput {
+            operation_token: "invoice-qa-open-closed".into(),
+            opening_amount: 200,
+        },
+    )?;
+    cash::movement(
+        &mut source,
+        1,
+        CashMovementInput {
+            operation_token: "invoice-qa-income".into(),
+            session_id: closed.session.id,
+            amount: 10,
+            reason: "QA ingreso".into(),
+        },
+        false,
+    )?;
+    cash::close(
+        &mut source,
+        1,
+        CloseCashInput {
+            operation_token: "invoice-qa-close".into(),
+            session_id: closed.session.id,
+            counted_amount: 210,
+        },
+    )?;
+    cash::open(
+        &mut source,
+        1,
+        OpenCashInput {
+            operation_token: "invoice-qa-open-live".into(),
+            opening_amount: 50,
+        },
+    )?;
+    source.execute("UPDATE products SET is_active=0 WHERE id=1", [])?;
+    validate_database(&source, 15, true, &path)?;
+    let snapshot = migration_source_snapshot(&source, &path, 15)?;
+    drop(source);
+    let mut c = open_database_path(&runtime, &path)?;
+    assert_eq!(migration_target_snapshot(&c, &path, 15)?, snapshot);
+    assert_eq!(
+        c.query_row("SELECT count(*) FROM purchase_invoices", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    let backup = matching_files(&runtime, "pos-v15-before-v16-")[0].clone();
+    let original = Connection::open(&backup)?;
+    assert_eq!(migration_source_snapshot(&original, &backup, 15)?, snapshot);
+    assert_eq!(
+        original.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='purchase_invoices'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    drop(original);
+    let xml = capture(
+        include_bytes!("../../../tests/fixtures/cfdi/income.xml").to_vec(),
+        "invoice.xml",
+        InvoiceAttachmentKind::Xml,
+    )?;
+    let pdf = capture(
+        b"%PDF-1.7\nsynthetic\0original".to_vec(),
+        "invoice.pdf",
+        InvoiceAttachmentKind::Pdf,
+    )?;
+    let user: User = c.query_row(
+        "SELECT id,first_name,last_name,email,created_at,updated_at FROM users WHERE id=1",
+        [],
+        |r| {
+            Ok(User {
+                id: r.get(0)?,
+                first_name: r.get(1)?,
+                last_name: r.get(2)?,
+                email: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        },
+    )?;
+    let saved = invoices::register(
+        &mut c,
+        &user,
+        &parse_purchase_invoice(&xml.bytes)?,
+        &xml,
+        Some(&pdf),
+    )?;
+    // Source-v15 rollback deliberately predates documents. A v16 SQLite backup,
+    // not a migration rollback or new maintenance CLI mode, preserves attachments.
+    let clone_path = runtime.join("v16-backup.db");
+    let mut cloned = Connection::open(&clone_path)?;
+    Backup::new(&c, &mut cloned)?.run_to_completion(5, Duration::from_millis(1), None)?;
+    drop(cloned);
+    drop(c);
+    let mut reopened = open_database_path(&runtime, &path)?;
+    assert_eq!(invoices::detail(&reopened, saved.detail.id)?, saved.detail);
+    let restored = open_database_path(&runtime, &clone_path)?;
+    for (kind, expected) in [
+        (InvoiceAttachmentKind::Xml, &xml),
+        (InvoiceAttachmentKind::Pdf, &pdf),
+    ] {
+        let actual = invoices::attachment(&restored, saved.detail.id, kind)?;
+        assert_eq!(actual.metadata, expected.metadata);
+        assert_eq!(actual.bytes, expected.bytes);
+    }
+    // Snapshot all original columns separately from new document sequences.
+    let old_rows = all_v15_rows(&restored, &clone_path)?;
+    assert_eq!(old_rows, snapshot.all_v15_rows);
+    validate_database(&restored, 16, true, &clone_path)?;
+    restored.execute_batch("SAVEPOINT tampered_document; UPDATE purchase_invoice_attachments SET content=zeroblob(size_bytes) WHERE kind='xml';")?;
+    assert!(validate_database(&restored, 16, true, &clone_path).is_err());
+    restored.execute_batch("ROLLBACK TO tampered_document; RELEASE tampered_document;")?;
+    validate_database(&restored, 16, true, &clone_path)?;
+    let open_id = cash::state(&reopened)?.unwrap().id;
+    cash::close(
+        &mut reopened,
+        1,
+        CloseCashInput {
+            operation_token: "qa-close-before-invoice".into(),
+            session_id: open_id,
+            counted_amount: 50,
+        },
+    )?;
+    let closed_snapshot = all_v15_rows(&reopened, &path)?;
+    let next = String::from_utf8(xml.bytes.to_vec())?.replace(
+        "01234567-89ab-cdef-0123-456789abcdef",
+        "11234567-89ab-cdef-0123-456789abcdef",
+    );
+    let next = capture(next.into_bytes(), "next.xml", InvoiceAttachmentKind::Xml)?;
+    invoices::register(
+        &mut reopened,
+        &user,
+        &parse_purchase_invoice(&next.bytes)?,
+        &next,
+        None,
+    )?;
+    assert_eq!(all_v15_rows(&reopened, &path)?, closed_snapshot);
+    drop(restored);
+    drop(reopened);
+    let rollback = restore_migration_backup(&runtime, &path, &backup)?;
+    validate_database(&rollback, 15, true, &path)?;
+    assert_eq!(migration_source_snapshot(&rollback, &path, 15)?, snapshot);
+    drop(rollback);
+    let remigrated = open_database_path(&runtime, &path)?;
+    assert_eq!(
+        remigrated.query_row("SELECT count(*) FROM purchase_invoices", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    let result = json!({"status":"passed","route":"v15->v16","target_version":16,"database":path,"migration_backup":backup,"document_backup":clone_path,"verified":["all old rows and sequences exact across migration","open and closed cash with operations","archived product codes stock and commercial history","no initial invoices","v16 backup and restored reopen original BLOB and hashes","v15 rollback predates invoices"]});
+    fs::write(
+        root.join("result-v15-v16.json"),
+        serde_json::to_vec_pretty(&result)?,
+    )?;
+    Ok(result)
+}
+
+#[test]
+fn v15_invoice_upgrade_and_v16_document_backup_preserve_all_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    invoice_v15_upgrade_qa(root.path()).unwrap();
 }
 
 #[test]
@@ -497,7 +684,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
 
     let connection = open_database_path(&runtime, &database_path)?;
     assert_v13_data(&connection, &before)?;
-    let backup_files = matching_files(&runtime, "pos-v8-before-v15-");
+    let backup_files = matching_files(&runtime, "pos-v8-before-v16-");
     let completed_files = matching_files(&runtime, "pos-schema-v13-migration-completed-");
     assert_eq!(backup_files.len(), 1);
     assert_eq!(completed_files.len(), 1);
@@ -536,7 +723,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         migration_target_snapshot(&reopened, &database_path, 8)?,
         v8_snapshot
     );
-    assert_eq!(matching_files(&runtime, "pos-v8-before-v15-").len(), 1);
+    assert_eq!(matching_files(&runtime, "pos-v8-before-v16-").len(), 1);
     assert_eq!(
         matching_files(&runtime, "pos-schema-v13-migration-completed-").len(),
         1
@@ -590,7 +777,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
 
     let v8_result = json!({
         "status": "passed",
-        "route": "v8->v15",
+        "route": "v8->v16",
         "target_version": CURRENT_SCHEMA_VERSION,
         "source_commit": "e2ab2d2",
         "migration_sha256": V8_MIGRATIONS.iter().chain(IMMUTABLE_V9_V12_MIGRATIONS.iter()).map(|(name, _, hash)| json!({"file":name,"sha256":hash})).collect::<Vec<_>>(),
@@ -605,7 +792,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         "after": {"integrity": v8_after_integrity, "summary": v8_after_summary},
         "verified": [
             "v8 source identity", "v8 preflight", "productive open_database_path",
-            "v15 integrity", "validated v8 backup", "completed manifest", "no pending marker",
+            "v16 integrity", "validated v8 backup", "completed manifest", "no pending marker",
             "idempotent second open", "credentials", "legacy values", "sequence holes", "001-012 migration hashes", "v9-v15 backfills",
             "complete v8 restore snapshot", "durable v8 restore manifest", "v8 restore reopen", "preserved v8 backup"
         ]
@@ -646,7 +833,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         v12_financial_after,
         vec![vec![json!(0), json!(0), json!(0), json!(0), json!(0)]]
     );
-    let v12_backups = matching_files(&v12_runtime, "pos-v12-before-v15-");
+    let v12_backups = matching_files(&v12_runtime, "pos-v12-before-v16-");
     let v12_manifests = matching_files(&v12_runtime, "pos-schema-v13-migration-completed-");
     assert_eq!(v12_backups.len(), 1);
     assert_eq!(v12_manifests.len(), 1);
@@ -711,7 +898,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         )?,
         vec![vec![json!(0)]]
     );
-    assert_eq!(matching_files(&v12_runtime, "pos-v12-before-v15-").len(), 1);
+    assert_eq!(matching_files(&v12_runtime, "pos-v12-before-v16-").len(), 1);
     assert_eq!(
         matching_files(&v12_runtime, "pos-schema-v13-migration-completed-").len(),
         1
@@ -826,7 +1013,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         vec![vec![json!(0)]]
     );
     drop(v13_after);
-    let v13_backups = matching_files(&v13_runtime, "pos-v13-before-v15-");
+    let v13_backups = matching_files(&v13_runtime, "pos-v13-before-v16-");
     let v13_manifests = matching_files(&v13_runtime, "pos-schema-v13-migration-completed-");
     assert_eq!(v13_backups.len(), 1);
     assert_eq!(v13_manifests.len(), 1);
@@ -844,7 +1031,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         v13_snapshot
     );
     drop(v13_reopened);
-    assert_eq!(matching_files(&v13_runtime, "pos-v13-before-v15-").len(), 1);
+    assert_eq!(matching_files(&v13_runtime, "pos-v13-before-v16-").len(), 1);
     fs::copy(
         &v13_database_path,
         root.join("after-v13-v15-before-restore.db"),
@@ -857,9 +1044,9 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
     );
     drop(v13_restored);
     let v13_result = json!({
-        "status":"passed", "route":"v13->v15", "target_version":CURRENT_SCHEMA_VERSION,
+        "status":"passed", "route":"v13->v16", "target_version":CURRENT_SCHEMA_VERSION,
         "database":v13_database_path, "backup":v13_backups[0], "completed_manifest":v13_manifests[0],
-        "verified":["canonical v13 and v15", "complete retained history including v13 purchase prices", "all products initially active", "validated v13 backup", "idempotent reopen", "complete v13 restore snapshot", "historical cash session without fabricated reconciliation"]
+        "verified":["canonical v13 and v16", "complete retained history including v13 purchase prices", "all products initially active", "validated v13 backup", "idempotent reopen", "complete v13 restore snapshot", "historical cash session without fabricated reconciliation"]
     });
     fs::write(
         root.join("result-v13-v15.json"),
@@ -868,7 +1055,7 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
 
     let v12_result = json!({
         "status": "passed",
-        "route": "v12->v15",
+        "route": "v12->v16",
         "target_version": CURRENT_SCHEMA_VERSION,
         "database": v12_database_path,
         "backup": v12_backups[0],
@@ -886,18 +1073,19 @@ fn real_v8_to_v13_migration_qa() -> Result<(), Box<dyn Error>> {
         serde_json::to_vec_pretty(&v12_result)?,
     )?;
     let v14_result = cash_v14_upgrade_qa(&root)?;
+    let v15_result = invoice_v15_upgrade_qa(&root)?;
     fs::write(
         root.join("result.json"),
         serde_json::to_vec_pretty(&json!({
             "status": "passed",
             "target_version": CURRENT_SCHEMA_VERSION,
-            "routes": {"v8->v15": v8_result, "v12->v15": v12_result, "v13->v15": v13_result, "v14->v15": v14_result}
+            "routes": {"v8->v16": v8_result, "v12->v16": v12_result, "v13->v16": v13_result, "v14->v16": v14_result, "v15->v16": v15_result}
         }))?,
     )?;
     fs::write(
         root.join("README.txt"),
         format!(
-            "Linea POS migration QA: PASSED (target v15; historical entrypoint/artifact names retained)\n\nRoute v8 -> v15\nSource: main e2ab2d2 migrations 001-008\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nCredentials: admin@pos.local / PosDemo123!\n\nRoute v12 -> v15\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nRoute v13 -> v15: result-v13-v15.json\nRoute v14 -> v15: result-v14-v15.json\nCombined report: {}\n",
+            "Linea POS migration QA: PASSED (target v16; historical entrypoint/artifact names retained)\n\nRoute v8 -> v16\nSource: main e2ab2d2 migrations 001-008\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nCredentials: admin@pos.local / PosDemo123!\n\nRoute v12 -> v16\nBefore: {}\nRuntime: {}\nBackup: {}\nManifest: {}\nRestore runtime: {}\nReport: {}\nRoute v13 -> v16: result-v13-v15.json\nRoute v14 -> v16: result-v14-v15.json\nRoute v15 -> v16: result-v15-v16.json\nCombined report: {}\n",
             before_path.display(),
             database_path.display(),
             backup_files[0].display(),

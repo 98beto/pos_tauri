@@ -8,6 +8,7 @@ import { ProductsView } from "../features/products/ProductsView";
 import { InventoryView } from "../features/inventory/InventoryView";
 import { SalesView } from "../features/sales/SalesView";
 import { CashView } from "../features/cash/CashView";
+import { PurchasesView } from "../features/purchases/PurchasesView";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
 
@@ -55,6 +56,7 @@ export function AppShell({ user, sessionId, loggingOut, onLogout, onNotice, onSe
         {activeView === "products" && <ProductsView sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "inventory" && <InventoryView key={`inventory-${historyActivation}`} user={user} onNotice={onNotice} onSessionRequired={onSessionRequired} />}
         {activeView === "sales" && <SalesView key={`sales-${historyActivation}`} onSessionRequired={onSessionRequired} />}
+        {activeView === "purchases" && <PurchasesView sessionId={sessionId} onSessionRequired={onSessionRequired} />}
       </div>
     </div>
   );

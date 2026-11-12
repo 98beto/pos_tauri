@@ -11,6 +11,7 @@ vi.mock("../features/products/ProductsView", () => ({ ProductsView: () => <div>V
 vi.mock("../features/inventory/InventoryView", () => ({ InventoryView: ({ onNotice }: { onNotice: (notice: { tone: "success"; message: string }) => void }) => <button onClick={() => onNotice({ tone: "success", message: "Movimiento creado." })}>Vista inventario</button> }));
 vi.mock("../features/sales/SalesView", () => ({ SalesView: () => <div>Vista ventas</div> }));
 vi.mock("../features/cash/CashView", () => ({ CashView: () => <div>Vista caja</div> }));
+vi.mock("../features/purchases/PurchasesView", () => ({ PurchasesView: ({ sessionId, onSessionRequired }: { sessionId: number; onSessionRequired: () => void }) => <button onClick={onSessionRequired}>Vista compras sesión {sessionId}</button> }));
 
 describe("AppShell", () => {
   const updaterControls: UpdaterControls = {
@@ -38,6 +39,10 @@ describe("AppShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Productos" }));
     expect(screen.getByText("Vista productos")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Productos" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Compras" }));
+    expect(screen.getByRole("heading", { name: "Compras" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Vista compras sesión 1" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Inventario" }));
     fireEvent.click(screen.getByRole("button", { name: "Vista inventario" }));

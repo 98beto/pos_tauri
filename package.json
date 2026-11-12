@@ -17,6 +17,7 @@
     "test:signature-integration": "node --test scripts/tauri-signature.integration.node-test.mjs",
     "test:run": "vitest run",
     "qa:migration-v8-v13": "node scripts/run-v8-v13-migration-qa.mjs",
+    "qa:migration-v16": "node scripts/run-v16-migration-qa.mjs",
     "validate:version": "node scripts/validate-version.mjs",
     "build": "tsc -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
     "preview": "vite preview",

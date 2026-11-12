@@ -29,6 +29,7 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     )),
     M::up(include_str!("../../migrations/014_archive_products.sql")),
     M::up(include_str!("../../migrations/015_cash_sessions.sql")),
+    M::up(include_str!("../../migrations/016_purchase_invoices.sql")),
 ];
 const MIGRATIONS: Migrations<'_> = Migrations::from_slice(MIGRATIONS_SLICE);
 
@@ -50,6 +51,10 @@ pub(crate) fn run_to_v13(connection: &mut Connection) -> Result<(), rusqlite_mig
 
 pub(crate) fn run_to_v14(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
     MIGRATIONS.to_version(connection, 14)
+}
+
+pub(crate) fn run_to_v15(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
+    MIGRATIONS.to_version(connection, 15)
 }
 
 #[cfg(test)]
@@ -142,7 +147,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         assert_eq!(table_count, 8);
     }
 
@@ -1388,7 +1393,7 @@ mod tests {
             connection
                 .pragma_update(None, "foreign_keys", true)
                 .unwrap();
-            assert_eq!(version(&connection), 15);
+            assert_eq!(version(&connection), 16);
             assert_eq!(
                 connection
                     .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1620,7 +1625,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(explicit_index_count, 34);
+        assert_eq!(explicit_index_count, 36);
 
         connection
             .execute_batch(

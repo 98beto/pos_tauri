@@ -2,29 +2,33 @@
 
 Esta guía reúne las comprobaciones especializadas que complementan las pruebas automatizadas del proyecto.
 
-## Ensayo de migración SQLite a esquema 15
+## Ensayo de migración SQLite a esquema 16
 
-El ensayo obligatorio cubre las rutas admitidas `8/12/13/14 -> 15`. Crea datos sintéticos, copia cada base a un runtime aislado y la abre mediante la misma función `open_database_path` usada por producción. La fuente v8 usa las migraciones `001`-`008` verificadas por hash contra `main` en `e2ab2d2`; las migraciones `001`-`013` permanecen inmutables.
+El ensayo cubre las rutas admitidas `8/12/13/14/15 -> 16`. Crea datos sintéticos, copia cada base a un runtime aislado y la abre mediante la misma función `open_database_path` usada por producción. La fuente v8 usa las migraciones `001`-`008` verificadas por hash contra `main` en `e2ab2d2`; las migraciones `001`-`013` permanecen inmutables. Una base nueva se crea en 16 sin facturas ficticias.
 
 ```bash
+pnpm qa:migration-v16
+# Entradas históricas compatibles, también con destino 16
 pnpm qa:migration-v8-v13
-# Entrada equivalente con el destino explícito
 node scripts/run-v15-migration-qa.mjs
 ```
 
-El comando no acepta argumentos ni rutas de datos de la aplicación y no abre la interfaz gráfica. Conserva el nombre histórico por compatibilidad con CI; su destino real es v15. Crea un directorio único `pos-tauri-v8-v13-qa-*` bajo el directorio temporal del sistema y al terminar imprime la ruta conservada. Es un gate requerido en CI y antes de generar un candidato de release.
+Los comandos no aceptan argumentos ni rutas de datos de la aplicación y no abren la interfaz gráfica. Crean un directorio único `pos-tauri-v8-v13-qa-*` bajo el directorio temporal del sistema e imprimen la ruta conservada. Los nombres históricos no indican el destino real. Deben pasar antes del candidato de release; su ejecución final está pendiente.
 
 Los artefactos actuales son:
 
 - `before-v8.db` y `before-v8-report.json`.
-- `runtime-v8-v13/pos.db`, su backup `pos-v8-before-v15-*.db` y su manifiesto `pos-schema-v13-migration-completed-*.json`.
+- `runtime-v8-v13/pos.db`, su backup `pos-v8-before-v16-*.db` y su manifiesto `pos-schema-v13-migration-completed-*.json`.
 - Tras el ensayo de restauración, `runtime-v8-v13/pos.db` vuelve al esquema 8 mediante la ruta de producción, con snapshot completo, reapertura, manifiesto de restauración y cuarentena diagnóstica verificados. Se reutiliza el mismo runtime, no se crea otro directorio de restauración.
 - `before-v12.db`.
-- `runtime-v12-v13/pos.db`, su backup `pos-v12-before-v15-*.db` y su manifiesto `pos-schema-v13-migration-completed-*.json`.
+- `runtime-v12-v13/pos.db`, su backup `pos-v12-before-v16-*.db` y su manifiesto `pos-schema-v13-migration-completed-*.json`.
 - Tras el ensayo de restauración, `runtime-v12-v13/pos.db` vuelve al esquema 12 en el mismo runtime, con snapshot completo, reapertura, manifiesto de restauración y cuarentena diagnóstica verificados.
 - `before-v13.db`, `runtime-v13-v15/pos.db` y `result-v13-v15.json`.
-- `before-v14.db`, `runtime-v14-v15/pos.db`, backup `pos-v14-before-v15-*.db` y `result-v14-v15.json`, con producto archivado y restauración durable.
-- `result-v8-v13.json`, `result-v12-v13.json`, `result.json` y `README.txt`. Nombres con `v13` son históricos; los reportes declaran `target_version: 15`.
+- `before-v14.db`, `runtime-v14-v15/pos.db`, backup `pos-v14-before-v16-*.db` y `result-v14-v15.json`, con producto archivado y restauración durable.
+- `runtime-v15-v16/pos.db`, backup `pos-v15-before-v16-*.db`, `runtime-v15-v16/v16-backup.db` y `result-v15-v16.json`.
+- `result-v8-v13.json`, `result-v12-v13.json`, `result.json` y `README.txt`. Nombres con `v13` o `v15` son históricos; los reportes declaran `target_version: 16`.
+
+El caso v15 comprueba que la migración no fabrica facturas y conserva datos anteriores; después registra documentos sintéticos y comprueba bytes y hashes tras un backup SQLite v16 y su reapertura. El rollback al backup anterior a la migración restaura v15 y necesariamente pierde las facturas y demás operaciones creadas después. Una copia SQLite consistente de v16 conserva BLOB y hashes; no se ha añadido una interfaz nueva de backup.
 
 Credenciales ficticias: `admin@pos.local` / `PosDemo123!`.
 
@@ -56,6 +60,8 @@ Además de los tests automatizados, el smoke funcional debe cubrir:
 7. Alternar lista/tarjetas en las tres vistas, conservando filtros, acciones y preferencia después de navegar.
 
 ### Smoke funcional y rollback
+
+Pendiente de ejecución final: en un perfil aislado importar CFDI 4.0 de ingreso, revisar conceptos originales, adjuntar PDF, registrar, filtrar y alternar lista/tarjetas, abrir detalle, exportar ambos archivos y abrir el PDF. Comparar bytes exportados y comprobar que stock y caja no cambian. Probar cancelación y duplicado. El smoke manual de Linux y Windows está bloqueado hasta disponer de entorno y operador; no se afirma ejecución en Windows.
 
 El gate de release sanea y reempaqueta primero el AppImage final; despues extrae ese AppImage y los DEB/RPM y ejecuta `maintenance-info` desde cada payload, antes de firmar o publicar. En Windows ejecuta `pos_tauri.exe maintenance-info`, inspecciona NSIS/MSI y corre Rust en debug y release; los tests de integracion mantienen por separado `pos-application.lock` y `pos-schema-v13-migration.lock` en un proceso y comprueban que otro proceso rechaza la restauracion con codigo 4.
 
