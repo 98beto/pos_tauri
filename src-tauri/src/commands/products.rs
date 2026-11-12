@@ -13,6 +13,39 @@ use crate::{
 use super::{with_authenticated_connection, AuthSession};
 
 #[tauri::command]
+pub fn get_product(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    id: i64,
+) -> Result<Product, AppError> {
+    with_authenticated_connection(&database, &session, |connection, _| {
+        products::get(connection, id)
+    })
+}
+
+#[tauri::command]
+pub fn archive_product(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    id: i64,
+) -> Result<Product, AppError> {
+    with_authenticated_connection(&database, &session, |connection, _| {
+        products::set_active(connection, id, false)
+    })
+}
+
+#[tauri::command]
+pub fn restore_product(
+    database: State<'_, Database>,
+    session: State<'_, AuthSession>,
+    id: i64,
+) -> Result<Product, AppError> {
+    with_authenticated_connection(&database, &session, |connection, _| {
+        products::set_active(connection, id, true)
+    })
+}
+
+#[tauri::command]
 pub fn get_products_view(
     database: State<'_, Database>,
     session: State<'_, AuthSession>,

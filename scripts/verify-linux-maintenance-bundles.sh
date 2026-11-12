@@ -57,11 +57,12 @@ deb=$(realpath "$2")
 checked_path=$3
 rpm=$(realpath "$3")
 work_dir=$(mktemp -d)
+version=$(node -p 'require(process.argv[1]).version' "$(dirname -- "$(realpath -- "$0")")/../package.json")
 
 verify_maintenance() {
   checked_path=$1
   "$@" > "$work_dir/maintenance-info.stdout"
-  printf '%s\n' 'Linea POS 0.2.1: mantenimiento local disponible' | cmp - "$work_dir/maintenance-info.stdout"
+  printf 'Linea POS %s: mantenimiento local disponible\n' "$version" | cmp - "$work_dir/maintenance-info.stdout"
   rm -- "$work_dir/maintenance-info.stdout"
 }
 

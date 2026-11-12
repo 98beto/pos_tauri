@@ -1,7 +1,7 @@
 {
   "name": "pos_tauri",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "packageManager": "pnpm@12.4.1",
   "engines": {
@@ -17,14 +17,15 @@
     "test:signature-integration": "node --test scripts/tauri-signature.integration.node-test.mjs",
     "test:run": "vitest run",
     "qa:migration-v8-v13": "node scripts/run-v8-v13-migration-qa.mjs",
+    "qa:migration-v16": "node scripts/run-v16-migration-qa.mjs",
     "validate:version": "node scripts/validate-version.mjs",
     "build": "tsc -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
-    "@fontsource-variable/fraunces": "^5.3.0",
     "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/manrope": "^5.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.12.0",

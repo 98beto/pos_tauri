@@ -43,7 +43,7 @@ const PURCHASE_CONCEPTS = [
 // Names below src/** are deliberately never ignored.
 const IGNORED_GENERATED_ROOTS = new Set([".git", "dist", "node_modules", "target", "src-tauri/target"]);
 
-// Migrations 001-012 have shipped. Any byte-level change is a gate failure, even if it
+// Migrations 001-013 have shipped. Any byte-level change is a gate failure, even if it
 // does not contain a retired symbol.
 const IMMUTABLE_FILES = new Map([
   ["src-tauri/migrations/001_create_users.sql", "847244dee2c0dde13120abfe8c2cd01ef81f8ce9e5937daaab311255d74a75d0"],
@@ -58,6 +58,7 @@ const IMMUTABLE_FILES = new Map([
   ["src-tauri/migrations/010_rebuild_sale_details.sql", "ed7ae6cb9652cad3ea16ea9bce37b6d2f60e41b6001047bd7f6d94ec677ae1d5"],
   ["src-tauri/migrations/011_rebuild_inventory_movements.sql", "6ab324ab5c4453880ea9d5852a99167efd8c51d9b71cee253e0a51b9ff117fc6"],
   ["src-tauri/migrations/012_add_sale_pricing_and_discounts.sql", "dfb071ef4f53a9bf923b5c9d5a10d9a10f9eec1c261e8b8ba9caa1a503225a1a"],
+  ["src-tauri/migrations/013_measured_presentations_centimeters.sql", "7e6a762f915c132d0354ed6ec99171325472e55d515fe4f128de39b6ef78ddd2"],
 ]);
 
 const HISTORICAL_FILES = new Map([
@@ -72,16 +73,18 @@ const HISTORICAL_FILES = new Map([
 ]);
 
 const PINNED_REFERENCE_FILES = new Map([
-  ["README.md", "045f9255f1b9550cfb6f2f078a0ab61dd247312538601e1e8d24f70a51a626b3"],
+  ["README.md", "722e8474ab4e8d9d7d216559bef5bd6869c2990d8fbde5bfc94eb72a3b714ae9"],
   ["docs/plans/measured-presentations-inventory-cost-corrections.md", "43e86deb8a8ebde7561cf48a16ceffac8bf83343c627571407cfae6622d70bc6"],
-  ["docs/quality-assurance.md", "4f1caf23b223fb6d92fcee0609d34dcd16e08cc99f89f8cadb9091851b1d4ec7"],
-  ["docs/releases.md", "467b4dd31a27ee9775479ac4cedbb30e7dd9a80e95d0b272d8850e355ae5e8ab"],
+  ["docs/quality-assurance.md", "a5fb0ad78fa88b4087183c96a9b7a264997a61bd719651f7a011bbfd6bb287ee"],
+  ["docs/releases.md", "af2d2a853c1d0ec77a34333d970af566ade65ca6d2bc4ef85c670525e1fe0323"],
   // The test suite contains intentional evasions and is itself an immutable reproduction corpus.
-  ["scripts/validate-retired-inventory-costs.node-test.mjs", "2a4bea52a96310e78ecfb7a3b33ef79998aa76ccce8db62911d82caaf846e7e7"],
-  // These files retain the shipped-schema compatibility and migration QA corpus.
-  ["src-tauri/src/db/migrations.rs", "353a4b5226533e325983d53f97f833c75a99b15ce89782877a6af75801975fe2"],
-  ["src-tauri/src/db/mod.rs", "a92764382e4067a9cefcf475515623d4cea6f7c39acf39179e33d7d393ad2d1e"],
-  ["src-tauri/src/db/tests/migration_qa.rs", "09207bedd4aae147608c3befadbb299fa6db898ebf0be7172b73b384e126c0bf"],
+  ["scripts/validate-retired-inventory-costs.node-test.mjs", "76dc0d46f0cce85b25cd5dd00a0c60cbe3b43a53e4d183edeb48d5a05fc2fd94"],
+  // Reviewed v14 archive / v15 cash / v16 document upgrades retain legacy probes,
+  // independent history projections, canonical schemas and backup/restore QA.
+  // Exact bytes only: additions (including new consumers) must fail integrity.
+  ["src-tauri/src/db/migrations.rs", "e61c9c2cda007720d432971b7bb225ce41db678ebb0725cb06b363ca58444199"],
+  ["src-tauri/src/db/mod.rs", "ee73c5fa11394c0a0bd49e65a6d8e01ee4d322104599ee74faa63e3ad724124c"],
+  ["src-tauri/src/db/tests/migration_qa.rs", "4c6d4187c8ee612056a0989fae8e3863f2b5f1fb5c54da1e9aa1999568f14468"],
 ]);
 
 // Local-only historical corpus: absence is allowed, but only the previously pinned
@@ -104,16 +107,16 @@ const ACTIVE_EXCEPTIONS = [
   { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/models/inventory_movement.rs", line: 229, column: 18, fingerprint: "87fb57171213acb0072eb5f263f9b7a8d0a207541dabaaea1b3b36c0074943b0" },
   { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/models/inventory_movement.rs", line: 230, column: 13, fingerprint: "00ee7b06c53563596632ce61d94c7291a06602643242fc2b061cdb469cf6e447" },
   { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 598, column: 23, fingerprint: "9c93cf2a8f171f9989f4f7999bffecbf4a5f79cff7b835bff9a0a8fd75dea580" },
-  { symbol: SYMBOLS.unitPrice, path: "src-tauri/src/services/inventory.rs", line: 1079, column: 27, fingerprint: "3dbfacb06dcc7252420e83419b2b240665d214192d70cabc2d1cb0e53ca956d9" },
-  { symbol: snake("purchase", "unit", "price", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1079, column: 18, fingerprint: "3dbfacb06dcc7252420e83419b2b240665d214192d70cabc2d1cb0e53ca956d9" },
-  { symbol: SYMBOLS.unitPrice, path: "src-tauri/src/services/inventory.rs", line: 1080, column: 22, fingerprint: "51547739cd6a285afc59fbb62374f975fc9ca69f8a201b01e32f9f4b1ccd2796" },
-  { symbol: snake("purchase", "unit", "price", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1080, column: 13, fingerprint: "51547739cd6a285afc59fbb62374f975fc9ca69f8a201b01e32f9f4b1ccd2796" },
-  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1081, column: 18, fingerprint: "1fccb8a1e10fb3437bd1f77820f6781759f529a69a9af52cbf9673e82d49c8a5" },
-  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1082, column: 13, fingerprint: "57ffaeeeb577382845a7f50d121c88fc3b6332996f50e1a417a223e41fa9ba67" },
-  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1690, column: 35, fingerprint: "7366a0a04a2f3ecab6b8d57b49f95d1d6983fc08c0acabc9bf5501d5a20a7f41" },
-  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 2159, column: 32, fingerprint: "8fd7eed8fd5816144fdfdf40889a444f9359b0fcf1b655351f4bd79e2d0087ef" },
-  { symbol: SYMBOLS.englishTerm, path: "src/features/inventory/InventoryView.test.tsx", line: 232, column: 15, fingerprint: "86409642a1fa3041e305c93ce8f250c38e718e4f4b5fb70690dceab7e1e0a2f6" },
-  { symbol: SYMBOLS.spanishTerm, path: "src/features/inventory/InventoryView.test.tsx", line: 236, column: 120, fingerprint: "4ee1ae444697c1b7e803e809efa47b4fcf2d2aba890b70bf521511fdc5640928" },
+  { symbol: SYMBOLS.unitPrice, path: "src-tauri/src/services/inventory.rs", line: 1080, column: 27, fingerprint: "3dbfacb06dcc7252420e83419b2b240665d214192d70cabc2d1cb0e53ca956d9" },
+  { symbol: snake("purchase", "unit", "price", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1080, column: 18, fingerprint: "3dbfacb06dcc7252420e83419b2b240665d214192d70cabc2d1cb0e53ca956d9" },
+  { symbol: SYMBOLS.unitPrice, path: "src-tauri/src/services/inventory.rs", line: 1081, column: 22, fingerprint: "51547739cd6a285afc59fbb62374f975fc9ca69f8a201b01e32f9f4b1ccd2796" },
+  { symbol: snake("purchase", "unit", "price", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1081, column: 13, fingerprint: "51547739cd6a285afc59fbb62374f975fc9ca69f8a201b01e32f9f4b1ccd2796" },
+  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1082, column: 18, fingerprint: "1fccb8a1e10fb3437bd1f77820f6781759f529a69a9af52cbf9673e82d49c8a5" },
+  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1083, column: 13, fingerprint: "57ffaeeeb577382845a7f50d121c88fc3b6332996f50e1a417a223e41fa9ba67" },
+  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 1817, column: 35, fingerprint: "7366a0a04a2f3ecab6b8d57b49f95d1d6983fc08c0acabc9bf5501d5a20a7f41" },
+  { symbol: snake("purchase", "total", "cents"), path: "src-tauri/src/services/inventory.rs", line: 2286, column: 32, fingerprint: "8fd7eed8fd5816144fdfdf40889a444f9359b0fcf1b655351f4bd79e2d0087ef" },
+  { symbol: SYMBOLS.englishTerm, path: "src/features/inventory/InventoryView.test.tsx", line: 260, column: 15, fingerprint: "86409642a1fa3041e305c93ce8f250c38e718e4f4b5fb70690dceab7e1e0a2f6" },
+  { symbol: SYMBOLS.spanishTerm, path: "src/features/inventory/InventoryView.test.tsx", line: 264, column: 120, fingerprint: "4ee1ae444697c1b7e803e809efa47b4fcf2d2aba890b70bf521511fdc5640928" },
   { symbol: SYMBOLS.englishTerm, path: "src/features/inventory/manual-movement-intent.test.ts", line: 105, column: 32, fingerprint: "75df0991c15d5a4598c3b3fe79d5e277138de871112dfe9829ee63853d6d5e9d" },
   { symbol: SYMBOLS.spanishTerm, path: "src/features/inventory/manual-movement-intent.test.ts", line: 108, column: 54, fingerprint: "7f7d4f8442f88640b0442ab9f8ddc8cf19bb0045da32ab2fc6f31eb3ebe12ad0" },
   { symbol: SYMBOLS.spanishTerm, path: "src/features/inventory/manual-movement-intent.test.ts", line: 108, column: 74, fingerprint: "7f7d4f8442f88640b0442ab9f8ddc8cf19bb0045da32ab2fc6f31eb3ebe12ad0" },

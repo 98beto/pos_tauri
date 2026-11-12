@@ -58,6 +58,7 @@ fn parse_discount_type_row(value: String) -> rusqlite::Result<CartDiscountType> 
 
 fn map_sale(row: &Row<'_>) -> rusqlite::Result<Sale> {
     Ok(Sale {
+        cash_session_id: row.get(17)?,
         id: row.get(0)?,
         user_id: row.get(1)?,
         cashier_name: row.get(2)?,
@@ -107,7 +108,7 @@ pub fn list(connection: &Connection) -> ServiceResult<Vec<Sale>> {
     let mut statement = connection.prepare(
         "SELECT id, user_id, cashier_name, cashier_email, checkout_token, cart_fingerprint,
                 sale_date, subtotal, discount_type, discount_value, discount_amount, total,
-                payment_method, cash_received, change_amount, created_at, updated_at
+                 payment_method, cash_received, change_amount, created_at, updated_at, cash_session_id
          FROM sales ORDER BY id DESC",
     )?;
     let sales = statement
@@ -117,39 +118,59 @@ pub fn list(connection: &Connection) -> ServiceResult<Vec<Sale>> {
 }
 
 pub fn view(connection: &Connection, filters: SalesViewFilters) -> ServiceResult<SalesView> {
+    if let Some(id) = filters.cash_session_id {
+        validate_id(id)?;
+    }
     let search = normalize_search(filters.search)?;
     let payment_method = normalize_payment_filter(filters.payment_method)?;
     let mut statement = connection.prepare(
         "SELECT s.id, printf('POS-%08d', s.id), s.sale_date, s.payment_method, s.total,
-                s.user_id, s.cashier_name, COUNT(d.id)
+                s.user_id, s.cashier_name, COUNT(d.id), s.cash_session_id
          FROM sales s
          LEFT JOIN sale_details d ON d.sale_id = s.id
          WHERE (?1 = '' OR instr(lower(printf('POS-%08d', s.id)), ?1) > 0)
            AND (?2 IS NULL OR s.payment_method = ?2)
+           AND (?3 IS NULL OR s.cash_session_id = ?3)
          GROUP BY s.id
          ORDER BY s.sale_date DESC, s.id DESC",
     )?;
     let headers = statement
-        .query_map(params![search, payment_method], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        })?
+        .query_map(
+            params![search, payment_method, filters.cash_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     let mut items = Vec::with_capacity(headers.len());
     let mut total_sold = 0;
     let mut lines_sold = 0;
-    for (id, ticket_number, sale_date, method, total, user_id, user_name, line_count) in headers {
+    for (
+        id,
+        ticket_number,
+        sale_date,
+        method,
+        total,
+        user_id,
+        user_name,
+        line_count,
+        cash_session_id,
+    ) in headers
+    {
         total_sold = checked_total(total_sold, total, "SALES_STATS_OVERFLOW")?;
         lines_sold = checked_total(lines_sold, line_count, "SALES_STATS_OVERFLOW")?;
         items.push(SalesViewRow {
+            cash_session_id,
             id,
             ticket_number,
             sale_date,
@@ -179,7 +200,7 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
         .query_row(
             "SELECT s.id, printf('POS-%08d', s.id), s.payment_method, s.sale_date, s.user_id,
                     s.cashier_name, s.cashier_email, s.subtotal, s.discount_type,
-                    s.discount_value, s.discount_amount, s.total, s.cash_received, s.change_amount
+                    s.discount_value, s.discount_amount, s.total, s.cash_received, s.change_amount, s.cash_session_id
              FROM sales s WHERE s.id = ?1",
             [sale_id],
             |row| {
@@ -198,6 +219,7 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
                     row.get(11)?,
                     row.get(12)?,
                     row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
@@ -270,6 +292,7 @@ pub fn history_detail(connection: &Connection, sale_id: i64) -> ServiceResult<Sa
     let line_count =
         i64::try_from(lines.len()).map_err(|_| stats_overflow("SALE_DETAIL_OVERFLOW"))?;
     Ok(SaleHistoryDetail {
+        cash_session_id: header.14,
         id: header.0,
         ticket_number: header.1,
         payment_method: header.2,
@@ -304,6 +327,12 @@ pub fn checkout(
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(receipt) = receipt_by_token(&transaction, checkout_token)? {
+        if input
+            .expected_cash_session_id
+            .is_some_and(|id| id != receipt.sale.cash_session_id)
+        {
+            return Err(checkout_token_reused());
+        }
         validate_retry(
             &transaction,
             &receipt,
@@ -315,6 +344,13 @@ pub fn checkout(
         )?;
         return Ok(receipt);
     }
+    let cash_session_id = input.expected_cash_session_id.ok_or_else(|| {
+        ServiceError::validation(
+            "CASH_SESSION_REQUIRED",
+            "Indica la sesion de caja esperada para un nuevo cobro",
+        )
+    })?;
+    super::cash::require_open(&transaction, cash_session_id)?;
     if cart.is_empty() {
         return Err(ServiceError::validation(
             "EMPTY_CART",
@@ -331,6 +367,9 @@ pub fn checkout(
         .ok_or_else(|| ServiceError::not_found("USER_NOT_FOUND", "Usuario no encontrado"))?;
 
     let resolved_cart = cart::get(&transaction, cart)?;
+    for line in &resolved_cart.lines {
+        super::products::ensure_active(&transaction, line.product_id)?;
+    }
     if resolved_cart.lines.iter().any(|line| !line.available) {
         return Err(ServiceError::conflict(
             "INSUFFICIENT_STOCK",
@@ -410,8 +449,8 @@ pub fn checkout(
     transaction.execute(
         "INSERT INTO sales (user_id, cashier_name, cashier_email, checkout_token,
              cart_fingerprint, sale_date, subtotal, discount_type, discount_value,
-             discount_amount, total, payment_method, cash_received, change_amount)
-         VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             discount_amount, total, payment_method, cash_received, change_amount, cash_session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             user_id,
             cashier_name,
@@ -430,6 +469,7 @@ pub fn checkout(
             input.payment_method,
             cash_received,
             change_amount,
+            cash_session_id,
         ],
     )?;
     let sale_id = transaction.last_insert_rowid();
@@ -521,6 +561,8 @@ pub fn checkout(
         ));
     }
     let receipt = receipt_by_id(&transaction, sale_id)?;
+    // Reject a sale that would make any session accounting total unsafe for IPC.
+    super::cash::session(&transaction, cash_session_id)?;
     transaction.commit()?;
     Ok(receipt)
 }
@@ -567,7 +609,7 @@ fn receipt_by_id(connection: &Connection, sale_id: i64) -> ServiceResult<SaleRec
     let sale = connection.query_row(
         "SELECT id, user_id, cashier_name, cashier_email, checkout_token, cart_fingerprint,
                 sale_date, subtotal, discount_type, discount_value, discount_amount, total,
-                payment_method, cash_received, change_amount, created_at, updated_at
+                payment_method, cash_received, change_amount, created_at, updated_at, cash_session_id
          FROM sales WHERE id = ?1",
         [sale_id],
         map_sale,
@@ -795,6 +837,15 @@ mod runtime_tests {
              INSERT INTO product_presentations(product_id,name,mode,base_quantity,price)
              VALUES(1,'Paquete','fixed',10,800);",
         ).unwrap();
+        crate::services::cash::open(
+            connection,
+            1,
+            crate::models::cash::OpenCashInput {
+                operation_token: "fixture-open".into(),
+                opening_amount: 0,
+            },
+        )
+        .unwrap();
         (1, 2)
     }
 
@@ -802,6 +853,111 @@ mod runtime_tests {
         let mut connection = Connection::open_in_memory().unwrap();
         let (piece, pack) = seed_database(&mut connection);
         (connection, piece, pack)
+    }
+
+    #[test]
+    fn archived_products_reject_new_checkout_but_saved_sale_retries_and_history_survive() {
+        let (mut connection, piece, pack) = database();
+        let cart = SessionCart::from([(piece, 2), (pack, 1)]);
+        let fingerprint = cart::get(&connection, &cart).unwrap().cart_fingerprint;
+        let input = |token: &str| CheckoutCartInput {
+            expected_cash_session_id: Some(1),
+            checkout_token: token.into(),
+            cart_fingerprint: fingerprint.clone(),
+            payment_method: "tarjeta".into(),
+            cash_received: None,
+        };
+        let first =
+            super::checkout(&mut connection, 1, &cart, input("saved-before-archive")).unwrap();
+        let movements_before =
+            serde_json::to_value(crate::services::inventory::list(&connection).unwrap()).unwrap();
+        crate::services::products::set_active(&mut connection, 1, false).unwrap();
+        assert_eq!(
+            super::checkout(&mut connection, 1, &cart, input("new-after-archive"))
+                .unwrap_err()
+                .code,
+            "PRODUCT_ARCHIVED"
+        );
+        assert_eq!(
+            super::checkout(&mut connection, 1, &cart, input("saved-before-archive")).unwrap(),
+            first
+        );
+        assert_eq!(
+            super::checkout(
+                &mut connection,
+                1,
+                &SessionCart::default(),
+                input("saved-before-archive")
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(
+            serde_json::to_value(crate::services::inventory::list(&connection).unwrap()).unwrap(),
+            movements_before
+        );
+        crate::services::products::set_active(&mut connection, 1, true).unwrap();
+        assert_eq!(
+            super::checkout(&mut connection, 1, &cart, input("saved-before-archive")).unwrap(),
+            first
+        );
+        assert_eq!(connection.query_row("SELECT stock,(SELECT count(*) FROM sales),(SELECT count(*) FROM inventory_movements) FROM products WHERE id=1", [], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, i64>(2)?))).unwrap(), (88,1,2));
+    }
+
+    #[test]
+    fn archive_and_checkout_serialize_across_connections_without_losing_saved_retry() {
+        use std::sync::{Arc, Barrier};
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("archive-checkout.db");
+        let mut connection = Connection::open(&path).unwrap();
+        let (piece, _) = seed_database(&mut connection);
+        let cart = SessionCart::from([(piece, 2)]);
+        let fingerprint = cart::get(&connection, &cart).unwrap().cart_fingerprint;
+        drop(connection);
+        let barrier = Arc::new(Barrier::new(2));
+        let archive_path = path.clone();
+        let archive_barrier = barrier.clone();
+        let archive = std::thread::spawn(move || {
+            let mut connection = Connection::open(archive_path).unwrap();
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            archive_barrier.wait();
+            crate::services::products::set_active(&mut connection, 1, false).unwrap();
+        });
+        let input = || CheckoutCartInput {
+            expected_cash_session_id: Some(1),
+            checkout_token: "race-with-archive".into(),
+            cart_fingerprint: fingerprint.clone(),
+            payment_method: "tarjeta".into(),
+            cash_received: None,
+        };
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        barrier.wait();
+        let result = super::checkout(&mut connection, 1, &cart, input());
+        archive.join().unwrap();
+        let expected = match result {
+            Ok(receipt) => {
+                assert_eq!(
+                    super::checkout(&mut connection, 1, &cart, input()).unwrap(),
+                    receipt
+                );
+                (98, 1, 1)
+            }
+            Err(error) => {
+                assert_eq!(error.code, "PRODUCT_ARCHIVED");
+                (100, 0, 0)
+            }
+        };
+        assert_eq!(connection.query_row("SELECT stock,(SELECT count(*) FROM sales),(SELECT count(*) FROM inventory_movements) FROM products WHERE id=1", [], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap(), expected);
+        assert!(
+            !crate::services::products::get(&connection, 1)
+                .unwrap()
+                .is_active
+        );
     }
 
     #[test]
@@ -815,6 +971,7 @@ mod runtime_tests {
             &cart,
             CheckoutCartInput {
                 checkout_token: "checkout-v3".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: resolved.cart_fingerprint,
                 payment_method: "tarjeta".into(),
                 cash_received: None,
@@ -862,6 +1019,7 @@ mod runtime_tests {
             &cart,
             CheckoutCartInput {
                 checkout_token: "rollback-v3".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: fingerprint,
                 payment_method: "tarjeta".into(),
                 cash_received: None,
@@ -884,12 +1042,14 @@ mod runtime_tests {
         let cart = SessionCart::from([(piece, 2)]);
         let input = CheckoutCartInput {
             checkout_token: "retry-v3".into(),
+            expected_cash_session_id: Some(1),
             cart_fingerprint: cart::get(&connection, &cart).unwrap().cart_fingerprint,
             payment_method: "tarjeta".into(),
             cash_received: None,
         };
         let first = super::checkout(&mut connection, 1, &cart, input).unwrap();
         let retry = CheckoutCartInput {
+            expected_cash_session_id: Some(1),
             checkout_token: "retry-v3".into(),
             cart_fingerprint: first.sale.cart_fingerprint.clone(),
             payment_method: "tarjeta".into(),
@@ -902,6 +1062,7 @@ mod runtime_tests {
         );
         let conflicting_cart = SessionCart::from([(pack, 1)]);
         let conflict = CheckoutCartInput {
+            expected_cash_session_id: Some(1),
             checkout_token: "retry-v3".into(),
             cart_fingerprint: cart::get(&connection, &conflicting_cart)
                 .unwrap()
@@ -939,6 +1100,7 @@ mod runtime_tests {
             &cart,
             CheckoutCartInput {
                 checkout_token: "snapshots-v3".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: resolved.cart_fingerprint,
                 payment_method: "tarjeta".into(),
                 cash_received: None,
@@ -1005,6 +1167,7 @@ mod runtime_tests {
             &cable,
             CheckoutCartInput {
                 checkout_token: "centimeters-v3".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: cable_fingerprint,
                 payment_method: "tarjeta".into(),
                 cash_received: None,
@@ -1030,6 +1193,7 @@ mod runtime_tests {
             &excessive,
             CheckoutCartInput {
                 checkout_token: "aggregate-v3".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: resolved.cart_fingerprint,
                 payment_method: "tarjeta".into(),
                 cash_received: None,
@@ -1063,6 +1227,7 @@ mod runtime_tests {
                 &cart,
                 CheckoutCartInput {
                     checkout_token: format!("payment-{index}"),
+                    expected_cash_session_id: Some(1),
                     cart_fingerprint: fingerprint,
                     payment_method: method.into(),
                     cash_received: cash.map(str::to_owned),
@@ -1097,6 +1262,7 @@ mod runtime_tests {
                 &cash_cart,
                 CheckoutCartInput {
                     checkout_token: "cash-not-allowed".into(),
+                    expected_cash_session_id: Some(1),
                     cart_fingerprint: cash_fingerprint,
                     payment_method: "tarjeta".into(),
                     cash_received: Some("1.00".into()),
@@ -1120,6 +1286,7 @@ mod runtime_tests {
         let filtered = super::view(
             &connection,
             SalesViewFilters {
+                cash_session_id: None,
                 search: Some("pos-00000003".into()),
                 payment_method: Some(" TRANSFERENCIA ".into()),
             },
@@ -1132,6 +1299,7 @@ mod runtime_tests {
             super::view(
                 &connection,
                 SalesViewFilters {
+                    cash_session_id: None,
                     search: None,
                     payment_method: Some("cheque".into()),
                 },
@@ -1166,6 +1334,7 @@ mod runtime_tests {
             &cart,
             CheckoutCartInput {
                 checkout_token: "stale-cart".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: stale,
                 payment_method: "efectivo".into(),
                 cash_received: Some("10.00".into()),
@@ -1200,6 +1369,7 @@ mod runtime_tests {
                 &cart,
                 CheckoutCartInput {
                     checkout_token: "reopen-sale".into(),
+                    expected_cash_session_id: Some(1),
                     cart_fingerprint: fingerprint.clone(),
                     payment_method: "transferencia".into(),
                     cash_received: None,
@@ -1218,6 +1388,7 @@ mod runtime_tests {
             &SessionCart::default(),
             CheckoutCartInput {
                 checkout_token: "reopen-sale".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: fingerprint,
                 payment_method: "transferencia".into(),
                 cash_received: None,
@@ -1241,12 +1412,12 @@ mod runtime_tests {
     fn sales_view_rejects_aggregate_overflow() {
         let (connection, _, _) = database();
         connection.execute_batch(
-            "INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,
-                 subtotal,discount_type,discount_value,discount_amount,total,payment_method)
-             VALUES(1,'Ada POS','ada@pos.local','overflow-1','legacy-1',CURRENT_TIMESTAMP,9007199254740991,'none',0,0,9007199254740991,'tarjeta');
+             "INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,
+                 subtotal,discount_type,discount_value,discount_amount,total,payment_method,cash_session_id)
+             VALUES(1,'Ada POS','ada@pos.local','overflow-1','legacy-1',CURRENT_TIMESTAMP,9007199254740991,'none',0,0,9007199254740991,'tarjeta',1);
              INSERT INTO sales(user_id,cashier_name,cashier_email,checkout_token,cart_fingerprint,sale_date,
-                 subtotal,discount_type,discount_value,discount_amount,total,payment_method)
-             VALUES(1,'Ada POS','ada@pos.local','overflow-2','legacy-2',CURRENT_TIMESTAMP,1,'none',0,0,1,'tarjeta');",
+                 subtotal,discount_type,discount_value,discount_amount,total,payment_method,cash_session_id)
+             VALUES(1,'Ada POS','ada@pos.local','overflow-2','legacy-2',CURRENT_TIMESTAMP,1,'none',0,0,1,'tarjeta',1);",
         ).unwrap();
 
         assert_eq!(

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Flujo</title>
+  <desc>Dos cintas paralelas recorren una esquina amplia y sugieren movimiento y una L abstracta.</desc>
+  <rect width="512" height="512" rx="112" fill="#EAF7F7"/>
+  <path d="M166 128V291C166 335 190 359 234 359H374" stroke="#147A88" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M250 128V279C250 291 258 299 270 299H374" stroke="#123B61" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M342 323L374 359L342 395" stroke="#147A88" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -18,9 +18,14 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
+const INVOICE_MIGRATION_SOURCE_VERSION: i64 = 15;
+const CASH_MIGRATION_SOURCE_VERSION: i64 = 14;
+const ARCHIVE_MIGRATION_SOURCE_VERSION: i64 = 13;
 const LEGACY_MIGRATION_SOURCE_VERSION: i64 = 8;
 const DIRECT_MIGRATION_SOURCE_VERSION: i64 = 12;
+// Keep the recovery protocol namespace stable across additive upgrades so old
+// pending markers/backups remain discoverable. Manifests carry exact versions.
 const PENDING_MARKER_NAME: &str = "pos-schema-v13-migration-pending.json";
 const LEGACY_PENDING_MARKER_NAME: &str = "pos-v0.2.0-migration-pending.json";
 const MIGRATION_LOCK_NAME: &str = "pos-schema-v13-migration.lock";
@@ -150,6 +155,7 @@ struct MigrationSnapshot {
     sale_details: SnapshotRows,
     movements: SnapshotRows,
     sequences: SnapshotRows,
+    all_v15_rows: Vec<SnapshotRows>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,7 +332,11 @@ where
             })?;
             validate_database(&connection, CURRENT_SCHEMA_VERSION, true, database_path)?;
         }
-        LEGACY_MIGRATION_SOURCE_VERSION | DIRECT_MIGRATION_SOURCE_VERSION => {
+        LEGACY_MIGRATION_SOURCE_VERSION
+        | DIRECT_MIGRATION_SOURCE_VERSION
+        | ARCHIVE_MIGRATION_SOURCE_VERSION
+        | CASH_MIGRATION_SOURCE_VERSION
+        | INVOICE_MIGRATION_SOURCE_VERSION => {
             validate_database(&connection, version, true, database_path)?;
             let before = migration_source_snapshot(&connection, database_path, version)?;
             let v8_sequences = if version == LEGACY_MIGRATION_SOURCE_VERSION {
@@ -370,10 +380,36 @@ where
                     &manifest.backup_path,
                 ));
             }
+            let inactive: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM products WHERE is_active<>1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    recovery_error(
+                        "No se pudo validar el estado inicial del catalogo",
+                        &manifest.backup_path,
+                    )
+                })?;
+            if version < CASH_MIGRATION_SOURCE_VERSION && inactive != 0 {
+                return Err(recovery_error(
+                    "La migracion archivo productos existentes",
+                    &manifest.backup_path,
+                ));
+            }
             if version == LEGACY_MIGRATION_SOURCE_VERSION {
                 validate_v8_generated_values(&connection, database_path).map_err(|_| {
                     recovery_error(
                         "Los valores migrados desde v8 no son validos; restaure el backup",
+                        &manifest.backup_path,
+                    )
+                })?;
+            }
+            if version < INVOICE_MIGRATION_SOURCE_VERSION {
+                validate_cash_backfill(&connection, database_path).map_err(|_| {
+                    recovery_error(
+                        "La validacion del historico de caja fallo; restaure el backup",
                         &manifest.backup_path,
                     )
                 })?;
@@ -457,6 +493,9 @@ fn preflight_installed_database(database_path: &Path) -> OpenResult<()> {
         0 if is_new => validate_database(&connection, 0, false, database_path),
         LEGACY_MIGRATION_SOURCE_VERSION
         | DIRECT_MIGRATION_SOURCE_VERSION
+        | ARCHIVE_MIGRATION_SOURCE_VERSION
+        | CASH_MIGRATION_SOURCE_VERSION
+        | INVOICE_MIGRATION_SOURCE_VERSION
         | CURRENT_SCHEMA_VERSION => validate_database(&connection, version, true, database_path),
         _ => {
             validate_database(&connection, version, false, database_path)?;
@@ -604,7 +643,11 @@ fn validate_database(
     if require_tables {
         let required_tables = match expected_version {
             LEGACY_MIGRATION_SOURCE_VERSION => V8_REQUIRED_TABLES,
-            DIRECT_MIGRATION_SOURCE_VERSION | CURRENT_SCHEMA_VERSION => V12_AND_V13_REQUIRED_TABLES,
+            DIRECT_MIGRATION_SOURCE_VERSION
+            | ARCHIVE_MIGRATION_SOURCE_VERSION
+            | CASH_MIGRATION_SOURCE_VERSION
+            | INVOICE_MIGRATION_SOURCE_VERSION
+            | CURRENT_SCHEMA_VERSION => V12_AND_V13_REQUIRED_TABLES,
             _ => &[],
         };
         for table in required_tables {
@@ -625,7 +668,50 @@ fn validate_database(
     }
 
     validate_schema_shape(connection, expected_version, path)?;
+    if expected_version == CURRENT_SCHEMA_VERSION {
+        validate_invoice_attachments(connection, path)?;
+    }
 
+    if expected_version >= INVOICE_MIGRATION_SOURCE_VERSION {
+        let invalid: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sales s LEFT JOIN cash_sessions c ON c.id=s.cash_session_id WHERE c.id IS NULL)",
+            [], |r| r.get(0),
+        ).map_err(|_| safe_error("No se pudo validar la relacion de ventas y caja", path))?;
+        if invalid {
+            return Err(safe_error("Hay ventas sin una sesion de caja valida", path));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_invoice_attachments(c: &Connection, path: &Path) -> OpenResult<()> {
+    let result = (|| -> rusqlite::Result<bool> {
+        let incomplete: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM purchase_invoices i WHERE NOT EXISTS(SELECT 1 FROM purchase_invoice_attachments a WHERE a.invoice_id=i.id AND a.kind='xml' AND a.sha256=i.xml_sha256) OR NOT EXISTS(SELECT 1 FROM purchase_invoice_lines l WHERE l.invoice_id=i.id AND l.position=0))",
+            [], |r|r.get(0))?;
+        if incomplete {
+            return Ok(false);
+        }
+        let mut statement =
+            c.prepare("SELECT size_bytes,sha256,content FROM purchase_invoice_attachments")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let size: i64 = row.get(0)?;
+            let hash: String = row.get(1)?;
+            let bytes: Vec<u8> = row.get(2)?;
+            if size != bytes.len() as i64 || hash != format!("{:x}", Sha256::digest(&bytes)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })();
+    if !result.unwrap_or(false) {
+        return Err(safe_error(
+            "Los adjuntos documentales no conservan su integridad",
+            path,
+        ));
+    }
     Ok(())
 }
 
@@ -634,8 +720,13 @@ fn validate_schema_shape(connection: &Connection, version: i64, path: &Path) -> 
         validate_canonical_structure(connection, path, version)?;
     } else if version == DIRECT_MIGRATION_SOURCE_VERSION {
         validate_v12_structure(connection, path)?;
-    } else if version == CURRENT_SCHEMA_VERSION {
+    } else if version == ARCHIVE_MIGRATION_SOURCE_VERSION {
         validate_v13_structure(connection, path)?;
+    } else if matches!(
+        version,
+        CASH_MIGRATION_SOURCE_VERSION | INVOICE_MIGRATION_SOURCE_VERSION | CURRENT_SCHEMA_VERSION
+    ) {
+        validate_canonical_structure(connection, path, version)?;
     }
     let column_exists = |table: &str, column: &str| -> rusqlite::Result<bool> {
         connection.query_row(
@@ -656,7 +747,10 @@ fn validate_schema_shape(connection: &Connection, version: i64, path: &Path) -> 
                     .map(|movement_cost| valid && movement_cost)
             })
             .unwrap_or(false),
-        CURRENT_SCHEMA_VERSION => {
+        ARCHIVE_MIGRATION_SOURCE_VERSION
+        | CASH_MIGRATION_SOURCE_VERSION
+        | INVOICE_MIGRATION_SOURCE_VERSION
+        | CURRENT_SCHEMA_VERSION => {
             let retired = [
                 ("products", "inventory_cost_cents"),
                 ("sale_details", "movement_cost_cents"),
@@ -697,7 +791,10 @@ fn validate_canonical_structure(
     match version {
         LEGACY_MIGRATION_SOURCE_VERSION => migrations::run_to_v8(&mut reference),
         DIRECT_MIGRATION_SOURCE_VERSION => migrations::run_to_v12(&mut reference),
-        CURRENT_SCHEMA_VERSION => migrations::run_to_v13(&mut reference),
+        ARCHIVE_MIGRATION_SOURCE_VERSION => migrations::run_to_v13(&mut reference),
+        CASH_MIGRATION_SOURCE_VERSION => migrations::run_to_v14(&mut reference),
+        INVOICE_MIGRATION_SOURCE_VERSION => migrations::run_to_v15(&mut reference),
+        CURRENT_SCHEMA_VERSION => migrations::run(&mut reference),
         _ => unreachable!("canonical validation only supports known schemas"),
     }
     .map_err(|_| safe_error("No se pudo construir la referencia del esquema", path))?;
@@ -811,7 +908,7 @@ fn validate_v12_structure(connection: &Connection, path: &Path) -> OpenResult<()
 }
 
 fn validate_v13_structure(connection: &Connection, path: &Path) -> OpenResult<()> {
-    validate_canonical_structure(connection, path, CURRENT_SCHEMA_VERSION)
+    validate_canonical_structure(connection, path, ARCHIVE_MIGRATION_SOURCE_VERSION)
 }
 
 // Each side owns its SQL contract. Do not alias source/target projections: a
@@ -877,6 +974,49 @@ const V13_AFTER_V12: SnapshotProjection = SnapshotProjection {
     sequences: "SELECT quote(name),quote(seq) FROM sqlite_sequence ORDER BY name",
 };
 
+// v13 -> v14 is purely additive. Include purchase prices, which do not
+// exist in the v12 projection, on both independently specified sides.
+const V13_BEFORE_ARCHIVE: SnapshotProjection = SnapshotProjection {
+    movements: "SELECT quote(id),quote(product_id),quote(product_name),quote(sku),quote(product_search_key),quote(sku_search_key),quote(sale_id),quote(record_version),quote(presentation_id),quote(sale_detail_id),quote(presentation_name),quote(presentation_barcode),quote(base_unit),quote(presentation_mode),quote(presentation_base_quantity),quote(origin),quote(reason),quote(type),quote(quantity),quote(entered_quantity),quote(base_quantity),quote(stock_before),quote(stock_after),quote(supplier),quote(provider_search_key),quote(document_reference),quote(document_reference_search_key),quote(note),quote(note_search_key),quote(operation_token),quote(intent_fingerprint),quote(created_at),quote(updated_at),quote(purchase_unit_price_cents),quote(purchase_total_cents) FROM inventory_movements ORDER BY id",
+    ..V13_AFTER_V12
+};
+
+const V14_AFTER_V13: SnapshotProjection = SnapshotProjection {
+    movements: "SELECT quote(id),quote(product_id),quote(product_name),quote(sku),quote(product_search_key),quote(sku_search_key),quote(sale_id),quote(record_version),quote(presentation_id),quote(sale_detail_id),quote(presentation_name),quote(presentation_barcode),quote(base_unit),quote(presentation_mode),quote(presentation_base_quantity),quote(origin),quote(reason),quote(type),quote(quantity),quote(entered_quantity),quote(base_quantity),quote(stock_before),quote(stock_after),quote(supplier),quote(provider_search_key),quote(document_reference),quote(document_reference_search_key),quote(note),quote(note_search_key),quote(operation_token),quote(intent_fingerprint),quote(created_at),quote(updated_at),quote(purchase_unit_price_cents),quote(purchase_total_cents) FROM inventory_movements ORDER BY id",
+    ..V13_AFTER_V12
+};
+
+const V14_BEFORE_CASH: SnapshotProjection = SnapshotProjection {
+    products: "SELECT quote(id),quote(name),quote(name_search_key),quote(price),quote(stock),quote(sku),quote(sku_search_key),quote(brand_id),quote(category_id),quote(created_at),quote(updated_at),quote(base_unit),quote(is_active) FROM products ORDER BY id",
+    ..V13_BEFORE_ARCHIVE
+};
+
+const V15_AFTER_V14: SnapshotProjection = SnapshotProjection {
+    products: "SELECT quote(id),quote(name),quote(name_search_key),quote(price),quote(stock),quote(sku),quote(sku_search_key),quote(brand_id),quote(category_id),quote(created_at),quote(updated_at),quote(base_unit),quote(is_active) FROM products ORDER BY id",
+    ..V14_AFTER_V13
+};
+
+fn validate_cash_backfill(connection: &Connection, path: &Path) -> OpenResult<()> {
+    let valid: bool = connection.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sales WHERE cash_session_id IS NOT 1)
+          AND NOT EXISTS(SELECT 1 FROM cash_operations)
+          AND (SELECT count(*) FROM cash_sessions)=CASE WHEN EXISTS(SELECT 1 FROM sales) THEN 1 ELSE 0 END
+          AND NOT EXISTS(SELECT 1 FROM cash_sessions WHERE id<>1 OR status<>'closed' OR historical<>1
+            OR opening_amount IS NOT NULL OR expected_amount IS NOT NULL OR counted_amount IS NOT NULL
+            OR difference IS NOT NULL OR opened_by IS NOT NULL OR closed_by IS NOT NULL
+            OR opening_operator IS NOT NULL OR closing_operator IS NOT NULL OR closing_breakdown IS NOT NULL
+            OR opened_at IS NOT (SELECT min(sale_date) FROM sales) OR closed_at IS NOT (SELECT max(sale_date) FROM sales))",
+        [], |r| r.get(0),
+    ).map_err(|_| safe_error("No se pudo validar el historico de caja", path))?;
+    if !valid {
+        return Err(safe_error(
+            "La migracion invento o perdio datos de caja",
+            path,
+        ));
+    }
+    Ok(())
+}
+
 fn migration_source_snapshot(
     connection: &Connection,
     path: &Path,
@@ -885,9 +1025,16 @@ fn migration_source_snapshot(
     let projection = match source_version {
         LEGACY_MIGRATION_SOURCE_VERSION => &V8_BEFORE,
         DIRECT_MIGRATION_SOURCE_VERSION => &V12_BEFORE,
+        ARCHIVE_MIGRATION_SOURCE_VERSION => &V13_BEFORE_ARCHIVE,
+        CASH_MIGRATION_SOURCE_VERSION => &V14_BEFORE_CASH,
+        INVOICE_MIGRATION_SOURCE_VERSION => &V15_AFTER_V14,
         _ => return Err(safe_error("Version de origen no admitida", path)),
     };
-    migration_snapshot(connection, path, projection, source_version)
+    let mut snapshot = migration_snapshot(connection, path, projection, source_version)?;
+    if source_version == INVOICE_MIGRATION_SOURCE_VERSION {
+        snapshot.all_v15_rows = all_v15_rows(connection, path)?;
+    }
+    Ok(snapshot)
 }
 
 fn migration_target_snapshot(
@@ -898,9 +1045,66 @@ fn migration_target_snapshot(
     let projection = match source_version {
         LEGACY_MIGRATION_SOURCE_VERSION => &V13_AFTER_V8,
         DIRECT_MIGRATION_SOURCE_VERSION => &V13_AFTER_V12,
+        ARCHIVE_MIGRATION_SOURCE_VERSION => &V14_AFTER_V13,
+        CASH_MIGRATION_SOURCE_VERSION => &V15_AFTER_V14,
+        INVOICE_MIGRATION_SOURCE_VERSION => &V15_AFTER_V14,
         _ => return Err(safe_error("Version de origen no admitida", path)),
     };
-    migration_snapshot(connection, path, projection, CURRENT_SCHEMA_VERSION)
+    let mut snapshot = migration_snapshot(connection, path, projection, CURRENT_SCHEMA_VERSION)?;
+    if source_version == INVOICE_MIGRATION_SOURCE_VERSION {
+        snapshot.all_v15_rows = all_v15_rows(connection, path)?;
+    }
+    Ok(snapshot)
+}
+
+// Purely additive v16 must retain EVERY old column, not just legacy projections.
+// Canonical validation fixes these table/column names before this comparison.
+fn all_v15_rows(c: &Connection, path: &Path) -> OpenResult<Vec<SnapshotRows>> {
+    let tables = [
+        "users",
+        "brands",
+        "categories",
+        "products",
+        "product_presentations",
+        "sales",
+        "sale_details",
+        "inventory_movements",
+        "cash_sessions",
+        "cash_operations",
+        "sqlite_sequence",
+    ];
+    tables
+        .into_iter()
+        .map(|table| {
+            let columns = c
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .and_then(|mut s| {
+                    s.query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|_| safe_error("No se pudo comparar el origen v15", path))?;
+            let select = columns
+                .iter()
+                .map(|name| format!("quote(\"{name}\")"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let old_sequences = if table == "sqlite_sequence" {
+                " WHERE name<>'purchase_invoices'"
+            } else {
+                ""
+            };
+            let mut statement = c
+                .prepare(&format!(
+                    "SELECT {select} FROM {table}{old_sequences} ORDER BY rowid"
+                ))
+                .map_err(|_| safe_error("No se pudo comparar el origen v15", path))?;
+            let rows = statement
+                .query_map([], |r| (0..columns.len()).map(|i| r.get(i)).collect())
+                .and_then(|rows| rows.collect())
+                .map_err(|_| safe_error("No se pudo comparar el origen v15", path));
+            rows
+        })
+        .collect()
 }
 
 fn migration_snapshot(
@@ -941,6 +1145,7 @@ fn migration_snapshot(
             sale_details: quoted_rows(connection, projection.sale_details)?,
             movements: quoted_rows(connection, projection.movements)?,
             sequences: quoted_rows(connection, projection.sequences)?,
+            all_v15_rows: Vec::new(),
         })
     })();
     result.map_err(|_| safe_error("No se pudo comparar la integridad historica", path))
@@ -1136,7 +1341,9 @@ where
         .duration_since(UNIX_EPOCH)
         .map_err(|_| safe_error("El reloj del sistema no permite crear el backup", directory))?;
     let attempt_id = format!("{}-{}", now.as_nanos(), std::process::id());
-    let backup_path = directory.join(format!("pos-v{source_version}-before-v13-{attempt_id}.db"));
+    let backup_path = directory.join(format!(
+        "pos-v{source_version}-before-v{CURRENT_SCHEMA_VERSION}-{attempt_id}.db"
+    ));
 
     create_database_file_new(&backup_path)
         .map_err(|_| safe_error("No se pudo crear un backup nuevo", &backup_path))?;
@@ -1393,7 +1600,11 @@ where
     let source_version = schema_version(&source, backup_path)?;
     if !matches!(
         source_version,
-        LEGACY_MIGRATION_SOURCE_VERSION | DIRECT_MIGRATION_SOURCE_VERSION
+        LEGACY_MIGRATION_SOURCE_VERSION
+            | DIRECT_MIGRATION_SOURCE_VERSION
+            | ARCHIVE_MIGRATION_SOURCE_VERSION
+            | CASH_MIGRATION_SOURCE_VERSION
+            | INVOICE_MIGRATION_SOURCE_VERSION
     ) || authority.manifest.source_version != source_version
     {
         return Err(safe_error(
@@ -1912,9 +2123,20 @@ fn migration_manifest_for_restore(
             && manifest.backup_validation_completed
             && matches!(
                 manifest.source_version,
-                LEGACY_MIGRATION_SOURCE_VERSION | DIRECT_MIGRATION_SOURCE_VERSION
+                LEGACY_MIGRATION_SOURCE_VERSION
+                    | DIRECT_MIGRATION_SOURCE_VERSION
+                    | ARCHIVE_MIGRATION_SOURCE_VERSION
+                    | CASH_MIGRATION_SOURCE_VERSION
+                    | INVOICE_MIGRATION_SOURCE_VERSION
             )
-            && manifest.target_version == CURRENT_SCHEMA_VERSION
+            && matches!(
+                manifest.target_version,
+                ARCHIVE_MIGRATION_SOURCE_VERSION
+                    | CASH_MIGRATION_SOURCE_VERSION
+                    | INVOICE_MIGRATION_SOURCE_VERSION
+                    | CURRENT_SCHEMA_VERSION
+            )
+            && manifest.source_version < manifest.target_version
             && manifest.backup_sha256.len() == 64
             && manifest
                 .backup_sha256
@@ -2617,6 +2839,145 @@ mod tests {
 
     mod migration_qa;
 
+    #[test]
+    fn v13_to_current_preserves_full_history_validated_backup_restore_and_archive_after_reopen() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pos.db");
+        create_v12_database(&path);
+        let before = {
+            let mut c = Connection::open(&path).unwrap();
+            migrations::run_to_v13(&mut c).unwrap();
+            c.execute_batch("INSERT INTO inventory_movements(product_id,product_name,sku,product_search_key,sku_search_key,record_version,base_unit,purchase_unit_price_cents,purchase_total_cents,origin,reason,type,quantity,entered_quantity,base_quantity,stock_before,stock_after,supplier,provider_search_key,document_reference,document_reference_search_key,operation_token,intent_fingerprint) VALUES(1,'Compra v13','SKU-1','compra v13','sku-1',3,'piece',125,250,'manual','compra','entrada',2,2,2,10,12,'Proveedor','proveedor','V13','v13','purchase-v13','purchase-v13'); UPDATE products SET stock=12 WHERE id=1; INSERT INTO product_presentations(product_id,name,mode,base_quantity,price,barcode,barcode_search_key,is_active) VALUES(1,'Inactiva','fixed',2,200,'OLD-CODE','old-code',0);").unwrap();
+            validate_database(&c, 13, true, &path).unwrap();
+            migration_source_snapshot(&c, &path, 13).unwrap()
+        };
+        let mut c = open_database_path(temp.path(), &path).unwrap();
+        validate_database(&c, CURRENT_SCHEMA_VERSION, true, &path).unwrap();
+        assert_eq!(migration_target_snapshot(&c, &path, 13).unwrap(), before);
+        c.execute("UPDATE inventory_movements SET purchase_unit_price_cents=130,purchase_total_cents=260 WHERE operation_token='purchase-v13'", []).unwrap();
+        assert_ne!(migration_target_snapshot(&c, &path, 13).unwrap(), before);
+        c.execute("UPDATE inventory_movements SET purchase_unit_price_cents=125,purchase_total_cents=250 WHERE operation_token='purchase-v13'", []).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM products WHERE is_active<>1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        for statement in [
+            "UPDATE products SET is_active=NULL",
+            "UPDATE products SET is_active=2",
+            "UPDATE products SET is_active=0.5",
+        ] {
+            assert!(c.execute(statement, []).is_err());
+        }
+        let backup = matching_files(temp.path(), "pos-v13-before-v16-")[0].clone();
+        let backup_c = Connection::open(&backup).unwrap();
+        validate_database(&backup_c, 13, true, &backup).unwrap();
+        assert_eq!(
+            migration_source_snapshot(&backup_c, &backup, 13).unwrap(),
+            before
+        );
+        drop(backup_c);
+        let completed_path =
+            matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
+        let completed: CompletedMigrationManifest = read_marker(&completed_path, "test").unwrap();
+        assert_eq!(
+            (
+                completed.migration.source_version,
+                completed.migration.target_version
+            ),
+            (13, CURRENT_SCHEMA_VERSION)
+        );
+        crate::services::products::set_active(&mut c, 1, false).unwrap();
+        drop(c);
+        let c = open_database_path(temp.path(), &path).unwrap();
+        assert!(!crate::services::products::get(&c, 1).unwrap().is_active);
+        assert_eq!(matching_files(temp.path(), "pos-v13-before-v16-").len(), 1);
+        drop(c);
+        restore_migration_backup_inner(temp.path(), &path, &backup).unwrap();
+        assert_eq!(version(&path), 13);
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(migration_source_snapshot(&c, &path, 13).unwrap(), before);
+        drop(c);
+        let c = open_database_path(temp.path(), &path).unwrap();
+        assert!(crate::services::products::get(&c, 1).unwrap().is_active);
+        assert_eq!(migration_target_snapshot(&c, &path, 13).unwrap(), before);
+    }
+
+    #[test]
+    fn canonical_v14_rejects_missing_or_extra_archive_contract() {
+        for statement in [
+            "ALTER TABLE products DROP COLUMN is_active",
+            "CREATE INDEX unexpected_archive_index ON products(is_active)",
+        ] {
+            let mut c = Connection::open_in_memory().unwrap();
+            migrations::run_to_v14(&mut c).unwrap();
+            validate_database(&c, 14, true, Path::new("v14.db")).unwrap();
+            c.execute_batch(statement).unwrap();
+            assert!(validate_database(&c, 14, true, Path::new("v14.db")).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_v15_rejects_missing_cash_indexes_guards_or_extra_objects() {
+        for statement in [
+            "DROP INDEX idx_cash_single_open",
+            "DROP TRIGGER sale_cash_open",
+            "DROP TRIGGER cash_closed_immutable",
+            "DROP TRIGGER sale_detail_cash_no_update",
+            "CREATE INDEX unexpected_cash_index ON cash_sessions(opened_at)",
+        ] {
+            let mut c = Connection::open_in_memory().unwrap();
+            migrations::run_to_v15(&mut c).unwrap();
+            validate_database(&c, 15, true, Path::new("v15.db")).unwrap();
+            c.execute_batch(statement).unwrap();
+            assert!(validate_database(&c, 15, true, Path::new("v15.db")).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_v16_rejects_missing_invoice_constraints_indexes_and_extra_objects() {
+        for sql in [
+            "DROP INDEX purchase_invoices_emission",
+            "DROP TABLE purchase_invoice_lines",
+            "CREATE VIEW unexpected_invoice_view AS SELECT id FROM purchase_invoices",
+        ] {
+            let mut c = Connection::open_in_memory().unwrap();
+            migrations::run(&mut c).unwrap();
+            validate_database(&c, 16, true, Path::new("v16.db")).unwrap();
+            c.execute_batch(sql).unwrap();
+            assert!(validate_database(&c, 16, true, Path::new("v16.db")).is_err());
+        }
+    }
+
+    #[test]
+    fn invoice_v15_snapshot_detects_every_old_column_and_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("v15.db");
+        create_v12_database(&path);
+        let mut c = Connection::open(&path).unwrap();
+        migrations::run_to_v15(&mut c).unwrap();
+        let original = all_v15_rows(&c, &path).unwrap();
+        for sql in [
+            "UPDATE products SET stock=stock+1",
+            "UPDATE products SET sku='OTHER',sku_search_key='other'",
+            "UPDATE products SET is_active=0",
+            "UPDATE cash_sessions SET opening_operator='tampered'",
+            "UPDATE sqlite_sequence SET seq=seq+1",
+        ] {
+            c.execute_batch("SAVEPOINT probe").unwrap();
+            // Historical cash rejects edits, which is also a successful retention guard.
+            if c.execute_batch(sql).is_ok() {
+                assert_ne!(all_v15_rows(&c, &path).unwrap(), original, "{sql}");
+            }
+            c.execute_batch("ROLLBACK TO probe; RELEASE probe").unwrap();
+        }
+        assert_eq!(all_v15_rows(&c, &path).unwrap(), original);
+    }
+
     fn create_v8_database(path: &Path) {
         let mut connection = Connection::open(path).unwrap();
         connection
@@ -2805,7 +3166,7 @@ mod tests {
 
         assert!(error.to_string().contains("no es canonico"));
         assert_eq!(version(&path), 13);
-        assert!(matching_files(temp.path(), "pos-v12-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v12-before-v16-").is_empty());
         assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
     }
 
@@ -2858,7 +3219,7 @@ mod tests {
             assert!(error.to_string().contains("no es canonico"), "{extra_object}");
             assert_eq!(version(&path), 12, "{extra_object}");
             assert!(
-                matching_files(temp.path(), "pos-v12-before-v13-").is_empty(),
+                matching_files(temp.path(), "pos-v12-before-v16-").is_empty(),
                 "{extra_object}"
             );
             assert!(!temp.path().join(PENDING_MARKER_NAME).exists(), "{extra_object}");
@@ -2867,13 +3228,16 @@ mod tests {
     }
 
     #[test]
-    fn new_database_goes_directly_to_v13_without_backup() {
+    fn new_database_goes_directly_to_current_without_backup() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
 
         let connection = open_database_path(temp.path(), &path).unwrap();
 
-        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
+        assert_eq!(
+            schema_version(&connection, &path).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(
             connection
                 .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
@@ -2881,19 +3245,22 @@ mod tests {
                 .to_lowercase(),
             "wal"
         );
-        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v16-").is_empty());
     }
 
     #[test]
-    fn migrates_v12_to_v13_with_financial_retirement_and_literal_backup() {
+    fn migrates_v12_to_current_with_financial_retirement_and_literal_backup() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
         create_v12_database(&path);
 
         let connection = open_database_path(temp.path(), &path).unwrap();
 
-        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
-        validate_database(&connection, 13, true, &path).unwrap();
+        assert_eq!(
+            schema_version(&connection, &path).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        validate_database(&connection, CURRENT_SCHEMA_VERSION, true, &path).unwrap();
         assert_eq!(
             connection
                 .query_row("SELECT subtotal,total FROM sales WHERE id=1", [], |row| {
@@ -2961,7 +3328,7 @@ mod tests {
                 .unwrap(),
             40
         );
-        let backups = matching_files(temp.path(), "pos-v12-before-v13-");
+        let backups = matching_files(temp.path(), "pos-v12-before-v16-");
         assert_eq!(backups.len(), 1);
         let backup =
             Connection::open_with_flags(&backups[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -2994,7 +3361,7 @@ mod tests {
                 manifest.migration.source_version,
                 manifest.migration.target_version
             ),
-            (12, 13)
+            (12, CURRENT_SCHEMA_VERSION)
         );
         assert!(manifest.migration.backup_validation_completed);
         assert!(manifest.canonical_target_validation_completed);
@@ -3082,7 +3449,7 @@ mod tests {
             .flatten()
             .any(|value| value == "NULL"));
 
-        migrations::run_to_version(&mut connection, 13).unwrap();
+        migrations::run(&mut connection).unwrap();
         assert_eq!(
             migration_target_snapshot(&connection, &path, 12).unwrap(),
             before
@@ -3107,7 +3474,7 @@ mod tests {
                 .unwrap();
             drop(connection);
             let migrated = open_database_path(temp.path(), &path).unwrap();
-            assert_eq!(version(&path), 13, "{base_unit}+{mode}");
+            assert_eq!(version(&path), CURRENT_SCHEMA_VERSION, "{base_unit}+{mode}");
             assert_eq!(
                 migrated
                     .query_row(
@@ -3161,7 +3528,7 @@ mod tests {
                 "{alteration}"
             );
             assert_eq!(version(&path), 12);
-            assert!(matching_files(temp.path(), "pos-v12-before-v13-").is_empty());
+            assert!(matching_files(temp.path(), "pos-v12-before-v16-").is_empty());
             assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
             assert!(!temp.path().join(MIGRATION_LOCK_NAME).exists());
         }
@@ -3189,7 +3556,7 @@ mod tests {
 
         assert!(open_database_path(temp.path(), &path).is_err());
         assert_eq!(version(&path), 12);
-        assert!(matching_files(temp.path(), "pos-v12-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v12-before-v16-").is_empty());
         assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
         assert!(!temp.path().join(MIGRATION_LOCK_NAME).exists());
     }
@@ -3209,7 +3576,7 @@ mod tests {
             .to_string()
             .contains(backup.to_string_lossy().as_ref()));
         assert_eq!(version(&path), 8);
-        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v16-").is_empty());
     }
 
     #[test]
@@ -3219,7 +3586,10 @@ mod tests {
         create_v8_database(&path);
 
         let connection = open_database_path(temp.path(), &path).unwrap();
-        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
+        assert_eq!(
+            schema_version(&connection, &path).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(
             connection
                 .query_row("SELECT stock FROM products WHERE id=1", [], |row| row
@@ -3229,7 +3599,7 @@ mod tests {
         );
         drop(connection);
 
-        let backups = matching_files(temp.path(), "pos-v8-before-v13-");
+        let backups = matching_files(temp.path(), "pos-v8-before-v16-");
         let manifests = matching_files(temp.path(), "pos-schema-v13-migration-completed-");
         assert_eq!(backups.len(), 1);
         assert_eq!(manifests.len(), 1);
@@ -3243,12 +3613,12 @@ mod tests {
     }
 
     #[test]
-    fn v13_reopens_without_replacing_backup_or_manifest() {
+    fn current_reopens_without_replacing_backup_or_manifest() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
         drop(open_database_path(temp.path(), &path).unwrap());
-        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v16-")[0].clone();
         let manifest =
             matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
         let backup_bytes = fs::read(&backup).unwrap();
@@ -3256,14 +3626,14 @@ mod tests {
 
         drop(open_database_path(temp.path(), &path).unwrap());
 
-        assert_eq!(matching_files(temp.path(), "pos-v8-before-v13-").len(), 1);
+        assert_eq!(matching_files(temp.path(), "pos-v8-before-v16-").len(), 1);
         assert_eq!(fs::read(backup).unwrap(), backup_bytes);
         assert_eq!(fs::read(manifest).unwrap(), manifest_bytes);
     }
 
     #[test]
     fn rejects_intermediate_future_and_negative_versions() {
-        for requested in [-1_i64, 1, 7, 9, 10, 11, 14] {
+        for requested in [-1_i64, 1, 7, 9, 10, 11, 15] {
             let temp = TempDir::new().unwrap();
             let path = temp.path().join("pos.db");
             let connection = Connection::open(&path).unwrap();
@@ -3276,7 +3646,7 @@ mod tests {
             assert!(error.to_string().contains(path.to_string_lossy().as_ref()));
             assert!(error.recovery_startup_message().is_none());
             assert_eq!(version(&path), requested);
-            assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+            assert!(matching_files(temp.path(), "pos-v8-before-v16-").is_empty());
         }
     }
 
@@ -3298,7 +3668,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(invalid_path.to_string_lossy().as_ref()));
-        assert!(matching_files(invalid.path(), "pos-v8-before-v13-").is_empty());
+        assert!(matching_files(invalid.path(), "pos-v8-before-v16-").is_empty());
     }
 
     #[test]
@@ -3431,12 +3801,12 @@ mod tests {
 
         assert!(open_database_path(temp.path(), &path).is_err());
         assert_eq!(version(&path), 8);
-        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v16-").is_empty());
         assert!(!temp.path().join(PENDING_MARKER_NAME).exists());
     }
 
     #[test]
-    fn failed_post_validation_leaves_v13_pending_and_blocks_reopen() {
+    fn failed_post_validation_leaves_current_pending_and_blocks_reopen() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
@@ -3463,7 +3833,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains(marker.backup_path.to_string_lossy().as_ref()));
-        assert_eq!(version(&path), 13);
+        assert_eq!(version(&path), CURRENT_SCHEMA_VERSION);
         assert!(temp.path().join(PENDING_MARKER_NAME).exists());
         assert!(open_database_path(temp.path(), &path).is_err());
     }
@@ -3513,7 +3883,10 @@ mod tests {
         drop(connection);
 
         let migrated = open_database_path(temp.path(), &path).unwrap();
-        assert_eq!(schema_version(&migrated, &path).unwrap(), 13);
+        assert_eq!(
+            schema_version(&migrated, &path).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(
             migration_target_snapshot(&migrated, &path, 8).unwrap(),
             absent
@@ -3683,7 +4056,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("Fallo de backup inyectado"));
-        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v16-").is_empty());
         assert_eq!(version(&path), 8);
         assert_eq!(
             source
@@ -3708,7 +4081,7 @@ mod tests {
             });
 
         assert!(result.is_err());
-        assert!(matching_files(temp.path(), "pos-v8-before-v13-").is_empty());
+        assert!(matching_files(temp.path(), "pos-v8-before-v16-").is_empty());
         assert_eq!(version(&path), 8);
     }
 
@@ -3748,7 +4121,7 @@ mod tests {
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
         drop(open_database_path(temp.path(), &path).unwrap());
-        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v16-")[0].clone();
         let current = Connection::open(&path).unwrap();
         current
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
@@ -3788,13 +4161,13 @@ mod tests {
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
         drop(open_database_path(temp.path(), &path).unwrap());
-        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v16-")[0].clone();
         let manifest =
             matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
         fs::remove_file(manifest).unwrap();
 
         assert!(restore_migration_backup_inner(temp.path(), &path, &backup).is_err());
-        assert_eq!(version(&path), 13);
+        assert_eq!(version(&path), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -3804,7 +4177,7 @@ mod tests {
             let path = temp.path().join("pos.db");
             create_v8_database(&path);
             drop(open_database_path(temp.path(), &path).unwrap());
-            let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+            let backup = matching_files(temp.path(), "pos-v8-before-v16-")[0].clone();
             let manifest_path =
                 matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
 
@@ -3827,7 +4200,7 @@ mod tests {
             }
 
             assert!(restore_migration_backup_inner(temp.path(), &path, &backup).is_err());
-            assert_eq!(version(&path), 13);
+            assert_eq!(version(&path), CURRENT_SCHEMA_VERSION);
         }
     }
 
@@ -3907,7 +4280,7 @@ mod tests {
         let path = temp.path().join("pos.db");
         create_v8_database(&path);
         drop(open_database_path(temp.path(), &path).unwrap());
-        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v16-")[0].clone();
         let foreign_backup = foreign.path().join("backup.db");
         let foreign_database = foreign.path().join("pos.db");
         fs::hard_link(&backup, &foreign_backup).unwrap();
@@ -4250,7 +4623,10 @@ mod tests {
         drop(migration_lock);
         fs::write(temp.path().join(MIGRATION_LOCK_NAME), b"stale metadata").unwrap();
         let connection = open_database_path(temp.path(), &path).unwrap();
-        assert_eq!(schema_version(&connection, &path).unwrap(), 13);
+        assert_eq!(
+            schema_version(&connection, &path).unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[cfg(unix)]
@@ -4309,7 +4685,7 @@ mod tests {
             )
             .unwrap();
 
-        let backup = matching_files(temp.path(), "pos-v8-before-v13-")[0].clone();
+        let backup = matching_files(temp.path(), "pos-v8-before-v16-")[0].clone();
         let manifest =
             matching_files(temp.path(), "pos-schema-v13-migration-completed-")[0].clone();
         for file in [path, backup, manifest] {

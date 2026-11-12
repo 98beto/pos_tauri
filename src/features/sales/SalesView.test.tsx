@@ -1,13 +1,17 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SalesView } from "./SalesView";
 import { getSaleHistoryDetail, getSalesView } from "../../api/sales";
+import { listCashSessions } from "../../api/cash";
+import { openCash } from "../../test/cash-fixtures";
 import type { SaleHistoryDetail, SalesView as SalesViewData } from "../../types/sale";
 
 vi.mock("../../api/sales", () => ({
   getSaleHistoryDetail: vi.fn(),
   getSalesView: vi.fn(),
 }));
+vi.mock("../../api/cash", () => ({ listCashSessions: vi.fn() }));
+beforeEach(() => { vi.mocked(listCashSessions).mockResolvedValue([openCash]); });
 
 const mockedGetSalesView = vi.mocked(getSalesView);
 const mockedGetSaleHistoryDetail = vi.mocked(getSaleHistoryDetail);
@@ -26,8 +30,8 @@ function salesView(): SalesViewData {
   return {
     stats: { sale_count: 2, total_sold: 3000, average_sale: 1500, lines_sold: 3 },
     items: [
-      { id: 1, ticket_number: "POS-00000001", sale_date: "2026-01-01", payment_method: "tarjeta", total: 2500, line_count: 2, user_id: 1, user_name: "Admin POS" },
-      { id: 2, ticket_number: "POS-00000002", sale_date: "2026-01-02", payment_method: "efectivo", total: 500, line_count: 1, user_id: 1, user_name: "Admin POS" },
+      { id: 1, cash_session_id: 2, ticket_number: "POS-00000001", sale_date: "2026-01-01", payment_method: "tarjeta", total: 2500, line_count: 2, user_id: 1, user_name: "Admin POS" },
+      { id: 2, cash_session_id: 1, ticket_number: "POS-00000002", sale_date: "2026-01-02", payment_method: "efectivo", total: 500, line_count: 1, user_id: 1, user_name: "Admin POS" },
     ],
   };
 }
@@ -35,6 +39,7 @@ function salesView(): SalesViewData {
 function detail(id: number): SaleHistoryDetail {
   return {
     id,
+    cash_session_id: 2,
     ticket_number: `POS-${String(id).padStart(8, "0")}`,
     payment_method: "tarjeta",
     sale_date: "2026-01-01",
@@ -152,9 +157,50 @@ function lengthDetail(): SaleHistoryDetail {
 afterEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
+  localStorage.clear();
 });
 
 describe("SalesView", () => {
+  it("displays the cash session in list, cards and detail and filters by historical session", async () => {
+    vi.useFakeTimers();
+    vi.mocked(listCashSessions).mockResolvedValue([openCash, { ...openCash, id: 1, historical: true, status: "closed" }]);
+    mockedGetSalesView.mockResolvedValue(salesView());
+    mockedGetSaleHistoryDetail.mockResolvedValue(detail(1));
+    render(<SalesView onSessionRequired={vi.fn()} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(screen.getByText("Caja #2")).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Caja #1 · Historica" })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Sesion de caja"), { target: { value: "1" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(mockedGetSalesView).toHaveBeenLastCalledWith({ search: undefined, payment_method: undefined, cash_session_id: 1 });
+    const calls = mockedGetSalesView.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    expect(screen.getByText("Caja #2")).toBeTruthy();
+    expect(mockedGetSalesView).toHaveBeenCalledTimes(calls);
+    fireEvent.click(screen.getByRole("button", { name: "Ver detalle de POS-00000001" }));
+    await act(async () => undefined);
+    expect(screen.getByRole("dialog").textContent).toContain("Caja #2");
+  });
+  it("switches to ticket cards without another fetch or losing filters and persists the choice", async () => {
+    vi.useFakeTimers();
+    mockedGetSalesView.mockResolvedValue(salesView());
+    const rendered = render(<SalesView onSessionRequired={vi.fn()} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.change(screen.getByLabelText("Buscar ticket"), { target: { value: "00000001" } });
+    fireEvent.change(screen.getByLabelText("Metodo de pago"), { target: { value: "tarjeta" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    const calls = mockedGetSalesView.mock.calls.length;
+    expect(screen.getByRole("button", { name: "Lista" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    expect(mockedGetSalesView).toHaveBeenCalledTimes(calls);
+    expect(screen.getByRole("button", { name: "Ver detalle de POS-00000001" })).toBeTruthy();
+    expect((screen.getByLabelText("Buscar ticket") as HTMLInputElement).value).toBe("00000001");
+    expect((screen.getByLabelText("Metodo de pago") as HTMLSelectElement).value).toBe("tarjeta");
+    rendered.unmount();
+    render(<SalesView onSessionRequired={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Tarjetas" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
   it("sends ticket and payment filters and replaces statistics with remote results", async () => {
     vi.useFakeTimers();
     mockedGetSalesView.mockResolvedValueOnce(salesView()).mockResolvedValueOnce({

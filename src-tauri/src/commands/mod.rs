@@ -4,6 +4,7 @@ pub mod cart;
 pub mod categories;
 pub mod inventory;
 pub mod products;
+pub mod purchase_invoices;
 pub mod sales;
 
 use crate::{
@@ -19,6 +20,8 @@ use std::sync::Mutex;
 pub struct SessionState {
     pub(super) current_user: Option<User>,
     pub(super) cart: CartState,
+    pub(super) generation: u64,
+    pub(super) invoice_preview: Option<purchase_invoices::PreviewBuffer>,
 }
 
 impl SessionState {
@@ -26,6 +29,11 @@ impl SessionState {
         // Keep logout cleanup centralized as more per-session state is added.
         self.current_user = None;
         self.cart.clear();
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("session generation exhausted");
+        self.invoice_preview = None;
     }
 
     fn set_current_user(&mut self, user: User) {
@@ -85,6 +93,7 @@ mod tests {
                 updated_at: "2026-01-01".into(),
             }),
             cart: [(7, 2)].into(),
+            ..Default::default()
         };
 
         state.clear();
@@ -107,6 +116,7 @@ mod tests {
         let mut state = super::SessionState {
             current_user: None,
             cart: [(7, 2)].into(),
+            ..Default::default()
         };
         let user = User {
             id: 1,
@@ -130,3 +140,4 @@ mod tests {
         assert!(state.cart.is_empty());
     }
 }
+pub mod cash;

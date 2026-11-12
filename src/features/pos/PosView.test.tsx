@@ -17,6 +17,8 @@ import {
   setCartItemUnitPrice,
 } from "../../api/cart";
 import { listCategories } from "../../api/categories";
+import { getCashState } from "../../api/cash";
+import { openCash } from "../../test/cash-fixtures";
 import { findProductByCode, listProductSelector } from "../../api/products";
 import { cart as cartFixture, deferred, emptyCart as emptyCartFixture, user } from "../../test/fixtures";
 import type { Cart } from "../../types/cart";
@@ -43,6 +45,7 @@ vi.mock("../../api/cart", () => ({
   setCartItemUnitPrice: vi.fn(),
 }));
 vi.mock("../../api/categories", () => ({ listCategories: vi.fn() }));
+vi.mock("../../api/cash", () => ({ getCashState: vi.fn() }));
 vi.mock("../../api/products", () => ({ findProductByCode: vi.fn(), listProductSelector: vi.fn() }));
 
 const mockedGetCart = vi.mocked(getCart);
@@ -62,6 +65,7 @@ const cart: Cart = {
 };
 const receipt: SaleReceipt = {
   sale: {
+    cash_session_id: 2,
     id: 3,
     user_id: user.id,
     cashier_name: "Ada Lovelace",
@@ -235,6 +239,7 @@ function updaterControls(overrides: Partial<UpdaterControls> = {}): UpdaterContr
 }
 
 beforeEach(() => {
+  vi.mocked(getCashState).mockReset().mockResolvedValue(openCash);
   vi.useFakeTimers();
   mockedGetCart.mockReset();
   mockedCheckoutCart.mockReset();
@@ -826,6 +831,7 @@ describe("PosView", () => {
       presentation_id: fixedPresentation.id,
       product: {
         ...product,
+        is_active: true,
         created_at: "",
         updated_at: "",
         presentations: selectorProduct.presentations,
@@ -850,6 +856,7 @@ describe("PosView", () => {
       match_kind: "sku",
       product: {
         ...product,
+        is_active: true,
         created_at: "",
         updated_at: "",
         presentations: selectorProduct.presentations,
@@ -1083,6 +1090,104 @@ describe("PosView", () => {
     expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
     expect(onNotice).toHaveBeenCalledWith({ tone: "error", message: "Venta completada, no se pudo actualizar el carrito." });
     expect(screen.queryByText(/confirmar el cobro/i)).toBeNull();
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes cash after recovering a confirmed legacy sale even when the cart reload fails", async () => {
+    vi.mocked(getCashState).mockResolvedValue(null);
+    savePendingCheckout({ version: 1, userId: user.id, checkoutToken: "legacy-confirmed", cartFingerprint: cart.cart_fingerprint, paymentMethod: "tarjeta" });
+    mockedGetCart.mockResolvedValueOnce(cart).mockRejectedValueOnce(new Error("offline"));
+    await renderLoaded();
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+    expect(mockedCheckoutCart).toHaveBeenCalledWith(expect.objectContaining({ checkout_token: "legacy-confirmed" }));
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
+    expect(screen.queryByText("Cobro pendiente de confirmar")).toBeNull();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
+  });
+
+  it("keeps a confirmed sale completed if its cash refresh fails", async () => {
+    vi.mocked(getCashState).mockResolvedValueOnce(openCash).mockRejectedValueOnce(new Error("offline"));
+    await renderLoaded();
+    expect(screen.queryByRole("button", { name: "Actualizar caja" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    await settleMutation(screen.getByRole("button", { name: /^Cobrar/ }));
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cerrar recibo" }));
+    expect(screen.getByRole("button", { name: "Reintentar consulta de caja" })).toBeTruthy();
+    expect(screen.queryByText("Cobro pendiente de confirmar")).toBeNull();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("reports expired authentication after confirmed checkout reload without restoring the intent (recovery=%s)", async (recovery) => {
+    if (recovery) savePendingCheckout({ version: 1, userId: user.id, checkoutToken: "confirmed-auth", cartFingerprint: cart.cart_fingerprint, paymentMethod: "tarjeta", expectedCashSessionId: 2 });
+    mockedGetCart.mockResolvedValueOnce(cart).mockRejectedValueOnce({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion requerida" });
+    const { onSessionRequired } = await renderLoaded();
+    if (!recovery) { fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" })); await settleMutation(screen.getByRole("button", { name: /^Cobrar/ })); }
+    expect(onSessionRequired).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
+    expect(screen.queryByText("Cobro pendiente de confirmar")).toBeNull();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+  });
+
+  it("blocks a new checkout after unreadable storage and recovers the original intent after remount", async () => {
+    const original = { version: 1 as const, userId: user.id, checkoutToken: "saved-before-readthrow", cartFingerprint: cart.cart_fingerprint, paymentMethod: "tarjeta" as const, expectedCashSessionId: 2 };
+    savePendingCheckout(original);
+    const key = `pos.checkout-intent.user.${user.id}`;
+    const raw = localStorage.getItem(key);
+    const getItem = Storage.prototype.getItem;
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (this: Storage, key) { if (key.startsWith("pos.checkout-intent")) throw new Error("denied"); return getItem.call(this, key); });
+    const first = await renderLoaded();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: /^Cobrar/ }));
+    expect(mockedCheckoutCart).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Releer cobro guardado" })).toBeTruthy();
+    first.unmount(); spy.mockRestore();
+    expect(localStorage.getItem(key)).toBe(raw);
+    mockedCheckoutCart.mockRejectedValueOnce(new Error("lost again"));
+    await renderLoaded();
+    expect(mockedCheckoutCart).toHaveBeenCalledWith({ checkout_token: original.checkoutToken, cart_fingerprint: original.cartFingerprint, payment_method: "tarjeta", expected_cash_session_id: 2 });
+    expect(localStorage.getItem(key)).toBe(raw);
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("does not overwrite a saved intent when the safety read at submit transiently fails", async () => {
+    await renderLoaded();
+    savePendingCheckout({ version: 1, userId: user.id, checkoutToken: "other-pending", cartFingerprint: cart.cart_fingerprint, paymentMethod: "tarjeta", expectedCashSessionId: 2 });
+    const raw = localStorage.getItem(`pos.checkout-intent.user.${user.id}`);
+    mockedCheckoutCart.mockRejectedValueOnce(new Error("uncertain recovery"));
+    vi.spyOn(Storage.prototype, "getItem").mockImplementationOnce(() => { throw new Error("transient"); });
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    await settleMutation(screen.getByRole("button", { name: /^Cobrar/ }));
+    vi.restoreAllMocks();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBe(raw);
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+    expect(mockedCheckoutCart.mock.calls[0][0].checkout_token).toBe("other-pending");
+    expect(screen.getByText("Cobro pendiente de confirmar")).toBeTruthy();
+  });
+
+  it("offers an accessible explicit resolution for invalid legacy data, preserving an exact local copy", async () => {
+    const raw = "{invalid legacy}";
+    localStorage.setItem("pos.checkout-intent", raw);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Revisar datos guardados" }));
+    expect(screen.getByRole("dialog", { name: "Revisar cobro guardado" }).textContent).toContain(raw);
+    expect((screen.getByRole("button", { name: "Conservar copia y desbloquear" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(localStorage.getItem("pos.checkout-intent")).toBe(raw);
+    fireEvent.click(screen.getByRole("checkbox", { name: /Revise las ventas/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Conservar copia y desbloquear" }));
+    expect(localStorage.getItem("pos.checkout-intent")).toBeNull();
+    const archiveKey = Object.keys(localStorage).find((key) => key.startsWith(`pos.checkout-intent.reviewed.user.${user.id}.`))!;
+    expect(JSON.parse(localStorage.getItem(archiveKey)!)).toEqual([{ key: "pos.checkout-intent", raw }]);
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(false);
+    expect(mockedCheckoutCart).not.toHaveBeenCalled();
   });
 
   it("keeps a recovered checkout completed when refreshing the cart fails", async () => {
@@ -1199,9 +1304,10 @@ describe("PosView", () => {
 
   it("keeps a changed-cart intention until accessible confirmation discards it", async () => {
     savePendingCheckout({ version: 1, userId: user.id, checkoutToken: "old-price", cartFingerprint: "cart-v2|11:1:1000", paymentMethod: "tarjeta" });
+    mockedCheckoutCart.mockRejectedValueOnce({ category: "conflict", code: "CART_CHANGED", message: "Carrito distinto" });
     await renderLoaded();
-    expect(mockedCheckoutCart).not.toHaveBeenCalled();
-    expect(screen.getByText(/El carrito cambio desde/)).toBeTruthy();
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+    expect(screen.getByText(/La caja, el carrito o la intencion/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Descartar intencion" }));
     const dialog = screen.getByRole("dialog", { name: "Descartar intencion de cobro" });
     expect(dialog).toBeTruthy();
@@ -1218,6 +1324,118 @@ describe("PosView", () => {
     expect(card.closest("label")?.className).toContain("has-[:focus-visible]:outline-2");
     card.focus();
     expect(document.activeElement).toBe(card);
+  });
+
+  it.each(["closed", "loading", "error"])("blocks all new payment methods with cash state %s but leaves the cart usable", async (state) => {
+    if (state === "closed") vi.mocked(getCashState).mockResolvedValue(null);
+    if (state === "loading") vi.mocked(getCashState).mockReturnValue(new Promise(() => {}));
+    if (state === "error") vi.mocked(getCashState).mockRejectedValue(new Error("offline"));
+    await renderLoaded();
+    for (const method of ["Tarjeta", "Transferencia", "Efectivo"]) {
+      fireEvent.click(screen.getByRole("radio", { name: method }));
+      expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect((screen.getByRole("button", { name: /Agregar producto/ }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: /Quitar Cafe/ }) as HTMLButtonElement).disabled).toBe(false);
+    expect(checkoutCart).not.toHaveBeenCalled();
+  });
+
+  it("only offers cash retry on failure, and enables checkout after a successful retry", async () => {
+    const retry = deferred<typeof openCash | null>();
+    vi.mocked(getCashState).mockRejectedValueOnce(new Error("offline")).mockReturnValueOnce(retry.promise);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Reintentar consulta de caja" }));
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Consultando estado de caja...")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Actualizar caja" })).toBeNull();
+    await act(async () => retry.resolve(openCash));
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(false);
+    expect(getCashState).toHaveBeenCalledTimes(2);
+    expect(checkoutCart).not.toHaveBeenCalled();
+  });
+
+  it("reports authentication errors from the cash query", async () => {
+    vi.mocked(getCashState).mockRejectedValueOnce({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion requerida" });
+    const { onSessionRequired } = await renderLoaded();
+    expect(onSessionRequired).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Reintentar consulta de caja" })).toBeTruthy();
+  });
+
+  it("keeps an archived/unavailable cart line removable and explains why it cannot be sold", async () => {
+    mockedGetCart.mockResolvedValue({ ...cart, lines: cart.lines.map((line) => ({ ...line, available: false })) });
+    vi.mocked(removeCartItem).mockResolvedValueOnce(emptyCart);
+    await renderLoaded();
+    expect(screen.getByText(/Producto no disponible para venta/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    expect((screen.getByRole("button", { name: /^Cobrar/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Quitar Cafe molido, Bolsa 250 g" }));
+    await act(async () => undefined);
+    expect(removeCartItem).toHaveBeenCalledWith(101);
+    expect(screen.getByText("El carrito esta vacio")).toBeTruthy();
+  });
+
+  it("delegates opening cash from the POS and refreshes state on focus without accepting a stale response", async () => {
+    const initial = deferred<typeof openCash | null>();
+    vi.mocked(getCashState).mockReturnValueOnce(initial.promise).mockResolvedValueOnce(null);
+    const onOpenCash = vi.fn();
+    render(<PosView user={user} sessionId={1} onNotice={vi.fn()} onSessionRequired={vi.fn()} onOpenCash={onOpenCash} />);
+    await act(async () => undefined);
+    expect(screen.queryByRole("button", { name: "Abrir caja" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reintentar consulta de caja" })).toBeNull();
+    fireEvent.focus(window); await act(async () => undefined);
+    fireEvent.click(screen.getByRole("button", { name: "Abrir caja" }));
+    expect(onOpenCash).toHaveBeenCalledOnce();
+    await act(async () => initial.resolve(openCash));
+    expect(screen.getByText(/No hay caja abierta/)).toBeTruthy();
+  });
+
+  it("persists the checkout cash session and never reassigns a rejected stale attempt to a new open session", async () => {
+    const response = deferred<SaleReceipt>();
+    mockedCheckoutCart.mockReturnValueOnce(response.promise);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cobrar/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Cobrar/ }));
+    const payload = mockedCheckoutCart.mock.calls[0][0];
+    expect(payload.expected_cash_session_id).toBe(openCash.id);
+    expect(JSON.parse(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)!).expectedCashSessionId).toBe(openCash.id);
+    vi.mocked(getCashState).mockResolvedValue({ ...openCash, id: 99 });
+    await act(async () => response.reject({ category: "conflict", code: "CASH_SESSION_NOT_OPEN", message: "La caja original ya cerro" }));
+    expect(mockedCheckoutCart).toHaveBeenCalledOnce();
+    const stored = JSON.parse(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)!);
+    expect(stored.expectedCashSessionId).toBe(openCash.id);
+    expect(stored.checkoutToken).toBe(payload.checkout_token);
+    expect(screen.getByRole("button", { name: "Descartar intencion" })).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("La caja o el carrito cambio");
+    expect(screen.getByText("Caja original #2. No se cambiara al reintentar.")).toBeTruthy();
+  });
+
+  it.each([false, true])("recovers an already confirmed receipt with closed cash (legacy=%s)", async (legacy) => {
+    vi.mocked(getCashState).mockResolvedValue(null);
+    savePendingCheckout({ version: 1, userId: user.id, checkoutToken: "saved-receipt", cartFingerprint: "old-cart", paymentMethod: "tarjeta", ...(!legacy ? { expectedCashSessionId: 1 } : {}) });
+    await renderLoaded();
+    expect(mockedCheckoutCart).toHaveBeenCalledWith(expect.objectContaining({ checkout_token: "saved-receipt", ...(!legacy ? { expected_cash_session_id: 1 } : {}) }));
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
+    expect(localStorage.getItem(`pos.checkout-intent.user.${user.id}`)).toBeNull();
+  });
+
+  it("recovers a lost new checkout after restart with the same token, payment and original cash session", async () => {
+    mockedCheckoutCart.mockRejectedValueOnce(new Error("lost response")).mockResolvedValueOnce(receipt);
+    const first = await renderLoaded();
+    fireEvent.click(screen.getByRole("radio", { name: "Tarjeta" }));
+    await settleMutation(screen.getByRole("button", { name: /^Cobrar/ }));
+    const original = mockedCheckoutCart.mock.calls[0][0];
+    expect(original.expected_cash_session_id).toBe(2);
+    expect(screen.getByText("Cobro pendiente de confirmar")).toBeTruthy();
+    first.unmount();
+    vi.mocked(getCashState).mockResolvedValue(null);
+    await renderLoaded();
+    expect(mockedCheckoutCart.mock.calls[1][0]).toEqual(original);
+    expect(screen.getByRole("dialog", { name: "Venta completada" })).toBeTruthy();
   });
 
   it("keeps discount radios keyboard-focusable with a visible focus style", async () => {

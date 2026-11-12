@@ -13,12 +13,14 @@
   --color-brand-soft: #e9eefc;
   --color-warning: #9a681b;
   --color-warning-soft: #fff3db;
+  --color-success: #216b50;
+  --color-success-soft: #e7f5ed;
   --color-danger: #b0444c;
   --color-danger-soft: #fcebed;
   --color-info: #397393;
   --color-info-soft: #e8f3f8;
   --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
-  --font-heading: "Fraunces Variable", Fraunces, Georgia, serif;
+  --font-heading: "Manrope Variable", Manrope, var(--font-sans);
   --shadow-panel: 0 18px 50px rgb(24 32 51 / 0.11);
   --radius-control: 0.625rem;
   --radius-card: 1rem;

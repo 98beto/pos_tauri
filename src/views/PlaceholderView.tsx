@@ -2,6 +2,8 @@ import { EmptyState } from "../components/ui";
 import type { ViewId } from "../layout/navigation";
 
 const content: Record<ViewId, { title: string; description: string; symbol: string }> = {
+  purchases: { title: "Compras", description: "Consulta la sección Compras para registrar facturas documentales.", symbol: "C" },
+  cash: { title: "Caja", description: "Consulta la seccion Caja para administrar la sesion global.", symbol: "" },
   pos: {
     title: "El punto de venta estara disponible pronto",
     description: "La estructura esta lista para conectar el carrito y el flujo de cobro en la siguiente etapa.",

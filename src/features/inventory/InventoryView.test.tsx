@@ -56,6 +56,34 @@ async function prepareAction(kind: "purchase" | "stock_count") {
 describe("InventoryView", () => {
   const sessionError = { category: "authentication", code: "SESSION_REQUIRED", message: "Sesion vencida" };
 
+  it("keeps independent list/cards preferences without reloading filters or pages", async () => {
+    mocks.view.mockResolvedValue({ ...view, product_total: 41, movement_total: 41 });
+    const rendered = renderView(); await settle();
+    const productList = screen.getByRole("button", { name: "Lista" });
+    expect(productList.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Siguiente" })); await settle();
+    const calls = mocks.view.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    expect(mocks.view).toHaveBeenCalledTimes(calls);
+    expect(screen.getByRole("button", { name: "Tarjetas" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByText("Pagina 2 de 3")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Movimientos" }));
+    expect(screen.getByRole("button", { name: "Tarjetas" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Lista" }));
+    expect(mocks.view).toHaveBeenCalledTimes(calls);
+    expect(screen.getByText("Compra · Entrada")).toBeTruthy();
+    expect(screen.getByText("Documento: FAC-1")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Buscar movimiento"), { target: { value: "cable" } }); await settle();
+    const filteredCalls = mocks.view.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
+    expect(mocks.view).toHaveBeenCalledTimes(filteredCalls);
+    expect((screen.getByLabelText("Buscar movimiento") as HTMLInputElement).value).toBe("cable");
+    rendered.unmount();
+    renderView();
+    expect(screen.getByRole("button", { name: "Tarjetas" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
   describe.each(["purchase", "stock_count"] as const)("initial %s quote session isolation", (kind) => {
     it.each(["success", "session", "field"] as const)("ignores an old %s completion across A->B->A without unlocking the new quote", async (outcome) => {
       const old = deferred<PurchaseQuote & StockCountQuote>();
@@ -282,6 +310,13 @@ describe("InventoryView", () => {
     renderView(); await settle(); fireEvent.click(screen.getByRole("tab", { name: "Movimientos" }));
     const panel = screen.getByRole("tabpanel", { name: "Movimientos" });
     expect(within(panel).getByText("Compra · Entrada")).toBeTruthy(); expect(within(panel).getByText("Ajuste · Salida")).toBeTruthy(); expect(within(panel).getByText("Venta · Salida")).toBeTruthy();
+    expect(within(panel).getByText((_, node) => node?.textContent === "Precio: $25.00 por 1 m")).toBeTruthy();
+    expect(within(panel).getByText("Proveedor: Proveedor")).toBeTruthy();
+    expect(within(panel).getByText("Documento: FAC-1")).toBeTruthy();
+    expect(within(panel).getByText("Stock anterior: 1 m")).toBeTruthy();
+    expect(within(panel).getAllByText("Stock después: 1.75 m").length).toBeGreaterThan(0);
+    expect(within(panel).getByText("Motivo: Merma")).toBeTruthy();
+    expect(within(panel).getByText("Ticket: T-9")).toBeTruthy();
   });
 
   it("consults a legacy token and demands recapture when it was not applied", async () => {

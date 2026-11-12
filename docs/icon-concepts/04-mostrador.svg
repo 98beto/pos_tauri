@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Mostrador</title>
+  <desc>Fachada de tienda reducida a toldo, marco y mostrador; la columna lateral dibuja una L discreta.</desc>
+  <rect width="512" height="512" rx="112" fill="#123B61"/>
+  <path d="M116 199L145 132H367L396 199" stroke="#F5FBFF" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M118 199C118 224 137 242 161 242C185 242 204 224 204 199C204 224 223 242 247 242C271 242 290 224 290 199C290 224 309 242 333 242C357 242 376 224 376 199C376 224 395 242 419 242" stroke="#56D8CC" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M145 243V370H368V243M145 370H269" stroke="#F5FBFF" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M273 300V370" stroke="#56D8CC" stroke-width="28" stroke-linecap="round"/>
+</svg>

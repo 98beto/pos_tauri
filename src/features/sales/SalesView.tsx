@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { getSaleHistoryDetail, getSalesView } from "../../api/sales";
-import { Button, EmptyState, Field, Modal, Spinner, StatCard } from "../../components/ui";
+import { listCashSessions } from "../../api/cash";
+import type { CashSession } from "../../types/cash";
+import { Button, EmptyState, Field, Modal, Spinner, StatCard, ViewToggle } from "../../components/ui";
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
 import { formatBaseQuantity, formatDateTime, formatEnteredQuantity, formatMoney, formatPricePerUnit } from "../../lib/format";
 import type { PaymentMethod, SaleHistoryDetail, SalesView as SalesViewData } from "../../types/sale";
+import { useViewPreference } from "../../hooks/useViewPreference";
 
 type SalesViewProps = {
   onSessionRequired: () => void;
@@ -32,9 +35,15 @@ function discountLabel(type: SaleHistoryDetail["discount_type"], value: number) 
 }
 
 export function SalesView({ onSessionRequired }: SalesViewProps) {
+  const [layout, setLayout] = useViewPreference("pos.view.sales", "list");
   const [view, setView] = useState<SalesViewData>();
   const [search, setSearch] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("");
+  const [cashSessionId, setCashSessionId] = useState("");
+  const [cashSessions, setCashSessions] = useState<CashSession[]>([]);
+  const [sessionsError, setSessionsError] = useState("");
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const sessionsRequest = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [detailOpen, setDetailOpen] = useState(false);
@@ -54,6 +63,7 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
       const nextView = await getSalesView({
         search: search || undefined,
         payment_method: (paymentMethod || undefined) as PaymentMethod | undefined,
+        ...(cashSessionId ? { cash_session_id: Number(cashSessionId) } : {}),
       });
       if (viewRequest.current !== request) return;
       setView(nextView);
@@ -94,7 +104,16 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
       window.clearTimeout(timeout);
       viewRequest.current += 1;
     };
-  }, [search, paymentMethod]);
+  }, [search, paymentMethod, cashSessionId]);
+
+  async function loadSessions() {
+    const request = ++sessionsRequest.current;
+    setSessionsLoading(true); setSessionsError("");
+    try { const result = await listCashSessions(); if (request === sessionsRequest.current) setCashSessions(result); }
+    catch (value) { if (request === sessionsRequest.current) { if (isSessionRequired(value)) onSessionRequired(); else setSessionsError(errorMessage(value, "No se pudieron consultar las sesiones de caja.")); } }
+    finally { if (request === sessionsRequest.current) setSessionsLoading(false); }
+  }
+  useEffect(() => { void loadSessions(); return () => { ++sessionsRequest.current; }; }, []);
 
   useEffect(() => () => {
     detailRequest.current += 1;
@@ -119,7 +138,7 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
     setSelectedSaleId(undefined);
   }
 
-  const hasFilters = Boolean(search || paymentMethod);
+  const hasFilters = Boolean(search || paymentMethod || cashSessionId);
   const statsDetail = loading
     ? "Pendiente de actualizacion"
     : error
@@ -152,9 +171,9 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
       </div>
 
       <section className="mt-5 overflow-hidden rounded-card border border-line bg-surface">
-        <div className="border-b border-line p-4 sm:p-5">
-          <h2 id="sales-table-title" className="font-heading text-xl font-bold">Historial de tickets</h2>
-          <p className="mt-1 text-xs text-muted">Ventas persistidas y disponibles para consulta.</p>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line p-4 sm:p-5">
+          <div><h2 id="sales-table-title" className="font-heading text-xl font-bold">Historial de tickets</h2><p className="mt-1 text-xs text-muted">Ventas persistidas y disponibles para consulta.</p></div>
+          <ViewToggle label="ventas" value={layout} onChange={setLayout} />
         </div>
         <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-[minmax(0,1fr)_280px] sm:p-5">
           <Field label="Buscar ticket" value={search} onChange={(event) => updateSearch(event.target.value)} placeholder="POS-00000001" />
@@ -167,6 +186,8 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
               <option value="transferencia">Transferencia</option>
             </select>
           </label>
+          <label className="grid gap-2 text-xs font-bold">Sesion de caja<select className={selectClass} value={cashSessionId} disabled={sessionsLoading} onChange={(e) => { setLoading(true); setError(""); setCashSessionId(e.target.value); }}><option value="">Todas las cajas</option>{cashSessions.map((s) => <option key={s.id} value={s.id}>Caja #{s.id}{s.historical ? " · Historica" : s.status === "open" ? " · Abierta" : " · Cerrada"}</option>)}</select></label>
+          {sessionsError && <div role="alert">{sessionsError}<Button disabled={sessionsLoading} onClick={() => void loadSessions()}>Reintentar cajas</Button></div>}
         </div>
 
         {error && (
@@ -179,18 +200,19 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
         {error && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Se muestran los resultados anteriores; no corresponden a los filtros actuales.</p>}
         {loading && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Actualizando; se muestran temporalmente los resultados anteriores.</p>}
 
-        <div className="relative overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Historial de tickets desplazable" aria-busy={loading} tabIndex={0}>
+        <div className="relative" aria-busy={loading}>
           {loading && <div className="absolute inset-x-0 top-0 z-10 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}
           {!view && loading ? (
             <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div>
-          ) : view?.items.length ? (
+          ) : view?.items.length && layout === "list" ? (
+            <div className="overflow-x-auto focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand" role="region" aria-label="Historial de tickets desplazable" tabIndex={0}>
             <table aria-labelledby="sales-table-title" className="w-full min-w-[760px] text-left text-sm">
               <caption className="sr-only">Tickets del historial de ventas</caption>
                <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Ticket</th><th className="border-b border-line px-5 py-3">Metodo</th><th className="border-b border-line px-5 py-3 text-right">Lineas</th><th className="border-b border-line px-5 py-3 text-right">Total</th><th className="border-b border-line px-5 py-3">Fecha</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
               <tbody>
                 {view.items.map((sale) => (
                   <tr key={sale.id} className="hover:bg-surface-soft/60">
-                    <td className="border-b border-line px-5 py-4"><strong className="font-mono text-xs">{sale.ticket_number}</strong><span className="mt-1 block text-xs text-muted">{sale.user_name}</span></td>
+                    <td className="border-b border-line px-5 py-4"><strong className="font-mono text-xs">{sale.ticket_number}</strong><span className="block text-xs">Caja #{sale.cash_session_id}</span><span className="mt-1 block text-xs text-muted">{sale.user_name}</span></td>
                     <td className="border-b border-line px-5 py-4"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${paymentClasses[sale.payment_method]}`}>{paymentLabels[sale.payment_method]}</span></td>
                     <td className="border-b border-line px-5 py-4 text-right font-semibold">{sale.line_count}</td>
                     <td className="border-b border-line px-5 py-4 text-right font-bold">{formatMoney(sale.total)}</td>
@@ -200,7 +222,8 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
                 ))}
               </tbody>
             </table>
-          ) : !loading && !error && (
+            </div>
+          ) : view?.items.length && layout === "cards" ? <div className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">{view.items.map((sale) => <article key={sale.id} className="grid gap-3 rounded-control border border-line p-4"><div className="flex items-start justify-between gap-3"><div><strong className="font-mono text-xs">{sale.ticket_number}</strong><span className="block text-xs">Caja #{sale.cash_session_id}</span><span className="mt-1 block text-xs text-muted">{sale.user_name}</span></div><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${paymentClasses[sale.payment_method]}`}>{paymentLabels[sale.payment_method]}</span></div><dl className="grid grid-cols-2 gap-3 text-sm"><div><dt className="text-xs text-muted">Lineas</dt><dd className="font-semibold">{sale.line_count}</dd></div><div><dt className="text-xs text-muted">Total</dt><dd className="font-bold">{formatMoney(sale.total)}</dd></div></dl><time className="text-xs text-muted">{formatDateTime(sale.sale_date)}</time><Button size="sm" variant="ghost" aria-label={`Ver detalle de ${sale.ticket_number}`} disabled={detailLoading && selectedSaleId === sale.id} onClick={() => openDetail(sale.id)}>Ver detalle</Button></article>)}</div> : !loading && !error && (
             <EmptyState title={hasFilters ? "No hay tickets con estos filtros" : "Aun no hay ventas"} description={hasFilters ? "Cambia el ticket o el metodo de pago para ampliar los resultados." : "Los tickets apareceran despues de completar el primer cobro."} icon="#" />
           )}
         </div>
@@ -213,6 +236,7 @@ export function SalesView({ onSessionRequired }: SalesViewProps) {
           <div className="grid min-h-64 place-items-center text-center" role="alert"><div className="max-w-sm"><strong className="block text-sm">No se pudo mostrar este ticket</strong><p className="mt-2 text-xs leading-5 text-danger">{detailError}</p><Button className="mt-4" onClick={() => selectedSaleId !== undefined && void loadDetail(selectedSaleId)}>Reintentar</Button></div></div>
         ) : detail ? (
           <div>
+            <p className="mb-3 font-bold">Caja #{detail.cash_session_id}</p>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <div className="rounded-card bg-brand-soft p-4"><span className="text-[0.625rem] font-bold tracking-wider text-brand uppercase">Total</span><strong className="mt-2 block font-heading text-2xl text-brand-dark">{formatMoney(detail.total)}</strong></div>
               <div className="rounded-card border border-line p-4"><span className="text-[0.625rem] font-bold tracking-wider text-muted uppercase">Metodo</span><strong className="mt-2 block text-sm">{paymentLabels[detail.payment_method]}</strong></div>

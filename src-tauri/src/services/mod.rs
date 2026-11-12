@@ -4,6 +4,9 @@ pub mod cart;
 pub mod categories;
 pub mod inventory;
 pub mod products;
+pub mod purchase_invoice_files;
+pub mod purchase_invoice_parser;
+pub mod purchase_invoices;
 pub mod sales;
 
 use unicode_casefold::UnicodeCaseFold;
@@ -325,3 +328,4 @@ mod tests {
         assert_eq!(BaseUnit::Piece.standard_base_quantity(), None);
     }
 }
+pub mod cash;

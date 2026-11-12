@@ -1,9 +1,11 @@
 pub mod brand;
 pub mod cart;
+pub mod cash;
 pub mod category;
 pub mod inventory_movement;
 pub mod product;
 pub mod product_presentation;
+pub mod purchase_invoice;
 pub mod sale;
 pub mod sale_detail;
 pub mod user;

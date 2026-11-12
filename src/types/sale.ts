@@ -3,6 +3,7 @@ import type { BaseUnit } from "./product";
 import type { PresentationMode } from "./product_presentation";
 
 export interface Sale {
+  cash_session_id: number;
   id: number;
   user_id: number;
   cashier_name: string;
@@ -31,11 +32,13 @@ export interface SaleReceipt {
 }
 
 export interface SalesViewFilters {
+  cash_session_id?: number;
   search?: string;
   payment_method?: PaymentMethod;
 }
 
 export interface SalesViewRow {
+  cash_session_id: number;
   id: number;
   ticket_number: string;
   sale_date: string;
@@ -77,6 +80,7 @@ export interface SaleHistoryLine {
 }
 
 export interface SaleHistoryDetail {
+  cash_session_id: number;
   id: number;
   ticket_number: string;
   payment_method: PaymentMethod;

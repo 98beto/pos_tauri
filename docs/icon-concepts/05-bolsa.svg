@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Bolsa</title>
+  <desc>Bolsa de compra sólida y amable con una L turquesa integrada como firma de marca.</desc>
+  <rect width="512" height="512" rx="112" fill="#DFF4F1"/>
+  <path d="M153 207H359L379 386H133L153 207Z" fill="#123B61"/>
+  <path d="M202 213V177C202 146 224 124 256 124C288 124 310 146 310 177V213" stroke="#123B61" stroke-width="30" stroke-linecap="round"/>
+  <path d="M224 252V334H305" stroke="#57DED0" stroke-width="27" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

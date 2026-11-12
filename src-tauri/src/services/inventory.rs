@@ -177,7 +177,7 @@ pub fn search_products(
 ) -> ServiceResult<InventoryProductSearchResult> {
     let search = normalize_search(search)?;
     let page = page(Some(requested_page), "page")?;
-    let condition = "?1='' OR instr(p.name_search_key,?1)>0 OR instr(p.sku_search_key,?1)>0";
+    let condition = "p.is_active=1 AND (?1='' OR instr(p.name_search_key,?1)>0 OR instr(p.sku_search_key,?1)>0)";
     let total = connection.query_row(
         &format!("SELECT COUNT(*) FROM products p WHERE {condition}"),
         [&search],
@@ -224,7 +224,7 @@ pub fn view(
     let base_unit = filters.base_unit.map(|unit| unit.as_str());
     let product_page = page(filters.product_page, "product_page")?;
     let movement_page = page(filters.movement_page, "movement_page")?;
-    let product_where = "(?1='' OR instr(p.name_search_key,?1)>0 OR instr(p.sku_search_key,?1)>0) AND (?2 IS NULL OR p.base_unit=?2)";
+    let product_where = "p.is_active=1 AND (?1='' OR instr(p.name_search_key,?1)>0 OR instr(p.sku_search_key,?1)>0) AND (?2 IS NULL OR p.base_unit=?2)";
     let product_total = connection.query_row(
         &format!("SELECT COUNT(*) FROM products p WHERE {product_where}"),
         params![product_search, base_unit],
@@ -849,6 +849,7 @@ fn public_count_quote(input: &NormalizedCount, value: CalculatedCount) -> StockC
 }
 
 fn load_product_snapshot(connection: &Connection, id: i64) -> ServiceResult<ProductSnapshot> {
+    super::products::ensure_active(connection, id)?;
     connection
         .query_row(
             "SELECT id,name,sku,stock,base_unit FROM products WHERE id=?1",
@@ -1181,7 +1182,8 @@ fn inventory_movement_product(
 }
 
 fn inventory_stats(connection: &Connection) -> ServiceResult<InventoryViewStats> {
-    let mut statement = connection.prepare("SELECT base_unit,stock FROM products")?;
+    let mut statement =
+        connection.prepare("SELECT base_unit,stock FROM products WHERE is_active=1")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -1593,6 +1595,131 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn archived_inventory_blocks_new_operations_but_recovers_saved_purchase_and_count() {
+        let (mut connection, presentation_id) = database();
+        let quote = super::quote_purchase(
+            &connection,
+            purchase_input(1, Some(presentation_id), "250", "120.00"),
+        )
+        .unwrap();
+        let first = super::create_purchase(
+            &mut connection,
+            create_purchase_input(&quote, "250", "120.00", "archive-purchase"),
+        )
+        .unwrap();
+        let count_quote = super::quote_stock_count(
+            &connection,
+            QuoteStockCountInput {
+                product_id: 1,
+                counted_stock: "1100".into(),
+                adjustment_reason: "Conteo fisico".into(),
+            },
+        )
+        .unwrap();
+        let count_input = |token: &str| CreateStockCountInput {
+            product_id: 1,
+            counted_stock: "1100".into(),
+            adjustment_reason: "Conteo fisico".into(),
+            operation_token: token.into(),
+            quote_fingerprint: count_quote.quote_fingerprint.clone(),
+        };
+        let count =
+            super::create_stock_count(&mut connection, count_input("archive-count")).unwrap();
+        let history = serde_json::to_value(super::list(&connection).unwrap()).unwrap();
+        crate::services::products::set_active(&mut connection, 1, false).unwrap();
+        assert_eq!(
+            super::create_purchase(
+                &mut connection,
+                create_purchase_input(&quote, "250", "120.00", "archive-purchase")
+            )
+            .unwrap()
+            .id,
+            first.id
+        );
+        assert_eq!(
+            super::create_stock_count(&mut connection, count_input("archive-count"))
+                .unwrap()
+                .id,
+            count.id
+        );
+        assert_eq!(
+            super::create_purchase(
+                &mut connection,
+                create_purchase_input(&quote, "250", "120.00", "new-archived-purchase")
+            )
+            .unwrap_err()
+            .code,
+            "PRODUCT_ARCHIVED"
+        );
+        assert_eq!(
+            super::create_stock_count(&mut connection, count_input("new-archived-count"))
+                .unwrap_err()
+                .code,
+            "PRODUCT_ARCHIVED"
+        );
+        for presentation in [None, Some(presentation_id)] {
+            assert_eq!(
+                super::quote_purchase(
+                    &connection,
+                    purchase_input(1, presentation, "250", "120.00")
+                )
+                .unwrap_err()
+                .code,
+                "PRODUCT_ARCHIVED"
+            );
+        }
+        assert_eq!(
+            super::quote_stock_count(
+                &connection,
+                QuoteStockCountInput {
+                    product_id: 1,
+                    counted_stock: "1000".into(),
+                    adjustment_reason: "Conteo fisico".into()
+                }
+            )
+            .unwrap_err()
+            .code,
+            "PRODUCT_ARCHIVED"
+        );
+        assert!(super::search_products(&connection, None, 1)
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(super::search_products(&connection, Some("ACE-1".into()), 1)
+            .unwrap()
+            .items
+            .is_empty());
+        let view = super::view(&connection, Default::default()).unwrap();
+        assert_eq!(view.product_total, 0);
+        assert_eq!(view.stats.product_count, 0);
+        assert_eq!(view.stats.milliliter_stock, 0);
+        assert_eq!(view.movement_total, 2);
+        assert_eq!(
+            serde_json::to_value(super::list(&connection).unwrap()).unwrap(),
+            history
+        );
+        let detail = super::product_detail(&connection, 1, Default::default()).unwrap();
+        assert_eq!(detail.product.stock, 1100);
+        assert_eq!(detail.total, 2);
+        assert_eq!(connection.query_row("SELECT stock,(SELECT count(*) FROM inventory_movements) FROM products WHERE id=1", [], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?))).unwrap(), (1100,2));
+        crate::services::products::set_active(&mut connection, 1, true).unwrap();
+        assert_eq!(
+            super::search_products(&connection, None, 1)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert!(
+            super::quote_purchase(&connection, purchase_input(1, None, "250", "120.00")).is_ok()
+        );
+        assert_eq!(
+            serde_json::to_value(super::list(&connection).unwrap()).unwrap(),
+            history
+        );
     }
 
     #[test]
@@ -2409,6 +2536,15 @@ mod tests {
         .unwrap();
 
         let cart = SessionCart::from([(presentation_id, 100)]);
+        crate::services::cash::open(
+            &mut connection,
+            1,
+            crate::models::cash::OpenCashInput {
+                operation_token: "fixture-open".into(),
+                opening_amount: 0,
+            },
+        )
+        .unwrap();
         let fingerprint = cart::get(&connection, &cart).unwrap().cart_fingerprint;
         let sale = sales::checkout(
             &mut connection,
@@ -2416,6 +2552,7 @@ mod tests {
             &cart,
             CheckoutCartInput {
                 checkout_token: "sale-after-purchase".into(),
+                expected_cash_session_id: Some(1),
                 cart_fingerprint: fingerprint,
                 payment_method: "tarjeta".into(),
                 cash_received: None,

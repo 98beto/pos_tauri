@@ -1,8 +1,12 @@
 use crate::{db, process_lock};
 use std::{ffi::OsString, fmt, fs, path::PathBuf};
 
-const USAGE: &str = "Uso: pos_tauri maintenance-info | restore-migration-backup --database <ruta-absoluta>/pos.db --backup <ruta-absoluta>/pos-v8|v12-before-v13-ID.db";
-const MAINTENANCE_INFO: &str = "Linea POS 0.2.1: mantenimiento local disponible";
+const USAGE: &str = "Uso: pos_tauri maintenance-info | restore-migration-backup --database <ruta-absoluta>/pos.db --backup <ruta-absoluta>/backup-del-manifiesto.db";
+const MAINTENANCE_INFO: &str = concat!(
+    "Linea POS ",
+    env!("CARGO_PKG_VERSION"),
+    ": mantenimiento local disponible"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaintenanceError {
@@ -243,6 +247,36 @@ mod tests {
             assert_eq!(
                 parse_arguments(invalid),
                 Err(MaintenanceError::InvalidArguments)
+            );
+        }
+    }
+
+    #[test]
+    fn usage_is_generic_and_parser_accepts_historical_backup_names() {
+        assert!(MaintenanceError::InvalidArguments
+            .to_string()
+            .contains("<ruta-absoluta>/backup-del-manifiesto.db"));
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("pos.db");
+        for name in [
+            "backup-del-manifiesto.db",
+            "pos-v8-before-v13-ID.db",
+            "pos-v12-before-v13-ID.db",
+            "pos-v14-before-v15-ID.db",
+        ] {
+            let backup = temp.path().join(name);
+            assert_eq!(
+                parse_arguments(vec![
+                    OsString::from("restore-migration-backup"),
+                    OsString::from("--database"),
+                    database.clone().into_os_string(),
+                    OsString::from("--backup"),
+                    backup.clone().into_os_string(),
+                ]),
+                Ok(RestoreArguments {
+                    database: database.clone(),
+                    backup,
+                })
             );
         }
     }

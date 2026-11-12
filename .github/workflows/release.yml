@@ -433,13 +433,14 @@ jobs:
           if ($executables.Count -ne 1 -or $executables[0].Length -eq 0) {
             throw "NSIS payload must contain exactly one non-empty pos_tauri.exe"
           }
+          $version = ([System.IO.File]::ReadAllText("$PWD/package.json") | ConvertFrom-Json).version
           $capture = Join-Path $env:RUNNER_TEMP ("nsis-maintenance-" + [guid]::NewGuid().ToString("N"))
           $stdoutPath = "$capture.stdout"
           $stderrPath = "$capture.stderr"
           $maintenance = Start-Process -FilePath $executables[0].FullName -ArgumentList "maintenance-info" -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
           $stdout = [System.IO.File]::ReadAllText($stdoutPath)
           $stderr = [System.IO.File]::ReadAllText($stderrPath)
-          if ($maintenance.ExitCode -ne 0 -or $stdout -cne "Linea POS 0.2.1: mantenimiento local disponible`n" -or $stderr.Length -ne 0) {
+          if ($maintenance.ExitCode -ne 0 -or $stdout -cne "Linea POS ${version}: mantenimiento local disponible`n" -or $stderr.Length -ne 0) {
             throw "NSIS payload maintenance-info failed (exit=$($maintenance.ExitCode)): stdout=[$stdout] stderr=[$stderr]"
           }
       - name: Sign final NSIS installer bytes
@@ -525,13 +526,14 @@ jobs:
           if ($executables.Count -ne 1 -or $executables[0].Length -eq 0) {
             throw "MSI payload must contain exactly one non-empty pos_tauri.exe"
           }
+          $version = ([System.IO.File]::ReadAllText("$PWD/package.json") | ConvertFrom-Json).version
           $capture = Join-Path $env:RUNNER_TEMP ("msi-maintenance-" + [guid]::NewGuid().ToString("N"))
           $stdoutPath = "$capture.stdout"
           $stderrPath = "$capture.stderr"
           $maintenance = Start-Process -FilePath $executables[0].FullName -ArgumentList "maintenance-info" -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
           $stdout = [System.IO.File]::ReadAllText($stdoutPath)
           $stderr = [System.IO.File]::ReadAllText($stderrPath)
-          if ($maintenance.ExitCode -ne 0 -or $stdout -cne "Linea POS 0.2.1: mantenimiento local disponible`n" -or $stderr.Length -ne 0) {
+          if ($maintenance.ExitCode -ne 0 -or $stdout -cne "Linea POS ${version}: mantenimiento local disponible`n" -or $stderr.Length -ne 0) {
             throw "MSI payload maintenance-info failed (exit=$($maintenance.ExitCode)): stdout=[$stdout] stderr=[$stderr]"
           }
       - run: git diff --exit-code -- src-tauri/Cargo.lock

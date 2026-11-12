@@ -69,6 +69,7 @@ pnpm install --frozen-lockfile
 pnpm validate:version v1.2.3
 pnpm test
 pnpm build
+pnpm qa:migration-v16
 pnpm qa:migration-v8-v13
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
@@ -79,26 +80,27 @@ git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
 
 El ultimo comando se ejecuta despues de confirmar los cambios de version y locks; comprueba que instalaciones y pruebas no los modificaron de nuevo. `pnpm validate:version` rechaza formatos distintos de `vX.Y.Z` y discrepancias entre los tres archivos.
 
-## Runbook de migracion al esquema 13
+## Runbook de migracion al esquema 16
 
 SQLite 13 adopta un modelo sin valoracion de inventario. Elimina intencionalmente las columnas financieras antiguas y los movimientos historicos de valoracion, no traslada precios historicos a los campos de compra v3 y amplia a `centimeter` el dominio `base_unit`. Conserva literalmente stock, cantidades, importes comerciales, IDs, relaciones y secuencias; la secuencia de movimientos no retrocede aunque se elimine su fila de ID mas alto.
 
-Se admiten solamente `8 -> 13` y `12 -> 13`. Una base nueva se crea directamente en 13; una base 13 se valida y abre sin migrar; las versiones 9, 10 y 11 se rechazan sin escritura. Nunca ejecutar el primer ensayo sobre el archivo activo de produccion.
+Las migraciones 014 y 015 añaden baja logica de productos y sesiones de caja; la 016 añade facturas documentales sin modificar las anteriores. Se admiten `8/12/13/14/15 -> 16`. Una base nueva se crea directamente en 16 sin facturas ficticias; una base 16 se valida y abre sin migrar; las versiones 9, 10 y 11 se rechazan sin escritura. Las ventas previas se asocian a una caja historica cerrada sin inventar apertura ni arqueo; si no hay ventas no se crea esa sesion. Nunca ejecutar el primer ensayo sobre el archivo activo de produccion.
 
 La prueba automatizada requerida por CI y release es:
 
 ```bash
+pnpm qa:migration-v16
 pnpm qa:migration-v8-v13
 ```
 
-El comando valida fixtures v8 y v12 con datos financieros conocidos, desconocidos e incorrectos, el caso de precio por kilo capturado como precio por gramo, compras, ajustes, ventas y valoraciones historicas. Comprueba su eliminacion intencional, preservacion literal de los campos retenidos, centimetros, rechazo de unidades desconocidas y versiones intermedias, backup, marcadores, reapertura y restauracion. No sustituye la prueba externa sobre una copia cerrada de produccion, que sigue pendiente hasta su ejecucion por un operador.
+La entrada historica y `node scripts/run-v15-migration-qa.mjs` tambien validan las cinco fuentes hasta v16. Los fixtures v8 y v12 comprueban las reglas historicas de la migracion 013; v13 y v14 comprueban datos comerciales, archivo, ventas y caja historica; v15 cubre datos previos y adjuntos en un backup v16. Se ejercitan backup, marcadores, reapertura y restauracion. No sustituye la prueba externa sobre una copia cerrada de produccion, que sigue pendiente hasta su ejecucion por un operador.
 
 ### Candidato y copia cerrada
 
 1. Registrar el commit exacto y ejecutar `Release` desde `main` con `mode=validate`.
 2. Descargar el artifact `release-candidate-<sha>` y registrar el run ID del `validate`; comprobar que `candidate-provenance.json` contiene el tag, SHA y run ID esperados y ejecutar `sha256sum --check SHA256SUMS`.
 3. Cerrar Linea POS en el equipo origen y confirmar que no quedan procesos ni operaciones activas.
-4. Confirmar `PRAGMA user_version` igual a 8 o 12, `quick_check=ok` y cero filas de `foreign_key_check`.
+4. Confirmar `PRAGMA user_version` igual a 8, 12, 13, 14 o 15, `quick_check=ok` y cero filas de `foreign_key_check`.
 5. Crear una copia consistente mediante `.backup`; no usar `cp` si puede existir WAL pendiente.
 6. Mantener copia, backups y manifiestos en almacenamiento restringido y anonimizar antes de sacarlos del entorno autorizado.
 
@@ -110,45 +112,48 @@ Usar una maquina, VM o perfil QA sin acceso al directorio de datos real. Mantene
 
 La aplicacion crea:
 
-- `pos-v8-before-v13-<attempt-id>.db` o `pos-v12-before-v13-<attempt-id>.db`.
+- `pos-v<source>-before-v16-<attempt-id>.db`, con origen 8, 12, 13, 14 o 15.
 - `pos-schema-v13-migration-pending.json` mientras la migracion no esta cerrada durablemente.
 - `pos-schema-v13-migration-completed-<attempt-id>.json` al completar.
 - `pos-schema-v13-migration.lock` para excluir aperturas concurrentes.
 - `pos-schema-v13-restore-pending.json` durante una restauracion.
 - `pos-schema-v13-restore-completed-<restore-id>.json` al completar la restauracion.
 
-Tras el primer inicio, comprobar `user_version=13`, `quick_check=ok`, cero violaciones de FK, exactamente un backup y un manifiesto completado, y ausencia del marcador pendiente. Leer siempre `database_path`, `backup_path`, `source_version`, `target_version`, `backup_size_bytes`, `backup_sha256` y `backup_validation_completed` desde el manifiesto. Reabrir y confirmar que no se crean otro backup ni otro manifiesto.
+Los nombres de marcadores `pos-schema-v13-*` se mantienen por compatibilidad; no indican el destino real. Tras el primer inicio, comprobar `user_version=16`, ausencia de facturas ficticias, `quick_check=ok`, cero violaciones de FK, exactamente un backup y un manifiesto completado, y ausencia del marcador pendiente. Leer siempre `database_path`, `backup_path`, `source_version`, `target_version`, `backup_size_bytes`, `backup_sha256` y `backup_validation_completed` desde el manifiesto. Reabrir y confirmar que no se crean otro backup ni otro manifiesto.
 
-Para una fuente 12, comparar antes y despues todos los campos retenidos. Confirmar por separado que no quedan columnas financieras antiguas, precios historicos copiados ni filas de valoracion. Las demas diferencias de esquema se limitan a los campos de compra v3 y a `centimeter` en los tres dominios de unidad.
+Para una fuente 12, comparar antes y despues todos los campos retenidos. Confirmar por separado que no quedan columnas financieras antiguas, precios historicos copiados ni filas de valoracion. Para todas las fuentes, verificar productos activos/archivados, presentaciones conservadas, ventas vinculadas a sesion y balances historicos desconocidos como `NULL`. No recalcular ventas ni ajustar stock al archivar.
 
 ### Smoke funcional
 
 1. Productos: crear una longitud con presentacion `Metro`; confirmar stock y ausencia de movimiento inicial.
 2. Compras: registrar una compra en centimetros con precio, proveedor y factura; comprobar stock, precio e importe propios.
 3. Conteos: capturar existencias reales mayores y menores; comprobar diferencia, motivo y stock resultante sin datos comerciales.
-4. POS: vender centimetros con precio personalizado y descuento; comprobar total comercial y stock.
+4. Caja y POS: comprobar bloqueo sin caja, abrir con fondo y vender centimetros con precio personalizado y descuento; comprobar total comercial, stock y sesion de venta.
 5. Ventas: comprobar snapshots, precio aplicado, subtotal, descuento y total historico, sin datos de costo.
 6. Correccion: sobre otra copia desechable, cotizar y corregir una compra con movimientos posteriores; comprobar que solo cambian el precio y el importe de esa compra y que cantidades, stock, ventas y movimientos posteriores permanecen iguales.
 7. Rollback transaccional: provocar un rechazo seguro, por ejemplo fingerprint obsoleto, y confirmar que no hay escrituras parciales.
+8. Caja: registrar ingreso/retiro con motivo y cerrar con efectivo contado; verificar esperado, diferencia, desglose y bloqueo posterior. Consultar la sesion historica sin mostrar balances desconocidos como cero.
+9. Catalogo: archivar/restaurar con stock e historia; verificar lookup, carrito, movimientos, codigos reservados y presentaciones. Alternar lista/tarjetas sin perder filtros.
+10. Facturas: importar XML CFDI 4.0 de ingreso y PDF opcional, revisar conceptos originales, registrar, filtrar y alternar vistas; consultar detalle, abrir PDF y exportar bytes originales. Confirmar que no cambia stock ni caja y probar cancelacion y duplicado. El smoke de plataforma, incluido Windows, permanece bloqueado hasta disponer de entorno y operador; no se ha acreditado su ejecucion.
 
 ### Restauracion y rollback
 
-Ensayar el rollback antes de publicar. Cerrar completamente el candidato, conservar una copia diagnostica de SQLite 13 y tomar el backup exacto desde el manifiesto completado o el marcador pendiente. Validar que conserva el `source_version` y el snapshot de origen.
+Ensayar el rollback antes de publicar. Cerrar completamente el candidato, conservar una copia diagnostica consistente de SQLite 16 y tomar el backup exacto desde el manifiesto completado o el marcador pendiente. Validar que conserva el `source_version` y el snapshot de origen. Un backup SQLite consistente v16 conserva los BLOB y hashes de adjuntos; no existe una nueva interfaz de backup. El backup de migracion v15 precede a las facturas registradas en v16 y no puede contenerlas.
 
-Leer `database_path` y `backup_path` del manifiesto `pos-schema-v13-migration-completed-<attempt-id>.json` o, si la migracion quedo pendiente, de `pos-schema-v13-migration-pending.json`. Cerrar Linea POS por completo. El comando real depende del artefacto instalado; sustituir las rutas por los dos valores exactos del manifiesto:
+Leer `database_path` y `backup_path` del manifiesto `pos-schema-v13-migration-completed-<attempt-id>.json` o, si la migracion quedo pendiente, de `pos-schema-v13-migration-pending.json`. Cerrar Linea POS por completo. Ejecutar el comando con el candidato 0.3.0 que realizo la migracion; el comando real depende del artefacto instalado. Sustituir las rutas por los dos valores exactos del manifiesto:
 
 ```bash
 # AppImage descargado
-./Linea.POS_0.2.1_amd64.AppImage restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/pos-v12-before-v13-ID.db
+./Linea.POS_0.3.0_amd64.AppImage restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/backup-indicado-en-manifiesto.db
 
 # DEB o RPM instalado
-/usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/pos-v12-before-v13-ID.db
+/usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/backup-indicado-en-manifiesto.db
 ```
 
 ```powershell
 # NSIS instalado por usuario (Start-Process espera al ejecutable GUI y conserva ExitCode)
 # ArgumentList recibe una sola cadena con comillas dobles literales para las rutas con espacios.
-$restoreArgs = 'restore-migration-backup --database "C:\ruta con espacios\pos.db" --backup "C:\ruta con espacios\pos-v12-before-v13-ID.db"'
+$restoreArgs = 'restore-migration-backup --database "C:\ruta con espacios\pos.db" --backup "C:\ruta con espacios\backup-indicado-en-manifiesto.db"'
 $result = Start-Process -FilePath "$env:LOCALAPPDATA\Linea POS\pos_tauri.exe" -ArgumentList $restoreArgs -Wait -PassThru
 $result.ExitCode
 
@@ -159,27 +164,29 @@ $result.ExitCode
 
 El CLI adquiere `pos-application.lock` antes de resolver los archivos y el lock de migracion antes de validarlos. Rechaza symlinks/reparse points, exige que backup, manifiesto y `pos.db` pertenezcan al mismo directorio canonico, comprueba esquema, atestaciones, tamaño y SHA-256, y repite identidad/hash bajo lock inmediatamente antes del primer movimiento. Si Linea POS esta ejecutandose, un lock no puede adquirirse o su archivo es sustituido, falla con codigo 4 sin restaurar; los fallos de rutas, manifiestos o datos conservan su categoria propia. No borrar los locks manualmente: son locks del sistema operativo y sus archivos pueden permanecer normalmente en disco.
 
-El comando usa el mecanismo durable del backend: solo acepta el esquema canónico completo v8 o v12 declarado por ese manifiesto, crea el marcador de restauracion, pone en cuarentena la base y los sidecars de SQLite 13, promociona un temporal validado, persiste el manifiesto completado y cierra SQLite. Debe terminar con `Restauracion durable completada`; cualquier otro resultado se considera fallo. Códigos estables: `0` éxito, `2` sintaxis, `3` ruta/archivo, `4` lock o aplicación activa, `5` restauración rechazada/fallida y `6` cierre SQLite fallido. No reemplazar manualmente `pos.db`.
+El comando usa el mecanismo durable del backend: solo acepta el esquema canónico completo de origen declarado por ese manifiesto (8, 12, 13, 14 o 15), crea el marcador de restauracion, pone en cuarentena la base y los sidecars de SQLite 16, promociona un temporal validado, persiste el manifiesto completado y cierra SQLite. Debe terminar con `Restauracion durable completada`; cualquier otro resultado se considera fallo. Códigos estables: `0` éxito, `2` sintaxis, `3` ruta/archivo, `4` lock o aplicación activa, `5` restauración rechazada/fallida y `6` cierre SQLite fallido. No reemplazar manualmente `pos.db`.
 
-Despues, confirmar `PRAGMA user_version` igual al `source_version`, `quick_check=ok`, cero filas de `foreign_key_check` y la presencia de `pos-schema-v13-restore-completed-<restore-id>.json`. Abrir y reabrir el resultado con la version compatible con el esquema 8 o 12 restaurado. Comparar literalmente productos, stock, historia financiera de origen, ventas, detalles, movimientos y secuencias. Toda operacion creada despues de migrar a 13 se pierde al restaurar el backup.
+Despues, confirmar `PRAGMA user_version` igual al `source_version`, `quick_check=ok`, cero filas de `foreign_key_check` y la presencia de `pos-schema-v13-restore-completed-<restore-id>.json`. Abrir y reabrir el resultado con la version compatible con el esquema de origen restaurado. Comparar literalmente productos, stock, historia de origen, ventas, detalles, movimientos y secuencias. Toda operacion creada despues de migrar a 16, incluidas facturas y adjuntos, se pierde al restaurar el backup de origen.
 
-Este procedimiento corresponde a `v0.2.1`. Su implementacion local no acredita por si sola la prueba sobre una copia cerrada real, `mode=validate`, smoke de artefactos, rollback operativo, tag ni publicacion.
+Este procedimiento para el esquema 16 corresponde a `v0.3.0` y al candidato que realizo la migracion. Su implementacion local no acredita por si sola la prueba sobre una copia cerrada real, `mode=validate`, smoke de artefactos, rollback operativo, tag ni publicacion.
 
 ### Checklist
 
 No publicar hasta que migracion, reapertura, smoke y rollback pasen sobre los archivos del mismo run ID de `validate`. La evidencia debe registrar `SHA256SUMS`; el tag se crea despues de aprobar esos bytes y `publish` debe recibir ese run ID, no generar otro candidato.
 
 - [ ] `pnpm qa:migration-v8-v13` termina correctamente en CI y en el candidato.
+- [ ] `pnpm qa:migration-v16` termina correctamente; se comprueban bytes y hashes en backup v16.
 - [ ] `pnpm test:retired-costs` confirma que no reaparecen simbolos financieros retirados.
 - [ ] Copia externa cerrada y consistente de produccion creada; las pruebas del repositorio no completan este paso.
-- [ ] Fuente 8 o 12 integra, preflight aprobado y snapshot privado registrado.
+- [ ] Fuente 8, 12, 13, 14 o 15 integra, preflight aprobado y snapshot privado registrado.
 - [ ] Commit, validate run ID, plataforma, instalador y `SHA256SUMS` registrados.
-- [ ] Esquema 13 integro, reapertura idempotente y manifiesto apuntando al backup exacto.
+- [ ] Esquema 16 integro, sin facturas ficticias, reapertura idempotente y manifiesto apuntando al backup exacto.
 - [ ] Campos y filas financieros antiguos eliminados intencionalmente; stock, campos comerciales, IDs, relaciones y secuencias retenidos literalmente.
 - [ ] Compras historicas v1/v2 no reciben precio ni importe de compra v3.
-- [ ] Smoke de productos, compras, conteos, checkout, ventas y correccion local completado con centimetros.
+- [ ] Smoke de productos, compras, conteos, checkout, ventas, archivo/restauracion, lista/tarjetas y apertura/movimientos/cierre de caja completado.
+- [ ] Smoke documental de importacion, revisión, consulta y archivos completado por plataforma, sin cambios en stock o caja.
 - [ ] Rechazo o fallo controlado revierte sin escrituras parciales.
-- [ ] Restauracion durable devuelve el esquema 8 o 12 y la version compatible lo abre.
+- [ ] Restauracion durable devuelve el esquema de origen y la version compatible lo abre.
 - [ ] `maintenance-info` y el rollback se ejecutan desde el AppImage o instalación DEB/RPM/NSIS/MSI del candidato, sin checkout ni toolchain.
 - [ ] No hay bases, backups, datos financieros, rutas sensibles, datos personales, tokens ni secretos en evidencia compartida.
 - [ ] Tag y `publish` cuentan con aprobacion explicita.

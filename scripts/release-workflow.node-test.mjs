@@ -13,6 +13,7 @@ const release = await readFile(new URL("../.github/workflows/release.yml", impor
 const releaseRequest = await readFile(new URL("../.github/workflows/release-request.yml", import.meta.url), "utf8");
 const ci = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const execFileAsync = promisify(execFile);
+const { version } = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
 const expectedPins = new Map([
   ["actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"],
@@ -275,7 +276,8 @@ test("proves maintenance mode is present in every installer payload", () => {
     assert.match(windowsJob, /\$stdoutPath = "\$capture\.stdout"\n\s+\$stderrPath = "\$capture\.stderr"/);
     assert.match(windowsJob, /\$stdout = \[System\.IO\.File\]::ReadAllText\(\$stdoutPath\)/);
     assert.match(windowsJob, /\$stderr = \[System\.IO\.File\]::ReadAllText\(\$stderrPath\)/);
-    assert.match(windowsJob, /\$maintenance\.ExitCode -ne 0 -or \$stdout -cne "Linea POS 0\.2\.1: mantenimiento local disponible`n" -or \$stderr\.Length -ne 0/);
+    assert.match(windowsJob, /\$version = \(\[System\.IO\.File\]::ReadAllText\("\$PWD\/package\.json"\) \| ConvertFrom-Json\)\.version/);
+    assert.match(windowsJob, /\$maintenance\.ExitCode -ne 0 -or \$stdout -cne "Linea POS \$\{version\}: mantenimiento local disponible`n" -or \$stderr\.Length -ne 0/);
     assert.match(windowsJob, /throw "[^"]*exit=\$\(\$maintenance\.ExitCode\)[^\n]*stdout=\[\$stdout\] stderr=\[\$stderr\]/);
     assert.doesNotMatch(windowsJob, /\.Trim\(|Get-Content/);
   }
@@ -287,7 +289,7 @@ test("proves maintenance mode is present in every installer payload", () => {
 });
 
 const maintenanceVerifier = fileURLToPath(new URL("./verify-linux-maintenance-bundles.sh", import.meta.url));
-const maintenanceOutput = "Linea POS 0.2.1: mantenimiento local disponible\n";
+const maintenanceOutput = `Linea POS ${version}: mantenimiento local disponible\n`;
 
 async function maintenanceFixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "pos maintenance bundles "));
@@ -300,7 +302,7 @@ async function maintenanceFixture(t) {
   for (const format of ["appimage", "deb", "rpm"]) {
     await mkdir(path.join(root, format, "usr", "bin"), { recursive: true });
     await executable(path.join(root, format, "usr", "bin", "pos_tauri"), `[[ $# == 1 && $1 == maintenance-info ]]
-printf '%s\\n' 'Linea POS 0.2.1: mantenimiento local disponible'`);
+printf '%s' '${maintenanceOutput}'`);
   }
   await executable(path.join(root, "appimage", "AppRun"), `printf 'AppRun\\n' >> "$FIXTURE_ROOT/launches"
 printf '%s' "\${LAUNCHER_PREFIX-}"
@@ -408,6 +410,8 @@ test("real bsdtar extracts RPM, preserves payload checks, and rejects damaged ar
     ["symlink", rpmFixture(Buffer.from("/bin/true"), 0o120777), "payload"],
     ["extra stdout", rpmFixture(Buffer.concat([binary, Buffer.from("printf extra\\n\n")])), "payload"],
     ["missing newline", rpmFixture(Buffer.from(binary.toString().replace(maintenanceOutput, maintenanceOutput.trimEnd()))), "payload"],
+    ["old version", rpmFixture(Buffer.from(binary.toString().replace(maintenanceOutput, "Linea POS 0.2.1: mantenimiento local disponible\n"))), "payload"],
+    ["other version", rpmFixture(Buffer.from(binary.toString().replace(maintenanceOutput, "Linea POS 99.88.77: mantenimiento local disponible\n"))), "payload"],
     ["nonzero", rpmFixture(Buffer.concat([binary, Buffer.from("exit 42\n")])), "payload"],
   ]) {
     await t.test(name, async () => {
@@ -467,6 +471,8 @@ test("Windows GUI payload capture waits and rejects inexact output, stderr, and 
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = path.join(root, "fixture.cs");
   const exe = path.join(root, "pos_tauri.exe");
+  const manifest = path.join(root, "package.json");
+  await writeFile(manifest, JSON.stringify({ version }));
   await writeFile(source, `using System;
 using System.IO;
 using System.Text;
@@ -476,7 +482,9 @@ class Fixture {
     if (args.Length != 1 || args[0] != "maintenance-info") return 99;
     Thread.Sleep(300);
     string defect = Environment.GetEnvironmentVariable("CAPTURE_DEFECT");
-    string output = "Linea POS 0.2.1: mantenimiento local disponible\\n";
+    string output = "Linea POS ${version}: mantenimiento local disponible\\n";
+    if (defect == "old-version") output = "Linea POS 0.2.1: mantenimiento local disponible\\n";
+    if (defect == "other-version") output = "Linea POS 99.88.77: mantenimiento local disponible\\n";
     if (defect == "extra") output += "\\n";
     if (defect == "missing-newline") output = output.TrimEnd('\\n');
     if (defect == "case") output = output.ToUpperInvariant();
@@ -492,17 +500,22 @@ class Fixture {
   await execFileAsync(compiler, ["/nologo", "/target:winexe", `/out:${exe}`, source]);
   for (const format of ["NSIS", "MSI"]) {
     const block = stepRunBlock(release, `Prove maintenance mode is in the ${format} payload`);
-    const capture = block.slice(block.indexOf("$capture ="));
+    const capture = block.slice(block.indexOf("$version ="));
     const script = path.join(root, `${format}.ps1`);
     await writeFile(script, `$ErrorActionPreference = "Stop"\n$executables = @(Get-Item -LiteralPath $env:GUI_FIXTURE)\n${capture}`);
     const run = (defect = "") => execFileAsync("pwsh", ["-NoProfile", "-File", script], {
+      cwd: root,
       env: { ...process.env, RUNNER_TEMP: root, GUI_FIXTURE: exe, CAPTURE_DEFECT: defect },
     });
     await run();
     await run(); // Repeated invocations must use independent capture files.
-    for (const defect of ["extra", "missing-newline", "case", "stderr", "exit"]) {
+    for (const defect of ["old-version", "other-version", "extra", "missing-newline", "case", "stderr", "exit"]) {
       await assert.rejects(run(defect), /payload maintenance-info failed/);
     }
+    await writeFile(manifest, JSON.stringify({ version: "99.88.77" }));
+    await assert.rejects(run(), /payload maintenance-info failed/);
+    await run("other-version");
+    await writeFile(manifest, JSON.stringify({ version }));
   }
 });
 
@@ -518,6 +531,26 @@ test("Linux maintenance verifier requires exact AppImage stdout", async (t) => {
   const f = await maintenanceFixture(t);
   for (const env of [{ LAUNCHER_PREFIX: "unexpected\n" }, { LAUNCHER_SUFFIX: "\n" }]) {
     await assert.rejects(f.run(env));
+  }
+});
+
+test("Linux maintenance verifier rejects old and other valid versions in every payload", async (t) => {
+  for (const format of ["appimage", "deb", "rpm"]) {
+    for (const wrongVersion of ["0.2.1", "99.88.77"]) {
+      await t.test(`${format}: ${wrongVersion}`, async (t) => {
+        assert.notEqual(wrongVersion, version);
+        const f = await maintenanceFixture(t);
+        const binary = path.join(f.root, format, "usr", "bin", "pos_tauri");
+        await writeFile(binary, (await readFile(binary, "utf8")).replace(
+          maintenanceOutput, `Linea POS ${wrongVersion}: mantenimiento local disponible\n`,
+        ));
+        await assert.rejects(f.run({ LC_ALL: "C" }), (error) => {
+          assert.match(error.stderr, new RegExp(`stage=${format}\\.(launcher|payload) exit=`));
+          assert.match(error.stderr, /maintenance stdout bytes/);
+          return true;
+        });
+      });
+    }
   }
 });
 

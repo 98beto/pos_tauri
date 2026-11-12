@@ -1,14 +1,15 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { createBrand, listBrands, updateBrand } from "../../api/brands";
 import { createCategory, listCategories, updateCategory } from "../../api/categories";
-import { createProductWithPresentations, getProductsView, updateProductWithPresentations } from "../../api/products";
-import { Button, EmptyState, Field, Modal, Spinner, StatCard } from "../../components/ui";
+import { archiveProduct, createProductWithPresentations, getProductsView, restoreProduct, updateProductWithPresentations } from "../../api/products";
+import { Button, EmptyState, Field, Modal, Spinner, StatCard, ViewToggle } from "../../components/ui";
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
 import { centsToDecimal, formatBaseQuantity, presentationPriceLabel } from "../../lib/format";
 import type { Brand } from "../../types/brand";
 import type { Category } from "../../types/category";
-import type { BaseUnit, ProductView, ProductViewRow } from "../../types/product";
+import type { BaseUnit, ProductView, ProductViewFilters, ProductViewRow } from "../../types/product";
 import type { PresentationMode } from "../../types/product_presentation";
+import { useViewPreference } from "../../hooks/useViewPreference";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
 type ProductsViewProps = {
@@ -120,25 +121,33 @@ function SelectField({ label, value, onChange, children, required = false, disab
 }
 
 export function ProductsView({ sessionId, onNotice, onSessionRequired }: ProductsViewProps) {
+  const [layout, setLayout] = useViewPreference("pos.view.products", "list");
   const [view, setView] = useState<ProductView>();
   const [brands, setBrands] = useState<Brand[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [search, setSearch] = useState("");
   const [brandFilter, setBrandFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<NonNullable<ProductViewFilters["status"]>>("active");
   const [loading, setLoading] = useState(true);
   const [tableLoading, setTableLoading] = useState(true);
   const [catalogError, setCatalogError] = useState("");
   const [viewError, setViewError] = useState("");
   const [productOpen, setProductOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<ProductViewRow>();
+  const editingProductRef = useRef(editingProduct);
+  editingProductRef.current = editingProduct;
   const [draft, setDraft] = useState<ProductDraft>(emptyDraft);
   const [savingProduct, setSavingProduct] = useState(false);
   const [productError, setProductError] = useState("");
   const [pendingBaseUnit, setPendingBaseUnit] = useState<BaseUnit>();
   const [catalogOpen, setCatalogOpen] = useState(false);
+  const [productOperationIds, setProductOperationIds] = useState<Set<number>>(() => new Set());
   const catalogRequest = useRef(0);
   const viewRequest = useRef(0);
+  const productOperations = useRef(new Set<number>());
+  const filtersRef = useRef({ search, brandFilter, categoryFilter, statusFilter });
+  filtersRef.current = { search, brandFilter, categoryFilter, statusFilter };
   const productSaveInFlight = useRef(false);
   const productSaveGeneration = useRef(0);
   const presentationKey = useRef(1);
@@ -193,9 +202,10 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     setTableLoading(true);
     try {
       const nextView = await getProductsView({
-        search: search || undefined,
-        brand_id: brandFilter ? Number(brandFilter) : undefined,
-        category_id: categoryFilter ? Number(categoryFilter) : undefined,
+        search: filtersRef.current.search || undefined,
+        brand_id: filtersRef.current.brandFilter ? Number(filtersRef.current.brandFilter) : undefined,
+        category_id: filtersRef.current.categoryFilter ? Number(filtersRef.current.categoryFilter) : undefined,
+        status: filtersRef.current.statusFilter,
       });
       if (!isCurrent(ownerSession, generation) || viewRequest.current !== request) return "stale";
       setView(nextView);
@@ -220,6 +230,7 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       viewRequest.current += 1;
       productSaveGeneration.current += 1;
       productSaveInFlight.current = false;
+      productOperations.current.clear();
     };
   }, []);
 
@@ -229,6 +240,8 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     viewRequest.current += 1;
     productSaveGeneration.current += 1;
     productSaveInFlight.current = false;
+    productOperations.current.clear();
+    setProductOperationIds(new Set());
     setSavingProduct(false);
     setProductOpen(false);
     setPendingBaseUnit(undefined);
@@ -243,7 +256,7 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       window.clearTimeout(timeout);
       viewRequest.current += 1;
     };
-  }, [sessionId, search, brandFilter, categoryFilter]);
+  }, [sessionId, search, brandFilter, categoryFilter, statusFilter]);
 
   useEffect(() => {
     const target = pendingPresentationFocus.current;
@@ -268,6 +281,7 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
   }
 
   function openEdit(product: ProductViewRow) {
+    if (!product.is_active || productOperations.current.has(product.id)) return;
     setEditingProduct(product);
     setPendingBaseUnit(undefined);
     setDraft({
@@ -396,6 +410,52 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     }
   }
 
+  async function changeProductStatus(product: ProductViewRow, action: "archive" | "restore") {
+    if (productOperations.current.has(product.id)) return;
+    if (action === "archive") {
+      const stockNotice = product.stock_base > 0
+        ? `\n\nExistencia actual: ${formatBaseQuantity(product.stock_base, product.base_unit)}. El stock no se ajustará.`
+        : "";
+      if (!window.confirm(`¿Eliminar ${product.name}?${stockNotice}\n\nSe conservarán ventas, movimientos, stock, códigos y presentaciones. Los SKU y códigos de barras seguirán reservados.`)) return;
+    }
+
+    productOperations.current.add(product.id);
+    setProductOperationIds(new Set(productOperations.current));
+    const ownerSession = sessionId;
+    const generation = lifetime.current;
+    const successMessage = action === "archive" ? "Producto eliminado; historial y existencias conservados." : "Producto restaurado.";
+    try {
+      const updated = action === "archive" ? await archiveProduct(product.id) : await restoreProduct(product.id);
+      if (!isCurrent(ownerSession, generation)) return;
+      const status = filtersRef.current.statusFilter;
+      setView((current) => current && {
+        ...current,
+        items: current.items.flatMap((item) => {
+          if (item.id !== updated.id) return [item];
+          if ((status === "active" && !updated.is_active) || (status === "archived" && updated.is_active)) return [];
+          return [{ ...item, ...updated }];
+        }),
+      });
+      if (!updated.is_active && editingProductRef.current?.id === updated.id) {
+        setProductOpen(false);
+        setEditingProduct(undefined);
+        setPendingBaseUnit(undefined);
+      }
+      onNotice({ tone: "success", message: successMessage });
+      if (await loadView() === "error" && isCurrent(ownerSession, generation)) {
+        onNotice({ tone: "info", message: `${successMessage} No se pudo recargar la lista; usa Reintentar carga.` });
+      }
+    } catch (value: unknown) {
+      if (!isCurrent(ownerSession, generation)) return;
+      fail(value, action === "archive" ? "No se pudo eliminar el producto." : "No se pudo restaurar el producto.");
+    } finally {
+      if (isCurrent(ownerSession, generation)) {
+        productOperations.current.delete(product.id);
+        setProductOperationIds(new Set(productOperations.current));
+      }
+    }
+  }
+
   async function catalogsChanged(message: string) {
     const ownerSession = sessionId;
     const generation = lifetime.current;
@@ -436,34 +496,35 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
         <StatCard label="Existencia por longitud" value={statsUnavailable ? "-" : formatBaseQuantity(view.stats.centimeter_stock, "centimeter")} detail={statsDetail} />
       </div>
 
-      <section className="mt-5 rounded-card border border-line bg-surface">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line p-4 sm:p-5">
+       <section className="mt-5 rounded-card border border-line bg-surface">
+         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line p-4 sm:p-5">
            <div><h2 id="products-table-title" className="font-heading text-xl font-bold">Catalogo de productos</h2><p className="mt-1 text-xs text-muted">Existencias y presentaciones disponibles para venta.</p></div>
-          <div className="flex flex-wrap gap-2"><Button onClick={() => setCatalogOpen(true)}>Marcas y categorias</Button><Button variant="primary" onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button></div>
+           <div className="flex flex-wrap items-center gap-2"><ViewToggle label="productos" value={layout} onChange={setLayout} /><Button onClick={() => setCatalogOpen(true)}>Marcas y categorias</Button><Button variant="primary" onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button></div>
         </div>
         <div className="grid gap-3 border-b border-line bg-surface-soft/60 p-4 sm:grid-cols-3 sm:p-5">
-          <Field label="Buscar" value={search} onChange={(event) => updateViewFilter(setSearch, event.target.value)} placeholder="Nombre o SKU" />
-          <SelectField label="Marca" value={brandFilter} onChange={(value) => updateViewFilter(setBrandFilter, value)}><option value="">Todas las marcas</option>{brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</SelectField>
+           <Field label="Buscar" value={search} onChange={(event) => updateViewFilter(setSearch, event.target.value)} placeholder="Nombre o SKU" />
+           <SelectField label="Estado" value={statusFilter} onChange={(value) => updateViewFilter((next) => setStatusFilter(next as NonNullable<ProductViewFilters["status"]>), value)}><option value="active">Activos</option><option value="archived">Eliminados</option><option value="all">Todos</option></SelectField>
+           <SelectField label="Marca" value={brandFilter} onChange={(value) => updateViewFilter(setBrandFilter, value)}><option value="">Todas las marcas</option>{brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</SelectField>
           <SelectField label="Categoria" value={categoryFilter} onChange={(value) => updateViewFilter(setCategoryFilter, value)}><option value="">Todas las categorias</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</SelectField>
         </div>
         {(catalogError || viewError) && <div className="m-4 flex flex-wrap items-center justify-between gap-3 rounded-control border border-danger/25 bg-danger-soft px-4 py-3 text-sm text-danger" role="alert"><span>{[catalogError, viewError].filter(Boolean).join(" ")}</span><Button size="sm" onClick={refreshAll} disabled={loading || tableLoading}>Reintentar carga</Button></div>}
         {viewError && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Se muestran los resultados anteriores; no corresponden a los filtros actuales.</p>}
         {tableLoading && view && <p className="mx-4 mb-3 text-xs font-semibold text-muted">Actualizando; se muestran temporalmente los resultados anteriores.</p>}
-        <div className="relative overflow-x-auto focus:outline-none focus:ring-3 focus:ring-brand/20" role="region" aria-busy={tableLoading} aria-label="Tabla de productos; desplaza horizontalmente para ver todas las columnas" tabIndex={0}>
-          {tableLoading && <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}
-          {!view && tableLoading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.items.length ? (
-            <table aria-labelledby="products-table-title" className="w-full min-w-[820px] text-left text-sm">
+         <div className="relative" aria-busy={tableLoading}>
+           {tableLoading && <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-brand-soft"><div className="h-full w-1/2 bg-brand" /></div>}
+           {!view && tableLoading ? <div className="grid min-h-64 place-items-center"><Spinner className="size-6 text-brand" /></div> : view?.items.length && layout === "list" ? <div className="overflow-x-auto focus:outline-none focus:ring-3 focus:ring-brand/20" role="region" aria-label="Tabla de productos; desplaza horizontalmente para ver todas las columnas" tabIndex={0}>
+             <table aria-labelledby="products-table-title" className="w-full min-w-[820px] text-left text-sm">
               <caption className="sr-only">Listado de productos del catalogo</caption>
               <thead><tr className="text-[0.625rem] tracking-wider text-muted uppercase"><th className="border-b border-line px-5 py-3">Producto</th><th className="border-b border-line px-5 py-3">Predeterminada</th><th className="border-b border-line px-5 py-3 text-right">Stock</th><th className="border-b border-line px-5 py-3 text-right">Activas</th><th className="border-b border-line px-5 py-3"><span className="sr-only">Acciones</span></th></tr></thead>
               <tbody>{view.items.map((product) => <tr key={product.id} className="hover:bg-surface-soft/60">
-                <td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</span></td>
+                 <td className="border-b border-line px-5 py-4"><strong className="block">{product.name}</strong><span className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</span><StatusBadge isActive={product.is_active} /></td>
                 <td className="border-b border-line px-5 py-4"><span className="block font-semibold">{product.default_presentation.name}</span><span className="text-xs text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${product.stock_base === 0 ? "bg-danger-soft text-danger" : "bg-brand-soft text-brand"}`}>{formatBaseQuantity(product.stock_base, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</td>
-                <td className="border-b border-line px-5 py-4 text-right"><Button size="sm" variant="ghost" aria-label={`Editar producto ${product.name}`} onClick={() => openEdit(product)}>Editar</Button></td>
+                 <td className="border-b border-line px-5 py-4 text-right"><ProductActions product={product} busy={productOperationIds.has(product.id)} onEdit={openEdit} onArchive={(item) => void changeProductStatus(item, "archive")} onRestore={(item) => void changeProductStatus(item, "restore")} /></td>
               </tr>)}</tbody>
-            </table>
-          ) : !tableLoading && !viewError && <EmptyState title="No hay productos para mostrar" description="Cambia los filtros o crea el primer producto." action={<Button onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button>} />}
+             </table>
+            </div> : view?.items.length && layout === "cards" ? <div className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">{view.items.map((product) => <article key={product.id} className="grid content-start gap-3 rounded-control border border-line p-4"><div><h3 className="font-bold">{product.name}</h3><p className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</p><StatusBadge isActive={product.is_active} /></div><div><span className="block text-xs text-muted">Presentación predeterminada</span><strong>{product.default_presentation.name}</strong><span className="block text-sm text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></div><dl className="grid grid-cols-2 gap-3 text-sm"><div><dt className="text-xs text-muted">Stock</dt><dd className="font-semibold">{formatBaseQuantity(product.stock_base, product.base_unit)}</dd></div><div><dt className="text-xs text-muted">Presentaciones activas</dt><dd className="font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</dd></div></dl><ProductActions product={product} busy={productOperationIds.has(product.id)} onEdit={openEdit} onArchive={(item) => void changeProductStatus(item, "archive")} onRestore={(item) => void changeProductStatus(item, "restore")} /></article>)}</div> : !tableLoading && !viewError && !view?.items.length && <EmptyState title="No hay productos para mostrar" description="Cambia los filtros o crea el primer producto." action={<Button onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button>} />}
         </div>
       </section>
 
@@ -525,6 +586,14 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       <CatalogModal open={catalogOpen} sessionId={sessionId} brands={brands} categories={categories} onClose={() => setCatalogOpen(false)} onSessionRequired={onSessionRequired} onChanged={catalogsChanged} />
     </main>
   );
+}
+
+function StatusBadge({ isActive }: { isActive: boolean }) {
+  return <span className={`ml-2 inline-flex rounded-full px-2 py-0.5 text-[0.625rem] font-extrabold tracking-wide uppercase ${isActive ? "bg-brand-soft text-brand" : "bg-surface-soft text-muted"}`}>{isActive ? "Activo" : "Eliminado"}</span>;
+}
+
+function ProductActions({ product, busy, onEdit, onArchive, onRestore }: { product: ProductViewRow; busy: boolean; onEdit: (product: ProductViewRow) => void; onArchive: (product: ProductViewRow) => void; onRestore: (product: ProductViewRow) => void }) {
+  return <div className="flex flex-wrap justify-end gap-1">{product.is_active ? <><Button size="sm" variant="ghost" aria-label={`Editar producto ${product.name}`} disabled={busy} onClick={() => onEdit(product)}>Editar</Button><Button size="sm" variant="ghost" aria-label={`Eliminar producto ${product.name}`} disabled={busy} loading={busy} onClick={() => onArchive(product)}>Eliminar</Button></> : <Button size="sm" variant="ghost" aria-label={`Restaurar producto ${product.name}`} disabled={busy} loading={busy} onClick={() => onRestore(product)}>Restaurar</Button>}</div>;
 }
 
 function CatalogModal({ open, sessionId, brands, categories, onClose, onChanged, onSessionRequired }: { open: boolean; sessionId: number; brands: Brand[]; categories: Category[]; onClose: () => void; onChanged: (message: string) => Promise<void>; onSessionRequired: () => void }) {

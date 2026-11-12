@@ -1,0 +1,5 @@
+<Comprobante xmlns="http://www.sat.gob.mx/cfd/4" Version="4.0" TipoDeComprobante="I" Fecha="2026-11-06T00:00:00" Moneda="MXN" SubTotal="0" Total="0">
+<Emisor Rfc="AAA010101AAA" Nombre="Emisor sintético"/><Receptor Rfc="XAXX010101000" Nombre="Receptor sintético"/>
+<Conceptos><Concepto ClaveProdServ="01010101" ClaveUnidad="H87" Descripcion="Muestra" Cantidad="1" ValorUnitario="0" Importe="0"/></Conceptos>
+<Complemento><TimbreFiscalDigital xmlns="http://www.sat.gob.mx/TimbreFiscalDigital" UUID="01234567-89AB-CDEF-0123-456789ABCDEF"/></Complemento>
+</Comprobante>

@@ -45,7 +45,14 @@ pub fn run() {
     #[cfg(all(not(debug_assertions), not(test)))]
     install_release_panic_hook();
 
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
+        .manage(commands::purchase_invoices::PdfCopies::default());
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_process::init());
 
@@ -61,6 +68,7 @@ pub fn run() {
 
             let application_lock =
                 db::acquire_application_lock(app).map_err(Box::<dyn std::error::Error>::from)?;
+            services::purchase_invoice_files::clean_pdf_cache(&app.path().app_cache_dir()?)?;
             let connection = db::open_database(app).map_err(|error| {
                 if let Some(message) = error.recovery_startup_message() {
                     *setup_recovery_message.lock().unwrap() = Some(message);
@@ -77,6 +85,23 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::purchase_invoices::pick_invoice_xml,
+            commands::purchase_invoices::pick_invoice_preview_pdf,
+            commands::purchase_invoices::discard_invoice_preview,
+            commands::purchase_invoices::register_invoice,
+            commands::purchase_invoices::get_purchase_invoices_view,
+            commands::purchase_invoices::search_invoice_suppliers,
+            commands::purchase_invoices::get_purchase_invoice_detail,
+            commands::purchase_invoices::attach_invoice_pdf,
+            commands::purchase_invoices::export_invoice_attachment,
+            commands::purchase_invoices::open_invoice_pdf,
+            commands::cash::get_cash_state,
+            commands::cash::list_cash_sessions,
+            commands::cash::get_cash_session_detail,
+            commands::cash::open_cash_session,
+            commands::cash::cash_income,
+            commands::cash::cash_withdraw,
+            commands::cash::close_cash_session,
             commands::auth::owner_exists,
             commands::auth::initialize_owner,
             commands::auth::login,
@@ -104,6 +129,9 @@ pub fn run() {
             commands::categories::create_category,
             commands::categories::update_category,
             commands::products::list_products,
+            commands::products::get_product,
+            commands::products::archive_product,
+            commands::products::restore_product,
             commands::products::get_products_view,
             commands::products::list_product_selector,
             commands::products::find_product_by_sku,

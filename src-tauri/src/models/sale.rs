@@ -5,6 +5,7 @@ use super::sale_detail::SaleDetail;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Sale {
+    pub cash_session_id: i64,
     pub id: i64,
     pub user_id: i64,
     pub cashier_name: String,
@@ -33,12 +34,14 @@ pub struct SaleReceipt {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SalesViewFilters {
+    pub cash_session_id: Option<i64>,
     pub search: Option<String>,
     pub payment_method: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SalesViewRow {
+    pub cash_session_id: i64,
     pub id: i64,
     pub ticket_number: String,
     pub sale_date: String,
@@ -84,6 +87,7 @@ pub struct SaleHistoryLine {
 
 #[derive(Debug, Serialize)]
 pub struct SaleHistoryDetail {
+    pub cash_session_id: i64,
     pub id: i64,
     pub ticket_number: String,
     pub payment_method: String,

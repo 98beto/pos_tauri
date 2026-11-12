@@ -38,8 +38,11 @@ fn maintenance_mode_is_exposed_by_the_packaged_application_binary() {
     assert!(output.status.success());
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim_end(),
-        "Linea POS 0.2.1: mantenimiento local disponible"
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "Linea POS {}: mantenimiento local disponible\n",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     assert!(output.stderr.is_empty());
 }

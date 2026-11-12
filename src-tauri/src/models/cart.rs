@@ -62,6 +62,7 @@ pub struct CashChangeQuote {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutCartInput {
+    pub expected_cash_session_id: Option<i64>,
     pub checkout_token: String,
     pub cart_fingerprint: String,
     pub payment_method: String,

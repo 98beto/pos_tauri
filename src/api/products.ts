@@ -26,6 +26,18 @@ export function listProducts(): Promise<Product[]> {
   return invoke<Product[]>("list_products");
 }
 
+export function getProduct(id: number): Promise<Product> {
+  return invoke<Product>("get_product", { id });
+}
+
+export function archiveProduct(id: number): Promise<Product> {
+  return invoke<Product>("archive_product", { id });
+}
+
+export function restoreProduct(id: number): Promise<Product> {
+  return invoke<Product>("restore_product", { id });
+}
+
 export function findProductBySku(sku: string): Promise<Product | null> {
   return invoke<Product | null>("find_product_by_sku", { sku });
 }

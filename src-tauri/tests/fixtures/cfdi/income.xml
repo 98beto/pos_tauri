@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<c:Comprobante xmlns:c="http://www.sat.gob.mx/cfd/4" xmlns:t="http://www.sat.gob.mx/TimbreFiscalDigital" Version="4.0" TipoDeComprobante="I" Serie="Á" Folio="0007" Fecha="2024-02-29T23:59:59" Moneda="USD" TipoCambio="17.000001" SubTotal="0010.123456" Descuento="0.00" Total="11.743209">
+  <c:Emisor Rfc="aaa010101aaa" Nombre="Café y Té S.A."/>
+  <c:Receptor Rfc="XAXX010101000" Nombre="Público general"/>
+  <c:Conceptos>
+    <c:Concepto NoIdentificacion="000ABC" ClaveProdServ="50101700" ClaveUnidad="KGM" Unidad="Kilógramo" Descripcion="Café de origen &amp; té" Cantidad="0.000001" ValorUnitario="10.123456" Importe="10.123456" Descuento="0">
+      <c:Impuestos><c:Traslados><c:Traslado Base="10.123456" Impuesto="002" TipoFactor="Tasa" TasaOCuota="0.160000" Importe="1.619753"/></c:Traslados><c:Retenciones><c:Retencion Base="10" Impuesto="001" TipoFactor="Tasa" TasaOCuota="0.010000" Importe="0.1"/></c:Retenciones></c:Impuestos>
+    </c:Concepto>
+    <c:Concepto ClaveProdServ="01010101" ClaveUnidad="H87" Descripcion="Exento" Cantidad="2.000" ValorUnitario="0" Importe="0"><c:Impuestos><c:Traslados><c:Traslado Base="0" Impuesto="002" TipoFactor="Exento"/></c:Traslados></c:Impuestos></c:Concepto>
+  </c:Conceptos>
+  <c:Impuestos TotalImpuestosTrasladados="1.619753" TotalImpuestosRetenidos="0.1"><c:Traslados><c:Traslado Base="10.123456" Impuesto="002" TipoFactor="Tasa" TasaOCuota="0.160000" Importe="1.619753"/></c:Traslados><c:Retenciones><c:Retencion Impuesto="001" Importe="0.1"/></c:Retenciones></c:Impuestos>
+  <c:Complemento><t:TimbreFiscalDigital UUID="01234567-89ab-cdef-0123-456789abcdef" FechaTimbrado="2024-03-01T00:00:01"/></c:Complemento>
+  <c:Addenda><custom xmlns="urn:synthetic">Información ignorada</custom></c:Addenda>
+</c:Comprobante>

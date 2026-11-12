@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>Línea continua</title>
+  <desc>Una sola L geométrica de trazo ancho y extremos redondeados sobre fondo claro.</desc>
+  <rect width="512" height="512" rx="112" fill="#F1F7FB"/>
+  <path d="M202 119V344C202 369 216 382 242 382H365" stroke="#123B61" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M260 382H365" stroke="#21BFB4" stroke-width="66" stroke-linecap="round"/>
+</svg>

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type ViewId = "pos" | "products" | "inventory" | "sales";
+export type ViewId = "pos" | "products" | "inventory" | "sales" | "cash" | "purchases";
 
 export type NavigationItem = {
   id: ViewId;
@@ -26,6 +26,7 @@ export const navigation: NavigationItem[] = [
     description: "Registra una nueva venta y administra el cobro.",
     icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M4 5.5h2l1.5 9h9.4l1.7-6H7M9.5 19h.01M16.5 19h.01" /></Icon>,
   },
+  { id: "cash", label: "Caja", title: "Caja", description: "Apertura, movimientos y cierre final de caja.", icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M7 10V4h10v6M5 10h14l1 5v5H4v-5l1-5Zm-1 5h16M8 7h4M9 18h6" /></Icon> },
   {
     id: "products",
     label: "Productos",
@@ -47,4 +48,5 @@ export const navigation: NavigationItem[] = [
     description: "Consulta tickets y el historial de operaciones.",
     icon: <Icon><path strokeLinecap="round" strokeLinejoin="round" d="M6 3h12v18l-3-2-3 2-3-2-3 2V3Zm3 5h6M9 12h6M9 16h3" /></Icon>,
   },
+  { id: "purchases", label: "Compras", title: "Compras", description: "Registra y consulta facturas documentales de proveedores.", icon: <Icon><path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3Zm3 5h6M9 12h6" /></Icon> },
 ];

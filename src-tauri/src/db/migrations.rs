@@ -27,6 +27,9 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     M::up(include_str!(
         "../../migrations/013_measured_presentations_centimeters.sql"
     )),
+    M::up(include_str!("../../migrations/014_archive_products.sql")),
+    M::up(include_str!("../../migrations/015_cash_sessions.sql")),
+    M::up(include_str!("../../migrations/016_purchase_invoices.sql")),
 ];
 const MIGRATIONS: Migrations<'_> = Migrations::from_slice(MIGRATIONS_SLICE);
 
@@ -44,6 +47,14 @@ pub(crate) fn run_to_v8(connection: &mut Connection) -> Result<(), rusqlite_migr
 
 pub(crate) fn run_to_v13(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
     MIGRATIONS.to_version(connection, 13)
+}
+
+pub(crate) fn run_to_v14(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
+    MIGRATIONS.to_version(connection, 14)
+}
+
+pub(crate) fn run_to_v15(connection: &mut Connection) -> Result<(), rusqlite_migration::Error> {
+    MIGRATIONS.to_version(connection, 15)
 }
 
 #[cfg(test)]
@@ -136,14 +147,66 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(version, 13);
+        assert_eq!(version, 16);
         assert_eq!(table_count, 8);
+    }
+
+    #[test]
+    fn migrated_legacy_checkout_recovers_without_expected_session_after_archive_and_new_open() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v8_fixture(&mut connection);
+        super::run(&mut connection).unwrap();
+        crate::services::products::set_active(&mut connection, 11, false).unwrap();
+        let retry = || crate::models::cart::CheckoutCartInput {
+            expected_cash_session_id: None,
+            checkout_token: "checkout-known".into(),
+            cart_fingerprint: "cart-v1|11:2".into(),
+            payment_method: "tarjeta".into(),
+            cash_received: None,
+        };
+        let first = crate::services::sales::checkout(
+            &mut connection,
+            1,
+            &crate::services::cart::SessionCart::default(),
+            retry(),
+        )
+        .unwrap();
+        assert_eq!(
+            (first.sale.id, first.sale.cash_session_id, first.sale.total),
+            (21, 1, 400)
+        );
+        assert_eq!(first.sale.sale_date, "2025-01-10 10:00:00");
+        crate::services::cash::open(
+            &mut connection,
+            1,
+            crate::models::cash::OpenCashInput {
+                operation_token: "new-open".into(),
+                opening_amount: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::services::sales::checkout(
+                &mut connection,
+                1,
+                &crate::services::cart::SessionCart::default(),
+                retry()
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM sales", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn v13_adds_centimeter_and_retires_financial_columns() {
         let mut connection = Connection::open_in_memory().unwrap();
-        super::run(&mut connection).unwrap();
+        super::run_to_v13(&mut connection).unwrap();
 
         connection.execute_batch(
             "INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
@@ -207,7 +270,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        super::run(&mut connection).unwrap();
+        super::run_to_v13(&mut connection).unwrap();
         connection.execute_batch(
             "INSERT INTO users(first_name,last_name,email,password_hash) VALUES('Ada','Lovelace','ada@pos.local','hash');
              INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
@@ -247,7 +310,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        super::run(&mut connection).unwrap();
+        super::run_to_v13(&mut connection).unwrap();
         connection.execute_batch(
             "INSERT INTO users(first_name,last_name,email,password_hash) VALUES('Ada','Lovelace','ada@pos.local','hash');
              INSERT INTO brands(name,name_search_key) VALUES('Marca','marca');
@@ -292,7 +355,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        super::run(&mut connection).unwrap();
+        super::run_to_v13(&mut connection).unwrap();
         connection.execute_batch(
             "INSERT INTO users(id,first_name,last_name,email,password_hash) VALUES(1,'Ada','Lovelace','ada@pos.local','hash');
              INSERT INTO brands(id,name,name_search_key) VALUES(1,'Marca','marca');
@@ -809,7 +872,9 @@ mod tests {
             )
             .unwrap();
 
-        super::run(&mut connection).unwrap();
+        // Exercise the historical rebuild's next ids before v15 makes legacy
+        // closed-session details immutable.
+        super::run_to_v13(&mut connection).unwrap();
 
         connection
             .execute(
@@ -934,7 +999,7 @@ mod tests {
     fn rejects_crossed_sale_line_relationships_and_accepts_legacy_details() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_v8_fixture(&mut connection);
-        super::run(&mut connection).unwrap();
+        super::run_to_v13(&mut connection).unwrap();
 
         let presentation_11: i64 = connection
             .query_row(
@@ -1062,6 +1127,7 @@ mod tests {
                 .unwrap(),
             0
         );
+        super::run(&mut connection).unwrap();
         let history = crate::services::sales::history_detail(&connection, 22).unwrap();
         assert_eq!(history.total, 777);
         assert_eq!(
@@ -1217,6 +1283,57 @@ mod tests {
     }
 
     #[test]
+    fn failure_in_migration_015_rolls_back_links_schema_and_historical_session() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v8_fixture(&mut connection);
+        super::run_to_v14(&mut connection).unwrap();
+        connection
+            .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::CreateTable {
+                    table_name: "cash_operations",
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }))
+            .unwrap();
+        assert!(super::run(&mut connection).is_err());
+        assert_eq!(version(&connection), 14);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'cash_%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('sales') WHERE name='cash_session_id'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT checkout_token,total,sale_date FROM sales WHERE id=21",
+                    [],
+                    |r| Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?
+                    ))
+                )
+                .unwrap(),
+            ("checkout-known".into(), 400, "2025-01-10 10:00:00".into())
+        );
+    }
+
+    #[test]
     fn failed_sale_detail_copy_rolls_back_migration_010_and_preserves_v8_data() {
         let mut connection = Connection::open_in_memory().unwrap();
         create_v8_fixture(&mut connection);
@@ -1276,7 +1393,7 @@ mod tests {
             connection
                 .pragma_update(None, "foreign_keys", true)
                 .unwrap();
-            assert_eq!(version(&connection), 13);
+            assert_eq!(version(&connection), 16);
             assert_eq!(
                 connection
                     .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1508,7 +1625,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(explicit_index_count, 31);
+        assert_eq!(explicit_index_count, 36);
 
         connection
             .execute_batch(
@@ -1616,7 +1733,7 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        super::run(&mut connection).unwrap();
+        super::run_to_v13(&mut connection).unwrap();
         connection
             .execute(
                 "INSERT INTO users (first_name, last_name, email, password_hash)
