@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getProductInventoryDetail } from "../../api/inventory";
-import { Button, EmptyState, Field, Spinner, StatCard } from "../../components/ui";
+import { Button, EmptyState, Field, MovementIndicator, movementAppearance, Spinner, StatCard } from "../../components/ui";
 import { errorMessage, isSessionRequired } from "../../lib/app-error";
 import { formatBaseQuantity, formatDateTime, formatEnteredQuantity, formatMoney } from "../../lib/format";
 import type { InventoryMovement, InventoryMovementReason, InventoryMovementType, ProductInventoryDetail as DetailData } from "../../types/inventory_movement";
@@ -37,9 +37,10 @@ function purchasePrice(movement: InventoryMovement) {
 
 function MovementDetail({ movement, onApplied, onSessionRequired }: { movement: InventoryMovement; onApplied: () => Promise<void>; onSessionRequired: () => void }) {
   const baseUnit = movement.base_unit;
-  return <article className="rounded-control border border-line p-4">
-    <div className="flex flex-wrap items-start justify-between gap-2"><div><strong>{movement.reason === "compra" ? "Compra" : movement.reason === "ajuste" ? "Ajuste de existencias" : "Venta"}</strong><span className="ml-2 text-xs font-semibold text-muted">{movement.type === "entrada" ? "Entrada" : "Salida"}</span></div><span className="text-xs text-muted">{formatDateTime(movement.created_at)}</span></div>
-    <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
+  const tone = movement.type === "entrada" ? "positive" : "negative";
+  return <article className={`rounded-control border border-line border-l-4 p-4 ${movementAppearance[tone].card}`}>
+    <div className="flex flex-wrap items-start justify-between gap-2"><div className="flex flex-wrap items-center gap-2"><strong>{movement.reason === "compra" ? "Compra" : movement.reason === "ajuste" ? "Ajuste de existencias" : "Venta"}</strong><MovementIndicator tone={tone}>{movement.type === "entrada" ? "Entrada" : "Salida"}</MovementIndicator></div><span className="text-xs text-ink/75">{formatDateTime(movement.created_at)}</span></div>
+    <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2 [&_dt]:text-ink/75">
       {movement.reason === "compra" && <><div><dt className="text-xs font-bold text-muted">Cantidad / presentacion</dt><dd>{movementQuantity(movement)} · {movement.presentation_name ?? "Unidad base"}</dd></div><div><dt className="text-xs font-bold text-muted">Precio y base</dt><dd>{purchasePrice(movement)}</dd></div><div><dt className="text-xs font-bold text-muted">Importe</dt><dd>{movement.purchase_total_cents === null ? "No disponible en historia" : formatMoney(movement.purchase_total_cents)}</dd></div><div><dt className="text-xs font-bold text-muted">Proveedor / factura</dt><dd>{movement.supplier ?? "Sin proveedor historico"} · {movement.document_reference ?? "Sin factura historica"}</dd></div>{movement.note && <div><dt className="text-xs font-bold text-muted">Nota</dt><dd>{movement.note}</dd></div>}</>}
       {movement.reason === "ajuste" && <><div><dt className="text-xs font-bold text-muted">Stock anterior</dt><dd>{movement.stock_before !== null && baseUnit ? formatBaseQuantity(movement.stock_before, baseUnit) : "-"}</dd></div><div><dt className="text-xs font-bold text-muted">Stock contado</dt><dd>{movement.stock_after !== null && baseUnit ? formatBaseQuantity(movement.stock_after, baseUnit) : "-"}</dd></div><div><dt className="text-xs font-bold text-muted">Diferencia</dt><dd>{movement.type === "entrada" ? "+" : "-"}{movement.base_quantity !== null && baseUnit ? formatBaseQuantity(movement.base_quantity, baseUnit) : movement.quantity}</dd></div><div><dt className="text-xs font-bold text-muted">Motivo</dt><dd>{movement.note ?? "Sin motivo historico"}</dd></div></>}
       {movement.reason === "venta" && <><div><dt className="text-xs font-bold text-muted">Cantidad retirada</dt><dd>{movementQuantity(movement)}</dd></div><div><dt className="text-xs font-bold text-muted">Ticket relacionado</dt><dd>{movement.ticket_reference ?? "Sin referencia"}</dd></div></>}
