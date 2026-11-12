@@ -1,17 +1,19 @@
 # Plan de ejecución de la siguiente release: v0.3.0
 
-**Estado:** preparado; la release no se ejecuta como parte de esta entrega.
+**Estado:** preparación local ejecutada y revisada; integración, candidato y
+publicación pendientes de los gates descritos al final de este documento.
 
-**Versión propuesta:** `0.3.0`, por las nuevas funciones de caja y facturas.
-Confirmar disponibilidad del tag al ejecutar el plan; no cambiar versiones hasta
-iniciar la preparación de esa release.
+**Versión preparada:** `0.3.0`, por las nuevas funciones de caja y facturas.
+El tag no existía en GitHub al iniciar esta ejecución; comprobar de nuevo antes
+de crearlo, después de aprobar el candidato.
 
 ## 1. Punto de partida
 
 - Última release publicada comprobada: **v0.2.1**.
 - Rama de desarrollo: `feat/catalog-cash-sessions`; se conserva `main` hasta que
   el usuario pruebe y apruebe integrar los cambios.
-- La aplicación sigue declarando `0.2.1` durante este trabajo; esquema objetivo 16.
+- La aplicación declaraba `0.2.1` al iniciar; la preparación la cambia a `0.3.0`,
+  sin modificar el esquema objetivo 16.
 - Alcance acumulado: icono, baja lógica, lista/tarjetas, apertura/movimientos/cierre
   de caja, historial de ventas en efectivo, facturas documentales, colores de
   movimientos, Manrope/Inter y mejoras de distribución de Inventario/Compras.
@@ -198,7 +200,7 @@ gh workflow run release.yml --ref main -f mode=publish -f tag=v0.3.0 -f candidat
 
 ## Checklist de ejecución
 
-- [ ] Usuario probó la rama y se aprobó su integración.
+- [x] Usuario probó la rama y autorizó commit, push y creación del PR a `main`.
 - [ ] Versión 0.3.0 y locks preparados, CI Linux/Windows verde.
 - [ ] Migración, reapertura, copia de datos y rollback verificados.
 - [ ] Diálogos/archivos/visor nativos y smoke funcional por plataforma completados.
@@ -206,3 +208,65 @@ gh workflow run release.yml --ref main -f mode=publish -f tag=v0.3.0 -f candidat
 - [ ] Tag publicado solamente después de aprobar esos bytes.
 - [ ] Publicación y `latest.json` comprobados, actualización y datos de QA intactos.
 - [ ] XML del usuario excluido de commits, bundles y artefactos compartidos.
+
+## Registro de ejecución — 12 de noviembre de 2026
+
+### Preparación y revisión local
+
+- Manifiestos sincronizados en `0.3.0`. Cargo regeneró el lock cambiando sólo la
+  versión raíz; el lock de pnpm y las dependencias permanecen iguales.
+- Notas: [`../release-notes-v0.3.0.md`](../release-notes-v0.3.0.md).
+- `maintenance-info` deriva la versión compilada. Los comprobadores Linux,
+  NSIS y MSI exigen exactamente la versión del manifiesto del candidato; las
+  regresiones rechazan mensajes de versiones antiguas o arbitrarias.
+- El runbook exige restaurar con el candidato que migró a 16, y abrir después
+  con la versión compatible con el esquema de origen. Su pin de integridad se
+  actualizó tras revisar ese cambio; no se relajó el guard.
+- Bloques y correcciones pasaron revisiones independientes. No se modificaron
+  las migraciones 001–016, la identidad ni las reglas de firma/publicación.
+
+### Gates locales acreditados
+
+Herramientas: Node `24.15.0`, pnpm `12.4.1`, Rust `1.98.1`.
+
+| Comprobación | Resultado |
+| --- | --- |
+| `pnpm install --frozen-lockfile` | Aprobado |
+| `pnpm validate:version v0.3.0` | Aprobado |
+| `pnpm test` | 384 frontend, 99 guard, 12 versión y 133 release aprobadas |
+| `pnpm build` | Aprobado; frontend en `dist/` |
+| `cargo fmt --manifest-path src-tauri/Cargo.toml --check` | Aprobado |
+| `cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | Aprobado |
+| `cargo test --locked --manifest-path src-tauri/Cargo.toml` | 216 biblioteca + 5 CLI aprobadas; 2 harnesses ignorados, ejecutados aparte |
+| `cargo test --locked --release --manifest-path src-tauri/Cargo.toml` | 217 biblioteca + 5 CLI aprobadas; 2 harnesses ignorados, ejecutados aparte |
+| `pnpm qa:migration-v16` | Aprobado, fuentes 8/12/13/14/15 a 16 |
+| `pnpm qa:migration-v8-v13` | Aprobado, alias con las mismas fuentes y destino 16 |
+| `git diff --check` | Aprobado |
+
+Los hashes de ambos locks no cambiaron durante las verificaciones. Las dos
+omisiones de release son el fixture GUI Windows/PowerShell y la integración
+Tauri/minisign opcional; no se acreditan como aprobadas. Cargo mostró un aviso
+de colisión de nombres de artefactos de biblioteca en release, sin fallar el build.
+
+Ambas QA verificaron backup, reapertura y restauración sintéticos, además de bytes
+y hashes de adjuntos en backup v16. Los informes temporales quedaron en
+`/tmp/pos-tauri-v8-v13-qa-lZJ2Hq` y `/tmp/pos-tauri-v8-v13-qa-gCgAPu`.
+
+El binario release arrancó durante 25 segundos con datos/configuración aislados en
+`/tmp/opencode/pos-tauri-smoke.czfkEN`; creó una base con `user_version=16`,
+`quick_check=ok` y sin violaciones FK. La terminación por timeout fue controlada.
+Esto acredita arranque local, no recorridos interactivos ni instaladores firmados.
+
+### Gates operativos pendientes
+
+La consulta de GitHub confirmó `v0.2.1` como última release estable y disponibilidad
+inicial del tag `v0.3.0`. También detectó requisitos del runbook sin configurar:
+`main` no tiene protección ni reglas aplicables, y `release-publication` no tiene
+reviewers ni restricción de rama. La inmutabilidad de releases está habilitada;
+existe una ruleset activa de tags y el environment `release` tiene reviewer y
+restricción a `main`. Corregir los requisitos pendientes antes de la publicación.
+
+Faltan CI Linux/Windows, revisión e integración del PR, candidato firmado desde
+`main`, copia cerrada de datos reales, QA nativa por plataforma, rollback del
+candidato y aprobación de esos bytes. Los XML locales no forman parte de los
+cambios preparados. No se ha creado un tag ni publicado una release.

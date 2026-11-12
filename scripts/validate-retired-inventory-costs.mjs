@@ -76,7 +76,7 @@ const PINNED_REFERENCE_FILES = new Map([
   ["README.md", "722e8474ab4e8d9d7d216559bef5bd6869c2990d8fbde5bfc94eb72a3b714ae9"],
   ["docs/plans/measured-presentations-inventory-cost-corrections.md", "43e86deb8a8ebde7561cf48a16ceffac8bf83343c627571407cfae6622d70bc6"],
   ["docs/quality-assurance.md", "a5fb0ad78fa88b4087183c96a9b7a264997a61bd719651f7a011bbfd6bb287ee"],
-  ["docs/releases.md", "9874efe49a82f0f383ce7ce9f0ceb158b1666c652198461996fbd44e6aeffef6"],
+  ["docs/releases.md", "af2d2a853c1d0ec77a34333d970af566ade65ca6d2bc4ef85c670525e1fe0323"],
   // The test suite contains intentional evasions and is itself an immutable reproduction corpus.
   ["scripts/validate-retired-inventory-costs.node-test.mjs", "76dc0d46f0cce85b25cd5dd00a0c60cbe3b43a53e4d183edeb48d5a05fc2fd94"],
   // Reviewed v14 archive / v15 cash / v16 document upgrades retain legacy probes,

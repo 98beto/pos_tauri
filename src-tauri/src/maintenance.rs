@@ -2,7 +2,11 @@ use crate::{db, process_lock};
 use std::{ffi::OsString, fmt, fs, path::PathBuf};
 
 const USAGE: &str = "Uso: pos_tauri maintenance-info | restore-migration-backup --database <ruta-absoluta>/pos.db --backup <ruta-absoluta>/backup-del-manifiesto.db";
-const MAINTENANCE_INFO: &str = "Linea POS 0.2.1: mantenimiento local disponible";
+const MAINTENANCE_INFO: &str = concat!(
+    "Linea POS ",
+    env!("CARGO_PKG_VERSION"),
+    ": mantenimiento local disponible"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaintenanceError {

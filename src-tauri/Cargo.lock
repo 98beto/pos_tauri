@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "pos_tauri"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "fs2",

@@ -2,7 +2,7 @@
 
 ## Plan de próxima release
 
-[`next-release-v0.3.0.md`](./next-release-v0.3.0.md) propone la preparación y ejecución de v0.3.0: pruebas de usuario, integración en main, candidato firmado, QA por plataforma y publicación de los mismos bytes. Es un plan pendiente, no una release ejecutada.
+[`next-release-v0.3.0.md`](./next-release-v0.3.0.md) registra la ejecución de v0.3.0: versión, notas y gates locales preparados y revisados; integración en main, candidato firmado, QA por plataforma y publicación de los mismos bytes pendientes. No hay una release publicada como resultado de esta preparación.
 
 ## Último ajuste visual implementado
 

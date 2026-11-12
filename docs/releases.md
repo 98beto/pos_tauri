@@ -140,11 +140,11 @@ Para una fuente 12, comparar antes y despues todos los campos retenidos. Confirm
 
 Ensayar el rollback antes de publicar. Cerrar completamente el candidato, conservar una copia diagnostica consistente de SQLite 16 y tomar el backup exacto desde el manifiesto completado o el marcador pendiente. Validar que conserva el `source_version` y el snapshot de origen. Un backup SQLite consistente v16 conserva los BLOB y hashes de adjuntos; no existe una nueva interfaz de backup. El backup de migracion v15 precede a las facturas registradas en v16 y no puede contenerlas.
 
-Leer `database_path` y `backup_path` del manifiesto `pos-schema-v13-migration-completed-<attempt-id>.json` o, si la migracion quedo pendiente, de `pos-schema-v13-migration-pending.json`. Cerrar Linea POS por completo. El comando real depende del artefacto instalado; sustituir las rutas por los dos valores exactos del manifiesto:
+Leer `database_path` y `backup_path` del manifiesto `pos-schema-v13-migration-completed-<attempt-id>.json` o, si la migracion quedo pendiente, de `pos-schema-v13-migration-pending.json`. Cerrar Linea POS por completo. Ejecutar el comando con el candidato 0.3.0 que realizo la migracion; el comando real depende del artefacto instalado. Sustituir las rutas por los dos valores exactos del manifiesto:
 
 ```bash
 # AppImage descargado
-./Linea.POS_0.2.1_amd64.AppImage restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/backup-indicado-en-manifiesto.db
+./Linea.POS_0.3.0_amd64.AppImage restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/backup-indicado-en-manifiesto.db
 
 # DEB o RPM instalado
 /usr/bin/pos_tauri restore-migration-backup --database /ruta/absoluta/pos.db --backup /ruta/absoluta/backup-indicado-en-manifiesto.db
@@ -168,7 +168,7 @@ El comando usa el mecanismo durable del backend: solo acepta el esquema canónic
 
 Despues, confirmar `PRAGMA user_version` igual al `source_version`, `quick_check=ok`, cero filas de `foreign_key_check` y la presencia de `pos-schema-v13-restore-completed-<restore-id>.json`. Abrir y reabrir el resultado con la version compatible con el esquema de origen restaurado. Comparar literalmente productos, stock, historia de origen, ventas, detalles, movimientos y secuencias. Toda operacion creada despues de migrar a 16, incluidas facturas y adjuntos, se pierde al restaurar el backup de origen.
 
-Este procedimiento corresponde a `v0.2.1`. Su implementacion local no acredita por si sola la prueba sobre una copia cerrada real, `mode=validate`, smoke de artefactos, rollback operativo, tag ni publicacion.
+Este procedimiento para el esquema 16 corresponde a `v0.3.0` y al candidato que realizo la migracion. Su implementacion local no acredita por si sola la prueba sobre una copia cerrada real, `mode=validate`, smoke de artefactos, rollback operativo, tag ni publicacion.
 
 ### Checklist
 
