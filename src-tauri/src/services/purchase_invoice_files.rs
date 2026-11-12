@@ -141,12 +141,15 @@ pub fn pdf_cache_root(cache: &Path) -> std::io::Result<std::path::PathBuf> {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir_all(cache)?;
-            let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
                 builder.mode(0o700);
-            }
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
             builder.create(&root)?;
         }
         Err(e) => return Err(e),
