@@ -4,6 +4,7 @@ export { Drawer, type DrawerProps } from "./Drawer";
 export { EmptyState, type EmptyStateProps } from "./EmptyState";
 export { Field, type FieldProps } from "./Field";
 export { Modal, type ModalProps } from "./Modal";
+export { MovementIndicator, movementAppearance, type MovementTone } from "./MovementIndicator";
 export { Spinner, type SpinnerProps } from "./Spinner";
 export { StatCard, type StatCardProps } from "./StatCard";
 export { Toast, type ToastProps } from "./Toast";

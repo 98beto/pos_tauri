@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import "@fontsource-variable/fraunces";
 import "@fontsource-variable/inter";
+import "@fontsource-variable/manrope/wght.css";
 import App from "./App";
 import "./index.css";
 
