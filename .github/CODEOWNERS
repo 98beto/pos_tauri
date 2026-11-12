@@ -1,0 +1,5 @@
+# Release infrastructure ownership. Main requires PR and passing CI.
+# The solo-maintainer policy is documented in docs/plans/next-release-v0.3.0.md.
+/.github/CODEOWNERS @98beto
+/.github/workflows/ @98beto
+/scripts/ @98beto

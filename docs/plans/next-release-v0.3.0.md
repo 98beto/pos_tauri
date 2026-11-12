@@ -260,11 +260,33 @@ Esto acredita arranque local, no recorridos interactivos ni instaladores firmado
 ### Gates operativos pendientes
 
 La consulta de GitHub confirmó `v0.2.1` como última release estable y disponibilidad
-inicial del tag `v0.3.0`. También detectó requisitos del runbook sin configurar:
-`main` no tiene protección ni reglas aplicables, y `release-publication` no tiene
-reviewers ni restricción de rama. La inmutabilidad de releases está habilitada;
-existe una ruleset activa de tags y el environment `release` tiene reviewer y
-restricción a `main`. Corregir los requisitos pendientes antes de la publicación.
+inicial del tag `v0.3.0`. La inmutabilidad de releases está habilitada y existe una
+ruleset activa que bloquea actualización, eliminación y force-push de tags `v*`.
+
+El usuario autorizó configurar las protecciones y adaptó expresamente la revisión
+formal de GitHub a su repositorio individual: puede aceptar su propio PR con CI
+verde, sin exigir la aprobación de otra cuenta. Esta decisión sustituye, para esta
+ejecución, el requisito general de aprobación externa del runbook. Se conservan
+las revisiones independientes de los cambios y la aprobación del candidato.
+
+- `main`: PR obligatorio, ambos jobs de CI requeridos y ligados a GitHub Actions,
+  rama actualizada, conversaciones resueltas, aplicación a administradores y
+  bloqueo de force-push/eliminación. Cero aprobaciones formales externas y sin
+  aprobación obligatoria de code owner, coherente con el flujo individual.
+- `.github/CODEOWNERS` identifica al propietario de workflows, scripts y del
+  propio archivo de propietarios; no concede una excepción para saltarse CI.
+- `release-publication`: reviewer `98beto` y deployments únicamente desde la rama
+  `main`, sin claves de firma. Se permite la aprobación manual del propietario
+  aunque sea quien inició el run; la misma política individual ya existía en
+  `release`. No se han agregado colaboradores ni modificado secrets.
+
+El PR [#1](https://github.com/98beto/pos_tauri/pull/1) contiene la preparación
+`b376893`. Su primera ejecución CI
+[43321112076](https://github.com/98beto/pos_tauri/actions/runs/43321112076)
+detectó `unused_mut` en `purchase_invoice_files.rs` al compilar en Windows. La
+corrección `730a9ad` conserva el modo Unix `0700` e inicializa el builder sin
+mutabilidad en las otras plataformas; pasó revisión independiente, clippy Linux
+y tres pruebas del servicio. Se lanzó de nuevo CI para validar ambos sistemas.
 
 Faltan CI Linux/Windows, revisión e integración del PR, candidato firmado desde
 `main`, copia cerrada de datos reales, QA nativa por plataforma, rollback del
