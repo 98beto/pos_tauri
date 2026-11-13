@@ -12,6 +12,7 @@ import type { PresentationMode } from "../../types/product_presentation";
 import { useViewPreference } from "../../hooks/useViewPreference";
 
 type Notice = { tone: "success" | "error" | "info"; message: string };
+type ArchiveIntent = { product: ProductViewRow; ownerSession: number; generation: number };
 type ProductsViewProps = {
   sessionId: number;
   onNotice: (notice: Notice) => void;
@@ -143,6 +144,9 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
   const [pendingBaseUnit, setPendingBaseUnit] = useState<BaseUnit>();
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [productOperationIds, setProductOperationIds] = useState<Set<number>>(() => new Set());
+  const [archiveIntent, setArchiveIntent] = useState<ArchiveIntent>();
+  const archiveIntentRef = useRef<ArchiveIntent | undefined>(undefined);
+  const [archiveError, setArchiveError] = useState("");
   const catalogRequest = useRef(0);
   const viewRequest = useRef(0);
   const productOperations = useRef(new Set<number>());
@@ -231,6 +235,7 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       productSaveGeneration.current += 1;
       productSaveInFlight.current = false;
       productOperations.current.clear();
+      archiveIntentRef.current = undefined;
     };
   }, []);
 
@@ -241,6 +246,9 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     productSaveGeneration.current += 1;
     productSaveInFlight.current = false;
     productOperations.current.clear();
+    archiveIntentRef.current = undefined;
+    setArchiveIntent(undefined);
+    setArchiveError("");
     setProductOperationIds(new Set());
     setSavingProduct(false);
     setProductOpen(false);
@@ -410,14 +418,25 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     }
   }
 
-  async function changeProductStatus(product: ProductViewRow, action: "archive" | "restore") {
+  function openArchive(product: ProductViewRow) {
+    if (!product.is_active || productOperations.current.has(product.id)) return;
+    const intent = { product, ownerSession: sessionId, generation: lifetime.current };
+    archiveIntentRef.current = intent;
+    setArchiveError("");
+    setArchiveIntent(intent);
+  }
+
+  function closeArchive(intent: ArchiveIntent | undefined) {
+    if (!intent || archiveIntentRef.current !== intent || !isCurrent(intent.ownerSession, intent.generation) || productOperations.current.has(intent.product.id)) return;
+    archiveIntentRef.current = undefined;
+    setArchiveIntent(undefined);
+  }
+
+  async function changeProductStatus(product: ProductViewRow, action: "archive" | "restore", intent?: ArchiveIntent) {
+    // Validate the rendered intent too: a session can change before its effect resets state.
+    if (action === "archive" && (!intent || archiveIntentRef.current !== intent || !isCurrent(intent.ownerSession, intent.generation))) return;
     if (productOperations.current.has(product.id)) return;
-    if (action === "archive") {
-      const stockNotice = product.stock_base > 0
-        ? `\n\nExistencia actual: ${formatBaseQuantity(product.stock_base, product.base_unit)}. El stock no se ajustará.`
-        : "";
-      if (!window.confirm(`¿Eliminar ${product.name}?${stockNotice}\n\nSe conservarán ventas, movimientos, stock, códigos y presentaciones. Los SKU y códigos de barras seguirán reservados.`)) return;
-    }
+    if (action === "archive") setArchiveError("");
 
     productOperations.current.add(product.id);
     setProductOperationIds(new Set(productOperations.current));
@@ -427,6 +446,10 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
     try {
       const updated = action === "archive" ? await archiveProduct(product.id) : await restoreProduct(product.id);
       if (!isCurrent(ownerSession, generation)) return;
+      if (action === "archive") {
+        archiveIntentRef.current = undefined;
+        setArchiveIntent(undefined);
+      }
       const status = filtersRef.current.statusFilter;
       setView((current) => current && {
         ...current,
@@ -447,7 +470,7 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
       }
     } catch (value: unknown) {
       if (!isCurrent(ownerSession, generation)) return;
-      fail(value, action === "archive" ? "No se pudo eliminar el producto." : "No se pudo restaurar el producto.");
+      fail(value, action === "archive" ? "No se pudo eliminar el producto." : "No se pudo restaurar el producto.", action === "archive" ? setArchiveError : undefined);
     } finally {
       if (isCurrent(ownerSession, generation)) {
         productOperations.current.delete(product.id);
@@ -521,10 +544,10 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
                 <td className="border-b border-line px-5 py-4"><span className="block font-semibold">{product.default_presentation.name}</span><span className="text-xs text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right"><span className={`rounded-full px-2.5 py-1 text-xs font-bold ${product.stock_base === 0 ? "bg-danger-soft text-danger" : "bg-brand-soft text-brand"}`}>{formatBaseQuantity(product.stock_base, product.base_unit)}</span></td>
                 <td className="border-b border-line px-5 py-4 text-right font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</td>
-                 <td className="border-b border-line px-5 py-4 text-right"><ProductActions product={product} busy={productOperationIds.has(product.id)} onEdit={openEdit} onArchive={(item) => void changeProductStatus(item, "archive")} onRestore={(item) => void changeProductStatus(item, "restore")} /></td>
+                 <td className="border-b border-line px-5 py-4 text-right"><ProductActions product={product} busy={productOperationIds.has(product.id)} onEdit={openEdit} onArchive={openArchive} onRestore={(item) => void changeProductStatus(item, "restore")} /></td>
               </tr>)}</tbody>
              </table>
-            </div> : view?.items.length && layout === "cards" ? <div className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">{view.items.map((product) => <article key={product.id} className="grid content-start gap-3 rounded-control border border-line p-4"><div><h3 className="font-bold">{product.name}</h3><p className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</p><StatusBadge isActive={product.is_active} /></div><div><span className="block text-xs text-muted">Presentación predeterminada</span><strong>{product.default_presentation.name}</strong><span className="block text-sm text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></div><dl className="grid grid-cols-2 gap-3 text-sm"><div><dt className="text-xs text-muted">Stock</dt><dd className="font-semibold">{formatBaseQuantity(product.stock_base, product.base_unit)}</dd></div><div><dt className="text-xs text-muted">Presentaciones activas</dt><dd className="font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</dd></div></dl><ProductActions product={product} busy={productOperationIds.has(product.id)} onEdit={openEdit} onArchive={(item) => void changeProductStatus(item, "archive")} onRestore={(item) => void changeProductStatus(item, "restore")} /></article>)}</div> : !tableLoading && !viewError && !view?.items.length && <EmptyState title="No hay productos para mostrar" description="Cambia los filtros o crea el primer producto." action={<Button onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button>} />}
+             </div> : view?.items.length && layout === "cards" ? <div className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">{view.items.map((product) => <article key={product.id} className="grid content-start gap-3 rounded-control border border-line p-4"><div><h3 className="font-bold">{product.name}</h3><p className="text-xs text-muted">{product.sku} · {product.brand_name} / {product.category_name}</p><StatusBadge isActive={product.is_active} /></div><div><span className="block text-xs text-muted">Presentación predeterminada</span><strong>{product.default_presentation.name}</strong><span className="block text-sm text-muted">{presentationPriceLabel(product.default_presentation, product.base_unit)}</span></div><dl className="grid grid-cols-2 gap-3 text-sm"><div><dt className="text-xs text-muted">Stock</dt><dd className="font-semibold">{formatBaseQuantity(product.stock_base, product.base_unit)}</dd></div><div><dt className="text-xs text-muted">Presentaciones activas</dt><dd className="font-semibold">{product.presentations.filter((presentation) => presentation.is_active).length}</dd></div></dl><ProductActions product={product} busy={productOperationIds.has(product.id)} onEdit={openEdit} onArchive={openArchive} onRestore={(item) => void changeProductStatus(item, "restore")} /></article>)}</div> : !tableLoading && !viewError && !view?.items.length && <EmptyState title="No hay productos para mostrar" description="Cambia los filtros o crea el primer producto." action={<Button onClick={openCreate} disabled={!brands.length || !categories.length}>Nuevo producto</Button>} />}
         </div>
       </section>
 
@@ -581,6 +604,12 @@ export function ProductsView({ sessionId, onNotice, onSessionRequired }: Product
 
       <Modal open={pendingBaseUnit !== undefined} onClose={() => setPendingBaseUnit(undefined)} title="Cambiar unidad base" description="Este cambio reiniciara las presentaciones capturadas." size="sm" footer={<><Button onClick={() => setPendingBaseUnit(undefined)}>Conservar datos</Button><Button variant="danger" onClick={() => pendingBaseUnit && applyBaseUnit(pendingBaseUnit)}>Cambiar y reiniciar</Button></>}>
         <p className="text-sm text-muted">Se perderan los nombres, conversiones, precios y codigos de barras de las presentaciones actuales.</p>
+      </Modal>
+
+      <Modal open={Boolean(archiveIntent && isCurrent(archiveIntent.ownerSession, archiveIntent.generation))} onClose={() => closeArchive(archiveIntent)} closeDisabled={Boolean(archiveIntent && productOperationIds.has(archiveIntent.product.id))} title="Eliminar producto" description={archiveIntent ? `¿Eliminar ${archiveIntent.product.name}? SKU: ${archiveIntent.product.sku}` : undefined} size="sm" footer={<><Button data-autofocus disabled={Boolean(archiveIntent && productOperationIds.has(archiveIntent.product.id))} onClick={() => closeArchive(archiveIntent)}>Cancelar</Button><Button variant="danger" loading={Boolean(archiveIntent && productOperationIds.has(archiveIntent.product.id))} onClick={() => archiveIntent && void changeProductStatus(archiveIntent.product, "archive", archiveIntent)}>Eliminar producto</Button></>}>
+        {archiveError && <div role="alert" className="mb-4 text-sm text-danger">{archiveError}</div>}
+        {archiveIntent && archiveIntent.product.stock_base > 0 && <p className="mb-3 text-sm text-muted">Existencia actual: {formatBaseQuantity(archiveIntent.product.stock_base, archiveIntent.product.base_unit)}. El stock no se ajustará.</p>}
+        <p className="text-sm text-muted">Se conservarán ventas, movimientos, stock, códigos y presentaciones. Los SKU y códigos de barras seguirán reservados.</p>
       </Modal>
 
       <CatalogModal open={catalogOpen} sessionId={sessionId} brands={brands} categories={categories} onClose={() => setCatalogOpen(false)} onSessionRequired={onSessionRequired} onChanged={catalogsChanged} />
