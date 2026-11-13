@@ -1,5 +1,6 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { Children, isValidElement, useLayoutEffect, type ComponentProps, type ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createBrand, listBrands, updateBrand } from "../../api/brands";
 import { createCategory, listCategories, updateCategory } from "../../api/categories";
@@ -11,6 +12,26 @@ import { ProductsView } from "./ProductsView";
 vi.mock("../../api/brands", () => ({ createBrand: vi.fn(), listBrands: vi.fn(), updateBrand: vi.fn() }));
 vi.mock("../../api/categories", () => ({ createCategory: vi.fn(), listCategories: vi.fn(), updateCategory: vi.fn() }));
 vi.mock("../../api/products", () => ({ archiveProduct: vi.fn(), createProductWithPresentations: vi.fn(), getProductsView: vi.fn(), restoreProduct: vi.fn(), updateProductWithPresentations: vi.fn() }));
+
+const modalCapture = vi.hoisted(() => ({ archive: undefined as ComponentProps<typeof import("../../components/ui").Modal> | undefined }));
+vi.mock("../../components/ui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../components/ui")>();
+  return {
+    ...actual,
+    Modal: (props: ComponentProps<typeof actual.Modal>) => {
+      if (props.title === "Eliminar producto") modalCapture.archive = props;
+      return <actual.Modal {...props} />;
+    },
+  };
+});
+
+function archiveCallbacks() {
+  const modal = modalCapture.archive;
+  if (!modal?.open || !isValidElement<{ children: React.ReactNode }>(modal.footer)) throw new Error("Archive modal is not open");
+  const buttons = Children.toArray(modal.footer.props.children) as ReactElement<{ onClick: () => void }>[];
+  if (buttons.length !== 2 || !buttons[0].props.onClick || !buttons[1].props.onClick) throw new Error("Archive footer callbacks missing");
+  return { cancel: buttons[0].props.onClick, accept: buttons[1].props.onClick, close: modal.onClose };
+}
 
 const mockedListBrands = vi.mocked(listBrands);
 const mockedListCategories = vi.mocked(listCategories);
@@ -73,6 +94,7 @@ const view: ProductView = {
 };
 
 beforeEach(() => {
+  modalCapture.archive = undefined;
   vi.useFakeTimers();
   localStorage.clear();
   mockedListBrands.mockResolvedValue([{ id: 1, name: "Origen", created_at: "", updated_at: "" }]);
@@ -84,7 +106,6 @@ beforeEach(() => {
   vi.mocked(updateCategory).mockResolvedValue({ id: 2, name: "Bebidas", created_at: "", updated_at: "" });
   mockedArchiveProduct.mockResolvedValue({ ...view.items[0], is_active: false });
   mockedRestoreProduct.mockResolvedValue(view.items[0]);
-  vi.stubGlobal("confirm", vi.fn(() => true));
 });
 
 async function renderLoaded() {
@@ -568,19 +589,19 @@ describe("ProductsView", () => {
   });
 
   it("cancels archive without a request, then archives in cards and refreshes current filters", async () => {
-    const confirmMock = vi.mocked(window.confirm);
-    confirmMock.mockReturnValueOnce(false).mockReturnValueOnce(true);
     await renderLoaded();
     fireEvent.change(screen.getByLabelText("Buscar"), { target: { value: "cafe" } });
     fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "all" } });
     await act(() => vi.advanceTimersByTimeAsync(250));
     fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
     fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
-    expect(confirmMock).toHaveBeenLastCalledWith(expect.stringContaining("Existencia actual: 1.25 kg. El stock no se ajustará."));
+    expect(screen.getByText("Existencia actual: 1.25 kg. El stock no se ajustará.")).toBeTruthy();
     expect(mockedArchiveProduct).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
 
     mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [{ ...view.items[0], is_active: false }] });
     fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
     await act(async () => undefined);
     expect(mockedArchiveProduct).toHaveBeenCalledWith(11);
     expect(mockedGetProductsView).toHaveBeenLastCalledWith({ search: "cafe", status: "all" });
@@ -611,7 +632,8 @@ describe("ProductsView", () => {
     await renderLoaded();
     fireEvent.click(screen.getByRole("button", { name: layout }));
     fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
-    const edit = screen.getByRole("button", { name: "Editar producto Cafe molido" }) as HTMLButtonElement;
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
+    const edit = screen.getByRole("button", { name: "Editar producto Cafe molido", hidden: true }) as HTMLButtonElement;
     expect(edit.disabled).toBe(true);
     fireEvent.click(edit);
     expect(screen.queryByRole("dialog", { name: "Editar producto" })).toBeNull();
@@ -628,7 +650,9 @@ describe("ProductsView", () => {
     await act(() => vi.advanceTimersByTimeAsync(250));
     fireEvent.click(screen.getByRole("button", { name: "Tarjetas" }));
     mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
-    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" })));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" })));
+    expect(screen.queryByRole("dialog", { name: "Eliminar producto" })).toBeNull();
     expect(screen.getByRole("alert")).toBeTruthy();
     expect(screen.getByText("Eliminado")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Editar producto Cafe molido" })).toBeNull();
@@ -640,7 +664,8 @@ describe("ProductsView", () => {
   it("removes status-mismatched rows after archive or restore even if refresh fails", async () => {
     await renderLoaded();
     mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
-    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" })));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" })));
     expect(screen.queryByText("Cafe molido")).toBeNull();
     expect(screen.getByRole("alert")).toBeTruthy();
 
@@ -675,6 +700,7 @@ describe("ProductsView", () => {
     };
     assertStale();
     fireEvent.click(screen.getByRole("button", { name: `${action === "archive" ? "Eliminar" : "Restaurar"} producto Cafe molido` }));
+    if (action === "archive") fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
     assertStale();
     mockedGetProductsView.mockRejectedValueOnce(new Error("refresh failed"));
     await act(async () => request.resolve({ ...initial, is_active: !initial.is_active }));
@@ -688,6 +714,207 @@ describe("ProductsView", () => {
     expect(screen.getAllByText("Segun filtros actuales")).toHaveLength(5);
   });
 
+  it.each(["Lista", "Tarjetas"])("opens real archive confirmation from %s without mutating", async (layout) => {
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: layout }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    const dialog = screen.getByRole("dialog", { name: "Eliminar producto" });
+    expect(within(dialog).getByText("¿Eliminar Cafe molido? SKU: CAFE-1")).toBeTruthy();
+    expect(within(dialog).getByText("Existencia actual: 1.25 kg. El stock no se ajustará.")).toBeTruthy();
+    expect(within(dialog).getByText("Se conservarán ventas, movimientos, stock, códigos y presentaciones. Los SKU y códigos de barras seguirán reservados.")).toBeTruthy();
+    expect(mockedArchiveProduct).not.toHaveBeenCalled();
+  });
+
+  it.each(["Cancelar", "Cerrar dialogo", "Escape"])("dismisses with %s without mutation and restores focus", async (action) => {
+    await renderLoaded();
+    const trigger = screen.getByRole("button", { name: "Eliminar producto Cafe molido" });
+    // jsdom has no layout; give the real Modal's return-focus target a visible rect.
+    vi.spyOn(trigger, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    trigger.focus();
+    fireEvent.click(trigger);
+    await act(() => vi.advanceTimersByTimeAsync(16));
+    expect(document.activeElement).not.toBe(trigger);
+    if (action === "Escape") fireEvent.keyDown(document, { key: "Escape" });
+    else fireEvent.click(screen.getByRole("button", { name: action }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(mockedArchiveProduct).not.toHaveBeenCalled();
+  });
+
+  it("omits the stock warning when there is no stock", async () => {
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [{ ...view.items[0], stock_base: 0 }] });
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    expect(screen.queryByText(/Existencia actual:/)).toBeNull();
+    expect(mockedArchiveProduct).not.toHaveBeenCalled();
+  });
+
+  it("guards duplicate acceptance synchronously and locks dismissal while pending", async () => {
+    const request = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    mockedArchiveProduct.mockReturnValueOnce(request.promise);
+    const onNotice = vi.fn();
+    render(<ProductsView sessionId={1} onNotice={onNotice} onSessionRequired={vi.fn()} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    const accept = screen.getByRole("button", { name: "Eliminar producto" }) as HTMLButtonElement;
+    const cancel = screen.getByRole("button", { name: "Cancelar" }) as HTMLButtonElement;
+    const close = screen.getByRole("button", { name: "Cerrar dialogo" }) as HTMLButtonElement;
+    const initial = archiveCallbacks();
+    act(() => {
+      initial.accept();
+      initial.accept();
+      initial.cancel();
+      initial.close();
+    });
+    expect(mockedArchiveProduct).toHaveBeenCalledExactlyOnceWith(11);
+    expect(accept.disabled).toBe(true);
+    expect(cancel.disabled).toBe(true);
+    expect(close.disabled).toBe(true);
+    expect(screen.getByRole("dialog").getAttribute("aria-busy")).toBe("true");
+    const pending = archiveCallbacks();
+    act(() => {
+      pending.accept();
+      pending.cancel();
+      pending.close();
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    expect(mockedArchiveProduct).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(onNotice).not.toHaveBeenCalled();
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [] });
+    await act(async () => request.resolve({ ...view.items[0], is_active: false }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onNotice).toHaveBeenCalledWith(expect.objectContaining({ tone: "success" }));
+  });
+
+  it("keeps a failed archive visible and allows a single explicit retry", async () => {
+    mockedArchiveProduct.mockRejectedValueOnce(new Error("backend failure"));
+    const retry = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    mockedArchiveProduct.mockReturnValueOnce(retry.promise);
+    const onNotice = vi.fn();
+    render(<ProductsView sessionId={1} onNotice={onNotice} onSessionRequired={vi.fn()} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" })));
+    expect(screen.getByRole("alert").textContent).toContain("No se pudo eliminar el producto.");
+    expect(screen.getByRole("button", { name: "Editar producto Cafe molido", hidden: true })).toBeTruthy();
+    expect(onNotice).not.toHaveBeenCalled();
+    const accept = screen.getByRole("button", { name: "Eliminar producto" });
+    fireEvent.click(accept);
+    fireEvent.click(accept);
+    expect(mockedArchiveProduct).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [] });
+    await act(async () => retry.resolve({ ...view.items[0], is_active: false }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("closes an applied confirmation before refresh finishes or fails", async () => {
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("Estado"), { target: { value: "all" } });
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    const refresh = deferred<ProductView>();
+    mockedGetProductsView.mockReturnValueOnce(refresh.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    const callback = archiveCallbacks().accept;
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" })));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("Eliminado")).toBeTruthy();
+    act(() => callback());
+    expect(mockedArchiveProduct).toHaveBeenCalledOnce();
+    await act(async () => refresh.reject(new Error("refresh failed")));
+    // The refresh has finished and its in-flight guard is released; the old intent must still be invalid.
+    act(() => callback());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("Eliminado")).toBeTruthy();
+    expect(mockedArchiveProduct).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Restaurar producto Cafe molido" })).toBeTruthy();
+  });
+
+  it("invalidates an unaccepted confirmation on session change", async () => {
+    const onNotice = vi.fn();
+    const onSessionRequired = vi.fn();
+    const beforePassiveReset = vi.fn();
+    function Harness({ sessionId }: { sessionId: number }) {
+      useLayoutEffect(() => {
+        if (sessionId === 2) beforePassiveReset();
+      }, [sessionId]);
+      return <ProductsView sessionId={sessionId} onNotice={onNotice} onSessionRequired={onSessionRequired} />;
+    }
+    const rendered = render(<Harness sessionId={1} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    const oldAccept = archiveCallbacks().accept;
+    beforePassiveReset.mockImplementation(() => {
+      expect(modalCapture.archive?.open).toBe(false);
+      // The old intent is still rendered here; the session-reset effect has not run.
+      expect(modalCapture.archive?.description).toBe("¿Eliminar Cafe molido? SKU: CAFE-1");
+      oldAccept();
+      expect(mockedArchiveProduct).not.toHaveBeenCalled();
+    });
+    rendered.rerender(<Harness sessionId={2} />);
+    expect(beforePassiveReset).toHaveBeenCalledOnce();
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockedArchiveProduct).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    expect(mockedArchiveProduct).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+  });
+
+  it.each(["resolve", "reject"] as const)("ignores an old archive %s without releasing a new session's guard", async (completion) => {
+    const old = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    const current = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    mockedArchiveProduct.mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    const onNotice = vi.fn();
+    const onSessionRequired = vi.fn();
+    const rendered = render(<ProductsView sessionId={1} onNotice={onNotice} onSessionRequired={onSessionRequired} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
+    rendered.rerender(<ProductsView sessionId={2} onNotice={onNotice} onSessionRequired={onSessionRequired} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    const currentAccept = archiveCallbacks().accept;
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
+    const calls = mockedGetProductsView.mock.calls.length;
+    await act(async () => {
+      if (completion === "resolve") old.resolve({ ...view.items[0], is_active: false });
+      else old.reject({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion vencida" });
+    });
+    expect(onNotice).not.toHaveBeenCalled();
+    expect(onSessionRequired).not.toHaveBeenCalled();
+    expect(mockedGetProductsView).toHaveBeenCalledTimes(calls);
+    expect(screen.getByRole("dialog").getAttribute("aria-busy")).toBe("true");
+    act(() => currentAccept());
+    expect(mockedArchiveProduct).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("dialog").getAttribute("aria-busy")).toBe("true");
+    mockedGetProductsView.mockResolvedValueOnce({ ...view, items: [] });
+    await act(async () => current.resolve({ ...view.items[0], is_active: false }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it.each(["resolve", "reject"] as const)("ignores archive %s after unmount", async (completion) => {
+    const request = deferred<Awaited<ReturnType<typeof archiveProduct>>>();
+    mockedArchiveProduct.mockReturnValueOnce(request.promise);
+    const onNotice = vi.fn();
+    const onSessionRequired = vi.fn();
+    const rendered = render(<ProductsView sessionId={1} onNotice={onNotice} onSessionRequired={onSessionRequired} />);
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
+    const calls = mockedGetProductsView.mock.calls.length;
+    rendered.unmount();
+    await act(async () => {
+      if (completion === "resolve") request.resolve({ ...view.items[0], is_active: false });
+      else request.reject({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion vencida" });
+    });
+    expect(mockedGetProductsView).toHaveBeenCalledTimes(calls);
+    expect(onNotice).not.toHaveBeenCalled();
+    expect(onSessionRequired).not.toHaveBeenCalled();
+  });
+
   it("shows archive errors and routes authentication failures to the session handler", async () => {
     const onSessionRequired = vi.fn();
     render(<ProductsView sessionId={1} onNotice={vi.fn()} onSessionRequired={onSessionRequired} />);
@@ -695,8 +922,10 @@ describe("ProductsView", () => {
     await act(async () => undefined);
     mockedArchiveProduct.mockRejectedValueOnce(new Error("No se pudo archivar"));
     fireEvent.click(screen.getByRole("button", { name: "Eliminar producto Cafe molido" }));
+    fireEvent.click(screen.getByRole("button", { name: "Eliminar producto" }));
     await act(async () => undefined);
     expect(screen.getByRole("alert").textContent).toContain("No se pudo eliminar el producto.");
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
 
     mockedRestoreProduct.mockRejectedValueOnce({ category: "authentication", code: "SESSION_REQUIRED", message: "Sesion vencida" });
     const archived = { ...view.items[0], is_active: false };
