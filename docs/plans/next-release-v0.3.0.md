@@ -1,7 +1,8 @@
 # Plan de ejecución de la siguiente release: v0.3.0
 
-**Estado:** preparación local ejecutada y revisada; integración, candidato y
-publicación pendientes de los gates descritos al final de este documento.
+**Estado:** PR inicial integrado y CI aprobado; candidato firmado histórico
+rechazado por QA. La corrección está verificada localmente, pero todavía requiere
+integración, CI, candidato regenerado y QA de esos nuevos bytes antes de publicar.
 
 **Versión preparada:** `0.3.0`, por las nuevas funciones de caja y facturas.
 El tag no existía en GitHub al iniciar esta ejecución; comprobar de nuevo antes
@@ -10,8 +11,8 @@ de crearlo, después de aprobar el candidato.
 ## 1. Punto de partida
 
 - Última release publicada comprobada: **v0.2.1**.
-- Rama de desarrollo: `feat/catalog-cash-sessions`; se conserva `main` hasta que
-  el usuario pruebe y apruebe integrar los cambios.
+- Rama inicial de desarrollo: `feat/catalog-cash-sessions`; el PR inicial ya se
+  integró en `main`. La corrección posterior aún debe integrarse y pasar CI.
 - La aplicación declaraba `0.2.1` al iniciar; la preparación la cambia a `0.3.0`,
   sin modificar el esquema objetivo 16.
 - Alcance acumulado: icono, baja lógica, lista/tarjetas, apertura/movimientos/cierre
@@ -98,8 +99,8 @@ Realizarlo en perfiles QA aislados, con el candidato que después se publicará:
    registrar, filtrar por proveedor/número/fechas, repetir el XML sin duplicados y
    consultar decimales y atributos originales. No cambian existencias ni caja.
 5. **Archivos:** cancelar selectores, adjuntar PDF si falta, exportar XML/PDF y
-   comparar hashes; abrir el PDF con el visor real del sistema. Éste es un punto
-   todavía pendiente de prueba interactiva y debe acreditarse antes de publicar.
+    comparar hashes; abrir el PDF con el visor real del sistema. Se probó en el
+    AppImage histórico rechazado; repetir con el nuevo candidato y por plataforma.
 6. **Interfaz:** fuentes locales sin Internet ni infracciones CSP, importación azul,
    botones y campos utilizables a 360/1280 px, modales y navegación por teclado.
 7. **Persistencia:** reiniciar con caja abierta y datos guardados, comprobar estado
@@ -201,7 +202,8 @@ gh workflow run release.yml --ref main -f mode=publish -f tag=v0.3.0 -f candidat
 ## Checklist de ejecución
 
 - [x] Usuario probó la rama y autorizó commit, push y creación del PR a `main`.
-- [ ] Versión 0.3.0 y locks preparados, CI Linux/Windows verde.
+- [x] Versión 0.3.0 y locks preparados; CI Linux/Windows verde para el PR inicial.
+- [ ] Integrar la corrección y obtener CI verde para el nuevo SHA.
 - [ ] Migración, reapertura, copia de datos y rollback verificados.
 - [ ] Diálogos/archivos/visor nativos y smoke funcional por plataforma completados.
 - [ ] Candidato del SHA exacto con firmas y hashes correctos, vigente y aprobado.
@@ -280,15 +282,33 @@ las revisiones independientes de los cambios y la aprobación del candidato.
   aunque sea quien inició el run; la misma política individual ya existía en
   `release`. No se han agregado colaboradores ni modificado secrets.
 
-El PR [#1](https://github.com/98beto/pos_tauri/pull/1) contiene la preparación
+El PR [#1](https://github.com/98beto/pos_tauri/pull/1) contenía la preparación
 `b376893`. Su primera ejecución CI
 [43321112076](https://github.com/98beto/pos_tauri/actions/runs/43321112076)
 detectó `unused_mut` en `purchase_invoice_files.rs` al compilar en Windows. La
 corrección `730a9ad` conserva el modo Unix `0700` e inicializa el builder sin
 mutabilidad en las otras plataformas; pasó revisión independiente, clippy Linux
-y tres pruebas del servicio. Se lanzó de nuevo CI para validar ambos sistemas.
+y tres pruebas del servicio. La ejecución posterior de CI pasó en ambos sistemas.
 
-Faltan CI Linux/Windows, revisión e integración del PR, candidato firmado desde
-`main`, copia cerrada de datos reales, QA nativa por plataforma, rollback del
-candidato y aprobación de esos bytes. Los XML locales no forman parte de los
-cambios preparados. No se ha creado un tag ni publicado una release.
+### Actualización — 13 de noviembre de 2026
+
+- PR #1 integrado en `627b1ff`; CI del PR
+  [43322905706](https://github.com/98beto/pos_tauri/actions/runs/43322905706)
+  y de `main` [43325554134](https://github.com/98beto/pos_tauri/actions/runs/43325554134)
+  aprobados para ese estado, no para la corrección posterior.
+- El validate [43328395267](https://github.com/98beto/pos_tauri/actions/runs/43328395267)
+  produjo un candidato firmado de `627b1ff`, pero QA lo **rechazó** por un P1:
+  Productos archivaba sin consentimiento efectivo al tratar `window.confirm`
+  asíncrono como booleano. No publicar ese candidato.
+- La corrección registrada en `f51658b129f4eb604376a17183ae39e2abdccfec` usa el
+  Modal compartido, guardas de sesión/intención y de doble envío; siguen pendientes
+  integración, CI y nuevo candidato firmado. Revisiones y pruebas locales, incluidos
+  diez casos nativos con un binario de producción anterior al commit, pasaron;
+  **no es el candidato firmado**. Detalles, alcance y límites:
+  [`../qa-linux-v0.3.0.md`](../qa-linux-v0.3.0.md).
+- Pendientes: integrar la corrección mediante PR y CI, generar validate desde el
+  nuevo SHA de `main` y volver a verificar firmas, hashes y QA sobre esos bytes;
+  también la copia cerrada real, rollback, Windows, instalación y actualización
+  requeridos. El propietario debe aprobar el candidato y la publicación según los
+  environments. La decisión de cero aprobaciones externas de PR sigue vigente.
+- No se ha creado el tag ni publicado la release v0.3.0. Las notas 0.3.0 ya existen.

@@ -2,7 +2,7 @@
 
 ## Plan de próxima release
 
-[`next-release-v0.3.0.md`](./next-release-v0.3.0.md) registra la ejecución de v0.3.0: versión, notas y gates locales preparados y revisados; integración en main, candidato firmado, QA por plataforma y publicación de los mismos bytes pendientes. No hay una release publicada como resultado de esta preparación.
+[`next-release-v0.3.0.md`](./next-release-v0.3.0.md) registra la ejecución de v0.3.0: PR inicial integrado y CI aprobado; el candidato firmado histórico fue rechazado por QA. La corrección pasó verificación local, pero faltan su integración y CI, un candidato regenerado, QA de esos bytes y gates operativos antes de publicar. Ver [`../qa-linux-v0.3.0.md`](../qa-linux-v0.3.0.md). No se ha publicado v0.3.0.
 
 ## Último ajuste visual implementado
 
